@@ -543,6 +543,10 @@ fn append_responses_input_as_chat_messages(
     let mut pending_tool_calls = Vec::new();
     let mut pending_reasoning: Option<String> = None;
     let mut last_assistant_index: Option<usize> = None;
+    // 记录“上一次为 function_call 生成的兜底 call_id”，供紧随其后的
+    // function_call_output 复用，保证同一次工具调用两端 id 相等。
+    // 一旦遇到已有非空 call_id 或与 tool 调用无关的项，就重置这个记忆槽。
+    let mut last_generated_call_id: Option<String> = None;
 
     match input {
         Value::String(text) => {
@@ -553,8 +557,12 @@ fn append_responses_input_as_chat_messages(
         }
         Value::Array(items) => {
             for item in items {
+                // 在下沉到具体转换逻辑之前，先按需回填 function_call /
+                // function_call_output 的 call_id，避免下游生成的
+                // tool_calls[0].id / tool_call_id 为空字符串。
+                let prepared = backfill_input_item_call_id(item, &mut last_generated_call_id);
                 append_responses_item_as_chat_message(
-                    item,
+                    &prepared,
                     messages,
                     &mut pending_tool_calls,
                     &mut pending_reasoning,
@@ -564,8 +572,10 @@ fn append_responses_input_as_chat_messages(
             }
         }
         Value::Object(_) => {
+            // 单对象输入不存在配对场景，但仍需保证 call_id 非空。
+            let prepared = backfill_input_item_call_id(input, &mut last_generated_call_id);
             append_responses_item_as_chat_message(
-                input,
+                &prepared,
                 messages,
                 &mut pending_tool_calls,
                 &mut pending_reasoning,
@@ -584,6 +594,88 @@ fn append_responses_input_as_chat_messages(
     );
     backfill_tool_call_reasoning_placeholders(messages);
     Ok(())
+}
+
+/// 兜底：为 Codex Responses `input` 序列里的 `function_call` /
+/// `function_call_output` 项补齐缺失或为空的 `call_id`。
+///
+/// 背景：上游（例如 Codex 客户端触发的重试链路）偶尔会送出 `call_id: ""` 或者
+/// 完全缺失 `call_id` 字段的工具调用项。若不处理，最终生成的 Chat Completions
+/// 消息里 `messages[N].tool_calls[0].id` 与 `messages[N+1].tool_call_id` 都会
+/// 变成空串，OpenAI 兼容后端会直接 400。
+///
+/// 配对策略：按 `input` 数组的顺序，用 `last_generated` 记忆最近一次为
+/// `function_call` 生成的兜底 id，供紧跟其后的 `function_call_output` 复用，
+/// 从而保证同一次工具调用两端 id 相等。
+/// - 空/缺失的 `function_call.call_id` → 生成 `tool_call_<uuid>` 并写入
+///   `last_generated`。
+/// - 空/缺失的 `function_call_output.call_id` → 优先复用 `last_generated`；
+///   若为空则独立生成，保底也不出空串。
+/// - 已带非空 `call_id` 的工具项 → 保留原值，并清空 `last_generated`，避免影响
+///   下一对配对逻辑。
+/// - 其它非工具项 → 不改写，但同样清空 `last_generated`，避免跨消息误复用。
+///
+/// 返回值：始终返回一个新的 `Value`（必要时是原始值的 `clone`），保证不会动到
+/// 上游持有的原始数组。
+fn backfill_input_item_call_id(item: &Value, last_generated: &mut Option<String>) -> Value {
+    let item_type = item.get("type").and_then(|v| v.as_str());
+    match item_type {
+        Some("function_call") => {
+            let mut cloned = item.clone();
+            // 仅处理 object；非 object 直接返回，交给下游逻辑按原样处理。
+            if let Some(obj) = cloned.as_object_mut() {
+                let needs_backfill = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if needs_backfill {
+                    let synthesized = generate_backfilled_call_id();
+                    obj.insert("call_id".to_string(), Value::String(synthesized.clone()));
+                    *last_generated = Some(synthesized);
+                } else {
+                    // 已有真实 id：清空记忆槽，避免污染下一对配对。
+                    *last_generated = None;
+                }
+            }
+            cloned
+        }
+        Some("function_call_output") => {
+            let mut cloned = item.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                let needs_backfill = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if needs_backfill {
+                    // 优先复用上一步 function_call 生成的 id 以保证配对相等；
+                    // 若没有（例如异常序列），退化为独立生成，保底也不出空串。
+                    let synthesized = last_generated
+                        .take()
+                        .unwrap_or_else(generate_backfilled_call_id);
+                    obj.insert("call_id".to_string(), Value::String(synthesized));
+                } else {
+                    *last_generated = None;
+                }
+            }
+            cloned
+        }
+        _ => {
+            // 非工具项会打断配对上下文（例如中间穿插了 user/assistant 消息），
+            // 清空记忆槽避免跨越消息误复用同一 id。
+            *last_generated = None;
+            item.clone()
+        }
+    }
+}
+
+/// 生成一个 `tool_call_<uuid-simple>` 格式的兜底 id。
+///
+/// 复用项目内已在 `transform_gemini` 中使用的 `uuid::Uuid::new_v4().simple()`
+/// 方案，避免引入新依赖，同一次转换内冲突概率可忽略。
+fn generate_backfilled_call_id() -> String {
+    format!("tool_call_{}", uuid::Uuid::new_v4().simple())
 }
 
 fn append_responses_item_as_chat_message(
@@ -3294,5 +3386,107 @@ mod tests {
             "tools should be present from tool_search_output"
         );
         assert_eq!(result["tools"][0]["function"]["name"], "search_docs");
+    }
+
+    /// A-1：配对回填——function_call 与 function_call_output 都是空 call_id 时，
+    /// 转换后 tool_calls[0].id 与配对的 tool_call_id 必须同值且非空。
+    #[test]
+    fn codex_input_backfills_empty_call_ids_and_keeps_pairing() {
+        let input = json!({
+            "model": "cortex-18",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "ok"
+                }
+            ]
+        });
+        let result = responses_to_chat_completions(input).expect("transform ok");
+        let messages = result["messages"].as_array().expect("messages array");
+        // 找到 assistant + tool 这一对
+        let (assistant_idx, _) = messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant with tool_calls exists");
+        let tool_call_id = messages[assistant_idx]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("tool_calls[0].id string");
+        let tool_msg_id = messages[assistant_idx + 1]["tool_call_id"]
+            .as_str()
+            .expect("tool_call_id string");
+        assert!(!tool_call_id.is_empty(), "tool_calls[0].id 不应为空");
+        assert_eq!(tool_call_id, tool_msg_id, "call 与 output 应共享同一个回填 id");
+        assert!(
+            tool_call_id.starts_with("tool_call_"),
+            "回填 id 应符合 tool_call_<idx> 规范，实得 {tool_call_id}"
+        );
+    }
+
+    /// A-2：非空 call_id 不能被覆盖。
+    #[test]
+    fn codex_input_preserves_non_empty_call_ids() {
+        let input = json!({
+            "model": "cortex-18",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                {
+                    "type": "function_call",
+                    "call_id": "abc123",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "abc123",
+                    "output": "ok"
+                }
+            ]
+        });
+        let result = responses_to_chat_completions(input).expect("transform ok");
+        let messages = result["messages"].as_array().expect("messages array");
+        let (assistant_idx, _) = messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant exists");
+        assert_eq!(messages[assistant_idx]["tool_calls"][0]["id"], "abc123");
+        assert_eq!(messages[assistant_idx + 1]["tool_call_id"], "abc123");
+    }
+
+    /// A-3：完全缺失 call_id 字段也要能回填。
+    #[test]
+    fn codex_input_backfills_missing_call_id_field() {
+        let input = json!({
+            "model": "cortex-18",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{}"
+                }
+            ]
+        });
+        let result = responses_to_chat_completions(input).expect("transform ok");
+        let messages = result["messages"].as_array().expect("messages array");
+        let (assistant_idx, _) = messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant exists");
+        let id = messages[assistant_idx]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("id string");
+        assert!(!id.is_empty());
+        assert!(id.starts_with("tool_call_"));
     }
 }
