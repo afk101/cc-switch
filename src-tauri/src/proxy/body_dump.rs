@@ -1,0 +1,414 @@
+//! Codex `/responses` 链路的诊断 body dump 工具。
+//!
+//! 通过环境变量 `CC_SWITCH_DUMP_BODY=1` 打开；不开启时 [`BodyDumper::try_new`]
+//! 返回 `None`，调用方保持零开销。
+//!
+//! 每个请求写入一个独立文件：`<app_config_dir>/logs/proxy-bodies/<ts>-<request_id>.log`，
+//! 追加写入以下内容：
+//! 1. 客户端 → CC Switch 的方法、URL、脱敏后的 header、请求 body 原文；
+//! 2. CC Switch → 上游的 URL、脱敏后的 header、发送前定稿的 body；
+//! 3. 上游 → CC Switch 的状态码、脱敏后的 header、非流式 body 原文
+//!    或流式 SSE 采样（前 [`SSE_HEAD_EVENTS`] 个事件 + 末 [`SSE_TAIL_EVENTS`] 个事件）。
+//!
+//! Header 中的敏感字段（`authorization` / `api-key` / `cookie` 等）会被替换为
+//! `***REDACTED***`。请求 / 响应 body 本身不脱敏，因为对话内容是排查所依赖的
+//! 原始信号；导出日志前请自行清理敏感段。
+
+use axum::http::HeaderMap;
+use once_cell::sync::Lazy;
+use serde_json::Value;
+use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+/// SSE 采样窗口：保留最开始的若干个事件用于观察请求生命周期起始行为。
+const SSE_HEAD_EVENTS: usize = 200;
+/// SSE 采样窗口：保留最后若干个事件用于观察异常结束时的上下文。
+const SSE_TAIL_EVENTS: usize = 50;
+/// 需要脱敏的 header 名（大小写不敏感匹配）。
+const REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "x-goog-api-key",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "openai-organization",
+    "chatgpt-account-id",
+];
+
+/// 缓存启动时读取到的开关值。避免每次请求都触发 `std::env` 全局锁。
+static DUMP_ENABLED: Lazy<bool> = Lazy::new(|| match std::env::var("CC_SWITCH_DUMP_BODY") {
+    Ok(val) => {
+        let trimmed = val.trim();
+        !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+    }
+    Err(_) => false,
+});
+
+/// 是否启用 body dump。
+#[inline]
+pub fn is_enabled() -> bool {
+    *DUMP_ENABLED
+}
+
+/// 单个请求生命周期的 body 落盘器。
+///
+/// 内部持有一个 `Mutex<File>`，允许在请求生命周期内的多个阶段追加写入
+/// （客户端请求、上游请求、上游响应）而不会互相截断。
+pub struct BodyDumper {
+    inner: Arc<Mutex<File>>,
+    request_id: String,
+}
+
+impl BodyDumper {
+    /// 仅在开关打开时创建 dumper；否则返回 `None`，调用方保持零成本。
+    ///
+    /// * `request_id` — 本次请求的追踪 ID，会写入文件名和文件头。
+    /// * `endpoint` — 触发本次请求的端点（例如 `/responses`），仅用于日志头部注释。
+    pub fn try_new(request_id: &str, endpoint: &str) -> Option<Arc<Self>> {
+        if !is_enabled() {
+            return None;
+        }
+        Self::try_new_inner(request_id, endpoint).ok().map(Arc::new)
+    }
+
+    /// 内部构造：单独抽出便于错误处理，避免调用点被 IO 错误污染。
+    fn try_new_inner(request_id: &str, endpoint: &str) -> std::io::Result<Self> {
+        let dir = dump_dir()?;
+        let now = chrono::Local::now();
+        let file_name = format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), request_id);
+        let path: PathBuf = dir.join(file_name);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(
+            file,
+            "# CC Switch body dump\n\
+             # request_id: {request_id}\n\
+             # endpoint: {endpoint}\n\
+             # created_at: {}\n",
+            now.format("%Y-%m-%d %H:%M:%S%.3f %:z"),
+        )?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(file)),
+            request_id: request_id.to_string(),
+        })
+    }
+
+    /// 请求 ID（供外部关联）。
+    #[allow(dead_code)]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    /// 记录客户端 → CC Switch 的请求。
+    ///
+    /// * `method` — HTTP 方法字符串（例如 `POST`）。
+    /// * `uri` — 完整 URI 字符串（含 query）。
+    /// * `headers` — 客户端上送的 header 集合，会经过脱敏。
+    /// * `body_bytes` — 客户端上送的原始 body 字节；若能解析为 JSON 会 pretty 输出。
+    pub fn dump_client_request(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &HeaderMap,
+        body_bytes: &[u8],
+    ) {
+        let mut section = String::new();
+        section.push_str("===== [Client → CC Switch] Request =====\n");
+        section.push_str(&format!("Method: {method}\n"));
+        section.push_str(&format!("URI: {uri}\n"));
+        section.push_str("Headers:\n");
+        section.push_str(&format_headers(headers));
+        section.push_str("\nBody:\n");
+        section.push_str(&format_body(body_bytes));
+        section.push_str("\n\n");
+        self.write_section(&section);
+    }
+
+    /// 记录 CC Switch → 上游的请求。
+    ///
+    /// * `url` — 出站请求的最终 URL 字符串。
+    /// * `headers` — 已定稿的出站 header 集合，会经过脱敏。
+    /// * `body_bytes` — 已定稿的出站 body 字节；若能解析为 JSON 会 pretty 输出。
+    pub fn dump_upstream_request(&self, url: &str, headers: &HeaderMap, body_bytes: &[u8]) {
+        let mut section = String::new();
+        section.push_str("===== [CC Switch → Upstream] Request =====\n");
+        section.push_str(&format!("URL: {url}\n"));
+        section.push_str("Headers:\n");
+        section.push_str(&format_headers(headers));
+        section.push_str("\nBody:\n");
+        section.push_str(&format_body(body_bytes));
+        section.push_str("\n\n");
+        self.write_section(&section);
+    }
+
+    /// 记录上游返回的非流式响应。
+    ///
+    /// * `status` — HTTP 状态码。
+    /// * `headers` — 响应 header，会经过脱敏。
+    /// * `body_bytes` — 响应 body 字节（如果调用方已解压则传解压后的内容）。
+    pub fn dump_upstream_response_non_streaming(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        body_bytes: &[u8],
+    ) {
+        let mut section = String::new();
+        section.push_str("===== [Upstream → CC Switch] Response (non-streaming) =====\n");
+        section.push_str(&format!("Status: {status}\n"));
+        section.push_str("Headers:\n");
+        section.push_str(&format_headers(headers));
+        section.push_str("\nBody:\n");
+        section.push_str(&format_body(body_bytes));
+        section.push_str("\n\n");
+        self.write_section(&section);
+    }
+
+    /// 记录上游返回的 SSE 采样。
+    ///
+    /// * `status` — HTTP 状态码。
+    /// * `headers` — 响应 header，会经过脱敏。
+    /// * `head_events` — 前 [`SSE_HEAD_EVENTS`] 个事件文本。
+    /// * `tail_events` — 后 [`SSE_TAIL_EVENTS`] 个事件文本。
+    /// * `total_events` — 采样期间累计的完整事件数（用于评估中间被丢弃了多少）。
+    pub fn dump_upstream_response_sse(
+        &self,
+        status: u16,
+        headers: &HeaderMap,
+        head_events: &[String],
+        tail_events: &[String],
+        total_events: usize,
+    ) {
+        let mut section = String::new();
+        section.push_str("===== [Upstream → CC Switch] Response (SSE sampled) =====\n");
+        section.push_str(&format!("Status: {status}\n"));
+        section.push_str(&format!(
+            "Total events observed: {total_events} (head kept: {}, tail kept: {})\n",
+            head_events.len(),
+            tail_events.len()
+        ));
+        section.push_str("Headers:\n");
+        section.push_str(&format_headers(headers));
+        section.push_str("\n---- Head events ----\n");
+        for evt in head_events {
+            section.push_str(evt);
+            if !evt.ends_with('\n') {
+                section.push('\n');
+            }
+            section.push_str("----\n");
+        }
+        if total_events > head_events.len() + tail_events.len() {
+            section.push_str(&format!(
+                "... (omitted {} middle events) ...\n",
+                total_events - head_events.len() - tail_events.len()
+            ));
+        }
+        section.push_str("---- Tail events ----\n");
+        for evt in tail_events {
+            section.push_str(evt);
+            if !evt.ends_with('\n') {
+                section.push('\n');
+            }
+            section.push_str("----\n");
+        }
+        section.push_str("\n\n");
+        self.write_section(&section);
+    }
+
+    /// 追加一段文本到 dump 文件。IO 错误只落警告日志，不影响主流程。
+    fn write_section(&self, section: &str) {
+        if let Ok(mut file) = self.inner.lock() {
+            if let Err(e) = file.write_all(section.as_bytes()) {
+                log::warn!("[BodyDump] 写入 dump 文件失败: {e}");
+            }
+        }
+    }
+}
+
+/// 计算 dump 文件所在目录 `<app_config_dir>/logs/proxy-bodies`，必要时创建。
+fn dump_dir() -> std::io::Result<PathBuf> {
+    let base = crate::panic_hook::get_log_dir().join("proxy-bodies");
+    std::fs::create_dir_all(&base)?;
+    Ok(base)
+}
+
+/// 把 header 集合格式化为多行字符串；敏感字段替换为 `***REDACTED***`。
+fn format_headers(headers: &HeaderMap) -> String {
+    let mut out = String::new();
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str();
+        let display = if REDACTED_HEADERS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(name_str))
+        {
+            "***REDACTED***".to_string()
+        } else {
+            value
+                .to_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<non-utf8>".to_string())
+        };
+        out.push_str(&format!("  {name_str}: {display}\n"));
+    }
+    if out.is_empty() {
+        out.push_str("  (empty)\n");
+    }
+    out
+}
+
+/// 尝试把字节流当作 JSON pretty 输出；失败则按 UTF-8 lossy 原文写入。
+fn format_body(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "(empty body)".to_string();
+    }
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(value) => serde_json::to_string_pretty(&value)
+            .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned()),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// SSE 事件采样器：只保留前 [`SSE_HEAD_EVENTS`] 个和最后 [`SSE_TAIL_EVENTS`] 个事件。
+///
+/// 中间事件按顺序被丢弃，避免占用大量内存；总数量单独计数用于事后回顾。
+pub struct SseSampler {
+    head: Vec<String>,
+    tail: VecDeque<String>,
+    total: usize,
+}
+
+impl SseSampler {
+    /// 创建空采样器。
+    pub fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(SSE_HEAD_EVENTS),
+            tail: VecDeque::with_capacity(SSE_TAIL_EVENTS),
+            total: 0,
+        }
+    }
+
+    /// 记录一个完整事件文本；调用方负责拆分完整 SSE block。
+    pub fn record(&mut self, event: String) {
+        self.total = self.total.saturating_add(1);
+        if self.head.len() < SSE_HEAD_EVENTS {
+            self.head.push(event);
+            return;
+        }
+        if self.tail.len() == SSE_TAIL_EVENTS {
+            self.tail.pop_front();
+        }
+        self.tail.push_back(event);
+    }
+
+    /// 转成 (head, tail, total) 三元组。
+    pub fn finish(self) -> (Vec<String>, Vec<String>, usize) {
+        (self.head, self.tail.into_iter().collect(), self.total)
+    }
+}
+
+impl Default for SseSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 把字节缓冲区中所有已成形的 SSE 事件（以 `\n\n` 分隔）取出。
+///
+/// 返回值为完整事件的文本列表；剩余不完整的字节保留在 `buffer` 里等待下一次调用。
+pub fn drain_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut events = Vec::new();
+    loop {
+        let Some(pos) = find_event_boundary(buffer) else {
+            break;
+        };
+        // pos 是 "\n\n" 起点；把事件文本取出（不含分隔符），并把分隔符从 buffer 头部剥掉。
+        let block: Vec<u8> = buffer.drain(..pos).collect();
+        // 剥掉紧随其后的 "\n\n"（长度固定 2）。
+        buffer.drain(..2);
+        // SSE 允许 `\r\n\r\n`；额外兼容一下 CR。
+        let text = String::from_utf8_lossy(&block).into_owned();
+        events.push(text.trim_end_matches('\r').to_string());
+    }
+    events
+}
+
+/// 找到缓冲区中首个 `"\n\n"` 的位置。
+fn find_event_boundary(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|w| w == b"\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+
+    /// 敏感 header 应该被替换，普通 header 保持原样。
+    #[test]
+    fn format_headers_redacts_sensitive_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-secret"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("abc"),
+        );
+        let rendered = format_headers(&headers);
+        assert!(rendered.contains("authorization: ***REDACTED***"));
+        assert!(rendered.contains("x-request-id: abc"));
+    }
+
+    /// 合法 JSON 会被 pretty 输出。
+    #[test]
+    fn format_body_pretty_prints_json() {
+        let out = format_body(br#"{"a":1,"b":[2,3]}"#);
+        assert!(out.contains("\"a\": 1"));
+        assert!(out.contains("\"b\": [\n"));
+    }
+
+    /// 非 JSON 保持原文。
+    #[test]
+    fn format_body_falls_back_to_lossy_utf8() {
+        let out = format_body(b"not json");
+        assert_eq!(out, "not json");
+    }
+
+    /// 前 N 个事件全部保留，超出部分挤入末尾环形缓冲；中间被丢弃但总数正确。
+    #[test]
+    fn sse_sampler_keeps_head_and_tail() {
+        let head = SSE_HEAD_EVENTS;
+        let tail = SSE_TAIL_EVENTS;
+        let extra = 20;
+        let total = head + tail + extra;
+
+        let mut sampler = SseSampler::new();
+        for i in 0..total {
+            sampler.record(format!("event-{i}"));
+        }
+        let (h, t, n) = sampler.finish();
+        assert_eq!(n, total);
+        assert_eq!(h.len(), head);
+        assert_eq!(t.len(), tail);
+        assert_eq!(h.first().map(String::as_str), Some("event-0"));
+        assert_eq!(t.last().map(String::as_str), Some(&*format!("event-{}", total - 1)));
+    }
+
+    /// 缓冲区中的完整事件被抽取；未闭合部分保留待续。
+    #[test]
+    fn drain_sse_events_splits_by_double_newline() {
+        let mut buf: Vec<u8> =
+            b"event: a\ndata: 1\n\nevent: b\ndata: 2\n\nevent: c\ndata: 3".to_vec();
+        let events = drain_sse_events(&mut buf);
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("event: a"));
+        assert!(events[1].contains("event: b"));
+        assert_eq!(String::from_utf8(buf).unwrap(), "event: c\ndata: 3");
+    }
+}

@@ -3,6 +3,7 @@
 //! 统一处理流式和非流式 API 响应
 
 use super::{
+    body_dump::{drain_sse_events, BodyDumper, SseSampler},
     content_encoding::{decompress_body, get_content_encoding},
     forwarder::ActiveConnectionGuard,
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
@@ -45,6 +46,16 @@ const HOP_BY_HOP_RESPONSE_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// 流式 dump 需要的上下文快照：响应状态、响应头、请求级 dumper。
+///
+/// 之所以拆成结构体而不是元组，是让 [`create_logged_passthrough_stream`] 的签名
+/// 保持可读，同时便于未来扩展（例如加起始时间戳）。
+pub struct SseDumpContext {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub dumper: std::sync::Arc<BodyDumper>,
+}
 
 /// 移除响应侧 hop-by-hop 头，以及 `Connection` 中点名的扩展头。
 pub(crate) fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
@@ -185,6 +196,13 @@ pub async fn handle_streaming(
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
 
+    // body dump 上下文：仅在 Codex /responses 链路挂了 dumper 时构建。
+    let body_dump_ctx = ctx.body_dumper.as_ref().map(|dumper| SseDumpContext {
+        status: status.as_u16(),
+        headers: response_headers.clone(),
+        dumper: dumper.clone(),
+    });
+
     // 创建带日志和超时的透传流
     let logged_stream = create_logged_passthrough_stream(
         stream,
@@ -192,6 +210,7 @@ pub async fn handle_streaming(
         usage_collector,
         timeout_config,
         connection_guard,
+        body_dump_ctx,
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -223,6 +242,12 @@ pub async fn handle_non_streaming(
     let (mut response_headers, status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     strip_hop_by_hop_response_headers(&mut response_headers);
+
+    // 诊断 body dump：仅 Codex /responses 链路在开关打开时挂了 dumper。
+    // 这里读的是已解压 body，避免用户还得手工解 gzip / zstd。
+    if let Some(dumper) = ctx.body_dumper.as_ref() {
+        dumper.dump_upstream_response_non_streaming(status.as_u16(), &response_headers, &body_bytes);
+    }
 
     log::debug!(
         "[{}] 上游响应体内容: {}",
@@ -674,12 +699,16 @@ async fn log_usage_internal(
 }
 
 /// 创建带日志记录和超时控制的透传流
+///
+/// 若传入 `body_dump_ctx`，会在流式转发过程中采样 SSE 事件（前 200 + 后 50），
+/// 在流结束时写入 dump 文件。
 pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
     tag: &'static str,
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    body_dump_ctx: Option<SseDumpContext>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
@@ -690,6 +719,12 @@ pub fn create_logged_passthrough_stream(
         let inspect_sse_events =
             collector.is_some() || log::log_enabled!(log::Level::Debug);
         let mut is_first_chunk = true;
+
+        // body dump 采样器：仅在 Codex /responses 链路挂了 dumper 时启用。
+        // 与 usage collector 并行工作：dumper 关心"上游发了什么字节"，
+        // collector 关心"这些字节的语义 usage"。
+        let mut dump_sampler = body_dump_ctx.as_ref().map(|_| SseSampler::new());
+        let mut dump_raw_buf: Vec<u8> = Vec::new();
 
         // 超时配置
         let first_byte_timeout = if timeout_config.first_byte_timeout > 0 {
@@ -739,6 +774,16 @@ pub fn create_logged_passthrough_stream(
                         );
                     }
                     is_first_chunk = false;
+
+                    // body dump 采样：抽出所有完整 SSE 事件并交给 sampler。
+                    // 这里独立于 inspect_sse_events 分支，确保即使 usage logging 关闭也能 dump。
+                    if let Some(sampler) = dump_sampler.as_mut() {
+                        dump_raw_buf.extend_from_slice(&bytes);
+                        for evt in drain_sse_events(&mut dump_raw_buf) {
+                            sampler.record(evt);
+                        }
+                    }
+
                     if inspect_sse_events {
                         crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
@@ -794,6 +839,26 @@ pub fn create_logged_passthrough_stream(
         }
         if let Some(guard) = &mut finish_guard {
             guard.disarm();
+        }
+
+        // 刷入 SSE 采样到 dump 文件（若开关打开且属于 Codex /responses 链路）。
+        if let (Some(sampler), Some(ctx)) = (dump_sampler.take(), body_dump_ctx.as_ref()) {
+            // 若最后一段没有 \n\n 收尾（上游异常断流），把残余原样当成一个事件补进去。
+            let mut sampler = sampler;
+            if !dump_raw_buf.is_empty() {
+                let tail = String::from_utf8_lossy(&dump_raw_buf).into_owned();
+                if !tail.trim().is_empty() {
+                    sampler.record(tail);
+                }
+            }
+            let (head, tail, total) = sampler.finish();
+            ctx.dumper.dump_upstream_response_sse(
+                ctx.status,
+                &ctx.headers,
+                &head,
+                &tail,
+                total,
+            );
         }
     }
 }

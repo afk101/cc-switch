@@ -5,6 +5,7 @@
 use crate::app_config::AppType;
 use crate::provider::Provider;
 use crate::proxy::{
+    body_dump::BodyDumper,
     extract_session_id,
     forwarder::RequestForwarder,
     server::ProxyState,
@@ -12,6 +13,7 @@ use crate::proxy::{
     ProxyError,
 };
 use axum::http::HeaderMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 流式超时配置
@@ -70,6 +72,10 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 请求级 body dump 诊断器（仅 Codex `/responses` 链路会填充；开关关时始终为 None）。
+    ///
+    /// forwarder 通过 `body_dumper()` 读取；handlers 侧在响应处理阶段读取。
+    pub body_dumper: Option<Arc<BodyDumper>>,
 }
 
 impl RequestContext {
@@ -173,6 +179,7 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            body_dumper: None,
         })
     }
 
@@ -241,6 +248,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            self.body_dumper.clone(),
         )
     }
 

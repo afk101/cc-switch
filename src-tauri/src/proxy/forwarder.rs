@@ -4,6 +4,7 @@
 
 use super::hyper_client::ProxyResponse;
 use super::{
+    body_dump::BodyDumper,
     body_filter::filter_private_params_with_whitelist,
     content_encoding::{decompress_body, get_content_encoding},
     error::*,
@@ -128,6 +129,8 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// 请求级 body dump 诊断器；仅 Codex `/responses` 链路会填充。
+    body_dumper: Option<Arc<BodyDumper>>,
 }
 
 impl RequestForwarder {
@@ -195,6 +198,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        body_dumper: Option<Arc<BodyDumper>>,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -218,6 +222,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            body_dumper,
         }
     }
 
@@ -1876,6 +1881,11 @@ impl RequestForwarder {
             }
         }
 
+        // 出站 body dump（仅在 Codex /responses 链路挂了 dumper 时执行）。
+        if let Some(dumper) = self.body_dumper.as_ref() {
+            dumper.dump_upstream_request(&url, &ordered_headers, &body_bytes);
+        }
+
         // 确定超时
         let timeout = if self.non_streaming_timeout.is_zero() {
             std::time::Duration::from_secs(600) // 默认 600 秒
@@ -2844,6 +2854,7 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            body_dumper: None,
         }
     }
 

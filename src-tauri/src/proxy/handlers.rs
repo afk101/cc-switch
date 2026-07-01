@@ -43,6 +43,8 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 
+use super::body_dump::BodyDumper;
+
 // ============================================================================
 // 健康检查和状态查询（简单端点）
 // ============================================================================
@@ -402,6 +404,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            None,
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -705,6 +708,18 @@ pub async fn handle_responses(
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
+    // 诊断 body dump：仅在 CC_SWITCH_DUMP_BODY 打开时生效。挂到 ctx 后，
+    // forwarder 会写入出站请求、response processor 会写入上游响应体或 SSE 采样。
+    if let Some(dumper) = BodyDumper::try_new(&ctx.session_id, "/responses") {
+        dumper.dump_client_request(
+            "POST",
+            &uri.to_string(),
+            &headers,
+            body_bytes.as_ref(),
+        );
+        ctx.body_dumper = Some(dumper);
+    }
+
     let is_stream = body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -783,6 +798,17 @@ pub async fn handle_responses_compact(
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
+
+    // 诊断 body dump：与 handle_responses 保持一致，仅在 CC_SWITCH_DUMP_BODY 打开时生效。
+    if let Some(dumper) = BodyDumper::try_new(&ctx.session_id, "/responses/compact") {
+        dumper.dump_client_request(
+            "POST",
+            &uri.to_string(),
+            &headers,
+            body_bytes.as_ref(),
+        );
+        ctx.body_dumper = Some(dumper);
+    }
 
     let is_stream = body
         .get("stream")
@@ -932,6 +958,7 @@ async fn handle_codex_chat_to_responses_transform(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            None,
         );
 
         let mut headers = axum::http::HeaderMap::new();
