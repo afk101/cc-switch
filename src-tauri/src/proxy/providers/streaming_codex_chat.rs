@@ -403,9 +403,13 @@ impl ChatToResponsesState {
 
     fn push_tool_call_delta(&mut self, tool_call: &Value, reasoning: Option<&str>) -> Vec<Bytes> {
         let chat_index = tool_call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // 上游可能发 `id: ""` 的 delta（如 cortex-18 的旧模型）。忽略空串，
+        // 避免覆盖已经累积到的非空 call_id 导致客户端拿到空 id，
+        // 进而下一轮 /responses 请求带着空 call_id 触发上游 400。
         let id_delta = tool_call
             .get("id")
             .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
             .map(str::to_string);
         let function = tool_call.get("function").unwrap_or(&Value::Null);
         let name_delta = function
@@ -1328,5 +1332,26 @@ mod tests {
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
         assert!(!output.contains("event: response.completed"));
+    }
+
+    /// B-1：上游 SSE 首个 delta 携带非空 id，后续 delta 携带 id:""
+    /// 不能覆盖已有的非空 call_id，最终 output_item.done 里必须仍是原 id。
+    /// 复用同文件的 `collect` helper 驱动 chat SSE → responses SSE 转换。
+    #[tokio::test]
+    async fn streaming_ignores_empty_id_in_tool_call_delta() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_kept\",\"type\":\"function\",\"function\":{\"name\":\"f\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+        assert!(
+            output.contains("\"call_id\":\"call_kept\""),
+            "output 应保留原 call_id call_kept，实得：\n{output}"
+        );
+        assert!(
+            !output.contains("\"call_id\":\"\""),
+            "output 不应含空串 call_id，实得：\n{output}"
+        );
     }
 }
