@@ -18,7 +18,7 @@ use crate::proxy::{
     },
 };
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "frequency_penalty",
@@ -543,10 +543,9 @@ fn append_responses_input_as_chat_messages(
     let mut pending_tool_calls = Vec::new();
     let mut pending_reasoning: Option<String> = None;
     let mut last_assistant_index: Option<usize> = None;
-    // 记录“上一次为 function_call 生成的兜底 call_id”，供紧随其后的
-    // function_call_output 复用，保证同一次工具调用两端 id 相等。
-    // 一旦遇到已有非空 call_id 或与 tool 调用无关的项，就重置这个记忆槽。
-    let mut last_generated_call_id: Option<String> = None;
+    // 并行工具调用 FIFO 配对队列：function_call 时 push_back，function_call_output 时 pop_front。
+    // 见 findings/2026-07-01-codex-parallel-tool-calls-mismatch-findings.md
+    let mut pending_call_ids: VecDeque<String> = VecDeque::new();
 
     match input {
         Value::String(text) => {
@@ -560,7 +559,7 @@ fn append_responses_input_as_chat_messages(
                 // 在下沉到具体转换逻辑之前，先按需回填 function_call /
                 // function_call_output 的 call_id，避免下游生成的
                 // tool_calls[0].id / tool_call_id 为空字符串。
-                let prepared = backfill_input_item_call_id(item, &mut last_generated_call_id);
+                let prepared = backfill_input_item_call_id(item, &mut pending_call_ids);
                 append_responses_item_as_chat_message(
                     &prepared,
                     messages,
@@ -573,7 +572,7 @@ fn append_responses_input_as_chat_messages(
         }
         Value::Object(_) => {
             // 单对象输入不存在配对场景，但仍需保证 call_id 非空。
-            let prepared = backfill_input_item_call_id(input, &mut last_generated_call_id);
+            let prepared = backfill_input_item_call_id(input, &mut pending_call_ids);
             append_responses_item_as_chat_message(
                 &prepared,
                 messages,
@@ -604,20 +603,16 @@ fn append_responses_input_as_chat_messages(
 /// 消息里 `messages[N].tool_calls[0].id` 与 `messages[N+1].tool_call_id` 都会
 /// 变成空串，OpenAI 兼容后端会直接 400。
 ///
-/// 配对策略：按 `input` 数组的顺序，用 `last_generated` 记忆最近一次为
-/// `function_call` 生成的兜底 id，供紧跟其后的 `function_call_output` 复用，
-/// 从而保证同一次工具调用两端 id 相等。
-/// - 空/缺失的 `function_call.call_id` → 生成 `tool_call_<uuid>` 并写入
-///   `last_generated`。
-/// - 空/缺失的 `function_call_output.call_id` → 优先复用 `last_generated`；
-///   若为空则独立生成，保底也不出空串。
-/// - 已带非空 `call_id` 的工具项 → 保留原值，并清空 `last_generated`，避免影响
-///   下一对配对逻辑。
-/// - 其它非工具项 → 不改写，但同样清空 `last_generated`，避免跨消息误复用。
+/// 配对策略：使用 `pending` FIFO 队列（`VecDeque<String>`）维持并行工具调用的
+/// 顺序配对关系：
+/// - `function_call` 空 call_id → 生成 id，`push_back` 到队列。
+/// - `function_call_output` 空 call_id → `pop_front` 从队列取 id（FIFO 保证
+///   第 i 个 call 与第 i 个 output 配对）。
+/// - 已有非空 call_id 的工具项 / 非工具项 → `clear` 队列，打断配对上下文。
 ///
 /// 返回值：始终返回一个新的 `Value`（必要时是原始值的 `clone`），保证不会动到
 /// 上游持有的原始数组。
-fn backfill_input_item_call_id(item: &Value, last_generated: &mut Option<String>) -> Value {
+fn backfill_input_item_call_id(item: &Value, pending: &mut VecDeque<String>) -> Value {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
         Some("function_call") => {
@@ -632,10 +627,10 @@ fn backfill_input_item_call_id(item: &Value, last_generated: &mut Option<String>
                 if needs_backfill {
                     let synthesized = generate_backfilled_call_id();
                     obj.insert("call_id".to_string(), Value::String(synthesized.clone()));
-                    *last_generated = Some(synthesized);
+                    pending.push_back(synthesized);
                 } else {
-                    // 已有真实 id：清空记忆槽，避免污染下一对配对。
-                    *last_generated = None;
+                    // 已有真实 id：清空队列，避免污染下一对配对。
+                    pending.clear();
                 }
             }
             cloned
@@ -649,22 +644,22 @@ fn backfill_input_item_call_id(item: &Value, last_generated: &mut Option<String>
                     .map(|s| s.is_empty())
                     .unwrap_or(true);
                 if needs_backfill {
-                    // 优先复用上一步 function_call 生成的 id 以保证配对相等；
-                    // 若没有（例如异常序列），退化为独立生成，保底也不出空串。
-                    let synthesized = last_generated
-                        .take()
+                    // FIFO：从队头取 id 保证与第 i 个 function_call 配对；
+                    // 若队列为空（异常序列），退化为独立生成，保底也不出空串。
+                    let synthesized = pending
+                        .pop_front()
                         .unwrap_or_else(generate_backfilled_call_id);
                     obj.insert("call_id".to_string(), Value::String(synthesized));
                 } else {
-                    *last_generated = None;
+                    pending.clear();
                 }
             }
             cloned
         }
         _ => {
             // 非工具项会打断配对上下文（例如中间穿插了 user/assistant 消息），
-            // 清空记忆槽避免跨越消息误复用同一 id。
-            *last_generated = None;
+            // 清空队列避免跨越消息误复用同一 id。
+            pending.clear();
             item.clone()
         }
     }
@@ -3424,7 +3419,10 @@ mod tests {
             .as_str()
             .expect("tool_call_id string");
         assert!(!tool_call_id.is_empty(), "tool_calls[0].id 不应为空");
-        assert_eq!(tool_call_id, tool_msg_id, "call 与 output 应共享同一个回填 id");
+        assert_eq!(
+            tool_call_id, tool_msg_id,
+            "call 与 output 应共享同一个回填 id"
+        );
         assert!(
             tool_call_id.starts_with("tool_call_"),
             "回填 id 应符合 tool_call_<idx> 规范，实得 {tool_call_id}"
@@ -3488,5 +3486,67 @@ mod tests {
             .expect("id string");
         assert!(!id.is_empty());
         assert!(id.starts_with("tool_call_"));
+    }
+
+    /// A-4：并行工具调用 FIFO 配对——2 个连续 function_call + 2 个连续
+    /// function_call_output（全部空 call_id），转换后第 i 个 tool_calls[i].id
+    /// 与第 i 个 tool 消息的 tool_call_id 必须按 FIFO 顺序相等。
+    #[test]
+    fn codex_input_backfills_parallel_tool_calls_with_fifo_pairing() {
+        let input = json!({
+            "model": "cortex-18",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "file1 file2"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "/home/user"
+                }
+            ]
+        });
+        let result = responses_to_chat_completions(input).expect("transform ok");
+        let messages = result["messages"].as_array().expect("messages array");
+        // 找到 assistant 消息（含 tool_calls）
+        let (assistant_idx, _) = messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant with tool_calls exists");
+        let tool_calls = messages[assistant_idx]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls.len(), 2, "应有 2 个并行 tool_calls");
+        // 找到紧随其后的 2 条 tool 消息
+        let tool_msg_1 = &messages[assistant_idx + 1];
+        let tool_msg_2 = &messages[assistant_idx + 2];
+        assert_eq!(tool_msg_1["role"], "tool");
+        assert_eq!(tool_msg_2["role"], "tool");
+        // FIFO 配对断言：第 i 个 tool_call.id == 第 i 个 tool.tool_call_id
+        let call_id_0 = tool_calls[0]["id"].as_str().expect("call 0 id");
+        let call_id_1 = tool_calls[1]["id"].as_str().expect("call 1 id");
+        let output_id_0 = tool_msg_1["tool_call_id"].as_str().expect("output 0 id");
+        let output_id_1 = tool_msg_2["tool_call_id"].as_str().expect("output 1 id");
+        assert!(!call_id_0.is_empty());
+        assert!(!call_id_1.is_empty());
+        assert_ne!(call_id_0, call_id_1, "两个并行 call 应有不同的 id");
+        assert_eq!(call_id_0, output_id_0, "FIFO: call#0 应与 output#0 配对");
+        assert_eq!(call_id_1, output_id_1, "FIFO: call#1 应与 output#1 配对");
     }
 }
