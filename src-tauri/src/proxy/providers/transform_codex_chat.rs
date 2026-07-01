@@ -42,6 +42,7 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const CODEX_APP_NAMESPACE: &str = "codex_app";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
@@ -196,7 +197,7 @@ impl CodexToolContext {
         };
 
         // 过滤 Codex App 内部工具（依赖 OpenAI 后端，代理链路不可用）
-        if namespace == "codex_app" {
+        if namespace == CODEX_APP_NAMESPACE {
             return;
         }
 
