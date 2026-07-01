@@ -3549,4 +3549,54 @@ mod tests {
         assert_eq!(call_id_0, output_id_0, "FIFO: call#0 应与 output#0 配对");
         assert_eq!(call_id_1, output_id_1, "FIFO: call#1 应与 output#1 配对");
     }
+
+    #[test]
+    fn test_codex_app_namespace_tools_are_filtered() {
+        // 模拟包含 codex_app namespace 的 Responses 请求
+        let body = json!({
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "codex_app",
+                    "description": "Tools provided by the Codex app.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "automation_update",
+                            "description": "Create, update, view, or delete recurring automations.",
+                            "strict": false,
+                            "parameters": {
+                                "$defs": {"__schema0": {"type": "string"}},
+                                "oneOf": [{"type": "object"}]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather info",
+                    "parameters": {"type": "object"}
+                }
+            ],
+            "input": "What's the weather?"
+        });
+
+        let context = build_codex_tool_context_from_request(&body);
+        let chat_tools = context.chat_tools();
+
+        // codex_app namespace 的工具不应出现
+        let tool_names: Vec<&str> = chat_tools
+            .iter()
+            .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .collect();
+
+        assert!(!tool_names.contains(&"codex_app__automation_update"),
+            "codex_app namespace 工具应被过滤");
+
+        // 其他工具应正常保留
+        assert!(tool_names.contains(&"get_weather"),
+            "非 codex_app namespace 工具应保留");
+    }
 }
