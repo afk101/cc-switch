@@ -194,6 +194,12 @@ impl CodexToolContext {
         let Some(namespace) = namespace_tool.get("name").and_then(|v| v.as_str()) else {
             return;
         };
+
+        // 过滤 Codex App 内部工具（依赖 OpenAI 后端，代理链路不可用）
+        if namespace == "codex_app" {
+            return;
+        }
+
         let Some(children) = namespace_tool
             .get("tools")
             .or_else(|| namespace_tool.get("children"))
