@@ -165,3 +165,38 @@ if let Some(id) = id_delta {
 - 已有非流式兜底（保留不动）：`transform_codex_chat.rs:1433-1438`。
 - 已有流式 finalize 兜底（保留不动）：`streaming_codex_chat.rs:727-728`。
 - 相关既有测试：`handlers.rs:2254 chat_sse_to_response_value_backfills_sparse_tool_call_ids`。
+
+---
+
+## v2 追加：并行工具调用 FIFO 配对修复
+
+### 背景
+
+commit `17dfc467` 按本 spec v1 实现了入站回填，但使用 `Option<String>` 单槽配对。该方案在串行场景（1 call + 1 output）正常，但在 Codex 客户端发起**并行工具调用**（N 个连续 `function_call` + N 个连续 `function_call_output`，全部空 `call_id`）时配对错乱，上游再次返回 HTTP 400。
+
+详见 `docs/superpowers/findings/2026-07-01-codex-parallel-tool-calls-mismatch-findings.md`。
+
+### 修复方案
+
+将 `backfill_input_item_call_id` 的配对记忆从 `Option<String>` 升级为 `VecDeque<String>`（FIFO 队列）：
+
+- `function_call` 空 call_id → 生成 id，`push_back`
+- `function_call_output` 空 call_id → `pop_front`（FIFO 保证顺序配对）
+- 非工具项 / 非空 call_id → `.clear()`（打断配对上下文，与 v1 语义一致）
+
+### 改动范围
+
+仅 `src-tauri/src/proxy/providers/transform_codex_chat.rs`：
+
+1. 文件头补 `use std::collections::VecDeque;`
+2. 调用方初始化 `let mut pending_call_ids: VecDeque<String> = VecDeque::new();`（替代 `Option<String>`）
+3. `backfill_input_item_call_id` 签名 `&mut Option<String>` → `&mut VecDeque<String>`
+4. 函数内部：`Some(synthesized)` → `push_back(synthesized)`；`.take()` → `.pop_front()`；`= None` → `.clear()`
+
+### 新增验收标准
+
+- **AC-9（并行配对）**：`input` 中含 2 个连续 `function_call`（空 call_id）+ 2 个连续 `function_call_output`（空 call_id），转换后第 i 个 `tool_calls[i].id` 与第 i 个 `tool` 消息的 `tool_call_id` 相等（FIFO 顺序配对）。
+
+### 新增测试
+
+- **T-A4**：`codex_input_backfills_parallel_tool_calls_with_fifo_pairing` — 2 calls + 2 outputs，断言 FIFO 配对。

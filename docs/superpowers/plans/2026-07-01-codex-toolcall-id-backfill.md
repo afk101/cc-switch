@@ -436,3 +436,244 @@ git commit -m "docs(findings): 追加 tool_call.id 空串修复的端到端回�
 
 Refs: docs/superpowers/plans/2026-07-01-codex-toolcall-id-backfill.md"
 ```
+
+---
+
+## v2 追加：并行工具调用 FIFO 配对修复
+
+> Task 1-5 已在 commit `17dfc467` 中完成（v1 单槽方案）。v2 修复并行工具调用配对错乱。
+
+### Task 6: A-4 — 并行工具调用 FIFO 配对测试（红）
+
+**Files:**
+- Modify: `src-tauri/src/proxy/providers/transform_codex_chat.rs`（在 `#[cfg(test)] mod tests` 内追加）
+
+- [ ] **Step 1: 写入失败测试，追加到 `tests` 模块尾部（A-3 测试之后、`}` 之前）**
+
+```rust
+    /// A-4：并行工具调用 FIFO 配对——2 个连续 function_call + 2 个连续
+    /// function_call_output（全部空 call_id），转换后第 i 个 tool_calls[i].id
+    /// 与第 i 个 tool 消息的 tool_call_id 必须按 FIFO 顺序相等。
+    #[test]
+    fn codex_input_backfills_parallel_tool_calls_with_fifo_pairing() {
+        let input = json!({
+            "model": "cortex-18",
+            "input": [
+                { "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"ls\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"pwd\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "file1 file2"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "",
+                    "output": "/home/user"
+                }
+            ]
+        });
+        let result = responses_to_chat_completions(input).expect("transform ok");
+        let messages = result["messages"].as_array().expect("messages array");
+        // 找到 assistant 消息（含 tool_calls）
+        let (assistant_idx, _) = messages
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("assistant with tool_calls exists");
+        let tool_calls = messages[assistant_idx]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(tool_calls.len(), 2, "应有 2 个并行 tool_calls");
+        // 找到紧随其后的 2 条 tool 消息
+        let tool_msg_1 = &messages[assistant_idx + 1];
+        let tool_msg_2 = &messages[assistant_idx + 2];
+        assert_eq!(tool_msg_1["role"], "tool");
+        assert_eq!(tool_msg_2["role"], "tool");
+        // FIFO 配对断言：第 i 个 tool_call.id == 第 i 个 tool.tool_call_id
+        let call_id_0 = tool_calls[0]["id"].as_str().expect("call 0 id");
+        let call_id_1 = tool_calls[1]["id"].as_str().expect("call 1 id");
+        let output_id_0 = tool_msg_1["tool_call_id"].as_str().expect("output 0 id");
+        let output_id_1 = tool_msg_2["tool_call_id"].as_str().expect("output 1 id");
+        assert!(!call_id_0.is_empty());
+        assert!(!call_id_1.is_empty());
+        assert_ne!(call_id_0, call_id_1, "两个并行 call 应有不同的 id");
+        assert_eq!(call_id_0, output_id_0, "FIFO: call#0 应与 output#0 配对");
+        assert_eq!(call_id_1, output_id_1, "FIFO: call#1 应与 output#1 配对");
+    }
+```
+
+- [ ] **Step 2: 运行测试验证红（必须失败）**
+
+Run:
+```bash
+cargo test -p cc-switch --lib \
+  proxy::providers::transform_codex_chat::tests::codex_input_backfills_parallel_tool_calls_with_fifo_pairing
+```
+Expected：FAIL — 当前 `Option<String>` 单槽方案会导致 `call_id_0 != output_id_0`（错配）或 `output_id_1` 是全新 id（无配对）。
+
+---
+
+### Task 7: A-5 — VecDeque FIFO 队列修复（绿）
+
+**Files:**
+- Modify: `src-tauri/src/proxy/providers/transform_codex_chat.rs`
+
+- [ ] **Step 1: 补 `use std::collections::VecDeque`**
+
+在文件头部的 `use` 区域（其他 `std::` 导入附近）添加：
+
+```rust
+use std::collections::VecDeque;
+```
+
+- [ ] **Step 2: 修改调用方初始化**
+
+定位 `codex_input_to_messages`（或等价入口）中的：
+
+```rust
+let mut last_generated_call_id: Option<String> = None;
+```
+
+改为：
+
+```rust
+// 并行工具调用 FIFO 配对队列：function_call 时 push_back，function_call_output 时 pop_front。
+// 见 findings/2026-07-01-codex-parallel-tool-calls-mismatch-findings.md
+let mut pending_call_ids: VecDeque<String> = VecDeque::new();
+```
+
+同函数内所有传递 `&mut last_generated_call_id` 的调用点改为 `&mut pending_call_ids`（共 2 处，约 563 行和 576 行）。
+
+- [ ] **Step 3: 修改 `backfill_input_item_call_id` 函数签名和内部逻辑**
+
+将整个函数（约 620-671 行）替换为：
+
+```rust
+/// 为 `/responses` `input` 数组中 `call_id` 为空或缺失的 `function_call` /
+/// `function_call_output` 项补齐兜底 id。
+///
+/// 配对策略：使用 `pending` FIFO 队列（`VecDeque<String>`）维持并行工具调用的
+/// 顺序配对关系：
+/// - `function_call` 空 call_id → 生成 id，`push_back` 到队列。
+/// - `function_call_output` 空 call_id → `pop_front` 从队列取 id（FIFO 保证
+///   第 i 个 call 与第 i 个 output 配对）。
+/// - 已有非空 call_id 的工具项 / 非工具项 → `clear` 队列，打断配对上下文。
+///
+/// 返回值：始终返回一个新的 `Value`（必要时是原始值的 `clone`），保证不会动到
+/// 上游持有的原始数组。
+fn backfill_input_item_call_id(item: &Value, pending: &mut VecDeque<String>) -> Value {
+    let item_type = item.get("type").and_then(|v| v.as_str());
+    match item_type {
+        Some("function_call") => {
+            let mut cloned = item.clone();
+            // 仅处理 object；非 object 直接返回，交给下游逻辑按原样处理。
+            if let Some(obj) = cloned.as_object_mut() {
+                let needs_backfill = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if needs_backfill {
+                    let synthesized = generate_backfilled_call_id();
+                    obj.insert("call_id".to_string(), Value::String(synthesized.clone()));
+                    pending.push_back(synthesized);
+                } else {
+                    // 已有真实 id：清空队列，避免污染下一对配对。
+                    pending.clear();
+                }
+            }
+            cloned
+        }
+        Some("function_call_output") => {
+            let mut cloned = item.clone();
+            if let Some(obj) = cloned.as_object_mut() {
+                let needs_backfill = obj
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if needs_backfill {
+                    // FIFO：从队头取 id 保证与第 i 个 function_call 配对；
+                    // 若队列为空（异常序列），退化为独立生成，保底也不出空串。
+                    let synthesized = pending
+                        .pop_front()
+                        .unwrap_or_else(generate_backfilled_call_id);
+                    obj.insert("call_id".to_string(), Value::String(synthesized));
+                } else {
+                    pending.clear();
+                }
+            }
+            cloned
+        }
+        _ => {
+            // 非工具项会打断配对上下文（例如中间穿插了 user/assistant 消息），
+            // 清空队列避免跨越消息误复用同一 id。
+            pending.clear();
+            item.clone()
+        }
+    }
+}
+```
+
+- [ ] **Step 4: 更新函数文档注释**
+
+函数上方的 doc comment 已在 Step 3 中一并替换，无需额外操作。
+
+- [ ] **Step 5: 运行 A-4 测试验证绿**
+
+Run:
+```bash
+cargo test -p cc-switch --lib \
+  proxy::providers::transform_codex_chat::tests::codex_input_backfills_parallel_tool_calls_with_fifo_pairing
+```
+Expected：PASS。
+
+- [ ] **Step 6: 运行全部 A 组测试确认回归**
+
+Run:
+```bash
+cargo test -p cc-switch --lib proxy::providers::transform_codex_chat::tests
+```
+Expected：A-1 / A-2 / A-3 / A-4 全部 PASS；已有测试全部 PASS。
+
+- [ ] **Step 7: 全量测试与 lint**
+
+Run:
+```bash
+cargo test -p cc-switch --lib
+cargo clippy -p cc-switch --lib -- -D warnings
+cargo fmt --all -- --check
+```
+Expected：全绿。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add src-tauri/src/proxy/providers/transform_codex_chat.rs
+git commit -m "fix(codex): 用 VecDeque FIFO 队列替换单槽配对，修复并行工具调用错配
+
+backfill_input_item_call_id 的 last_generated: Option<String> 只能
+记住最近一个生成的 call_id，在并行工具调用场景（N 个连续
+function_call + N 个连续 function_call_output，全部空 call_id）
+会导致后面的 call 覆盖前面的 id，output 错配到错误的 call。
+
+改用 VecDeque<String> FIFO 队列：call 端 push_back、output 端
+pop_front，自然维持第 i 个 call 与第 i 个 output 的顺序配对。
+
+现象：智汇云cc / cortex-18 并行工具调用时上游返回
+'No tool output found for function call tool_call_804dfe50...'。
+
+Refs: docs/superpowers/findings/2026-07-01-codex-parallel-tool-calls-mismatch-findings.md"
+```
