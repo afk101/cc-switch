@@ -1,0 +1,19 @@
+# 本地开发覆盖：显式指定系统 cc 为 linker，避免被 nvm 中同名的 claude-code-proxy shim 遮蔽
+# 说明：默认 rustc 通过 `cc` 调用 linker（`cc` 是 clang 的 driver），
+# 由于当前 shell 的 PATH 中 nvm 版本的 `cc`（一个 node 脚本）优先，会导致 link 阶段静默失败，
+# 表现为编译出的 build script 无法执行（No such file or directory / os error 2）。
+# 这里为 macOS aarch64 与 x86_64 两种目标都固定 linker 到系统 clang 驱动。
+
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"
+
+# cc-rs 库（编译 C/Objective-C build 脚本，如 objc2-exception-helper）也会读 `cc`，
+# 必须显式指定 CC/CXX，否则同样会被 nvm 中的 claude-code-proxy shim 拦截。
+[env]
+CC = "/usr/bin/cc"
+CXX = "/usr/bin/c++"
+CC_aarch64-apple-darwin = "/usr/bin/cc"
+CXX_aarch64-apple-darwin = "/usr/bin/c++"

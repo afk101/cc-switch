@@ -1,4 +1,15 @@
 packages: []
 
+allowBuilds:
+  esbuild: true
+  msw: true
+
+# allowBuilds:
+#   esbuild: set this to true or false
+#   msw: set this to true or false
+
+# 允许执行 postinstall 构建脚本的依赖白名单（pnpm >= 10 需要显式声明）
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'
+  - esbuild
+  - msw
