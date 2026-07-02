@@ -291,7 +291,7 @@ async function performUpgrade(targetTag) {
     console.log("  1. 解决冲突文件");
     console.log("  2. git add <已解决的文件>");
     console.log("  3. git commit");
-    console.log(`  4. git push origin ${newBranch}`);
+    console.log(`  4. git push -u origin ${newBranch}`);
     process.exit(1);
   }
 
@@ -308,7 +308,7 @@ async function performUpgrade(targetTag) {
   if (shouldPush) {
     log(`正在推送分支 "${newBranch}" 到 origin...`, "info");
     try {
-      run(`git push origin ${newBranch}`);
+      run(`git push -u origin ${newBranch}`);
       log(`分支 "${newBranch}" 已成功推送到 origin！`, "success");
     } catch (err) {
       log(`推送失败，请手动执行：git push origin ${newBranch}`, "error");
@@ -316,7 +316,7 @@ async function performUpgrade(targetTag) {
     }
   } else {
     log("已跳过推送，可稍后手动执行：", "info");
-    console.log(`  git push origin ${newBranch}`);
+    console.log(`  git push -u origin ${newBranch}`);
   }
 }
 
