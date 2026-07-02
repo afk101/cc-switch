@@ -96,16 +96,48 @@ git commit -m "refactor(proxy): replace runtime env var with compile-time consta
 
 ---
 
-### Task 3: 验证构建时变量生效
+### Task 3: 添加 npm scripts 快捷命令
+
+**Files:**
+- Modify: `package.json`
+
+- [ ] **Step 1: 在 package.json 的 scripts 中添加 build:dump 和 dev:dump**
+
+在现有 `"dev:renderer"` 之前添加两条：
+
+```json
+"build:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri build",
+"dev:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri dev",
+```
+
+最终 scripts 顺序：
+
+```json
+"dev": "pnpm tauri dev",
+"build": "pnpm tauri build",
+"dev:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri dev",
+"build:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri build",
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add package.json
+git commit -m "feat(scripts): add build:dump and dev:dump npm scripts"
+```
+
+---
+
+### Task 4: 验证构建时变量生效
 
 - [ ] **Step 1: 默认构建（关闭 dump）**
 
-Run: `cd src-tauri && cargo build 2>&1 | tail -5`
+Run: `pnpm build`
 Expected: 编译成功
 
 - [ ] **Step 2: 开启 dump 构建**
 
-Run: `cd src-tauri && CC_SWITCH_DUMP_BODY=1 cargo build 2>&1 | tail -5`
+Run: `pnpm build:dump`
 Expected: 编译成功
 
 - [ ] **Step 3: Commit（如有文档更新）**

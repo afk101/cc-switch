@@ -20,15 +20,13 @@
 
 ## 使用方式
 
+通过 npm scripts 快捷命令操作，无需手动输入环境变量：
+
 ```bash
-# 开启 dump 的构建
-CC_SWITCH_DUMP_BODY=1 pnpm tauri build
-
-# 默认关闭的构建
-pnpm tauri build
-
-# 开发模式同样适用
-CC_SWITCH_DUMP_BODY=1 pnpm tauri dev
+pnpm build          # 默认关闭 dump 的构建
+pnpm build:dump     # 开启 dump 的构建
+pnpm dev            # 普通开发模式
+pnpm dev:dump       # 开启 dump 的开发模式
 ```
 
 ## 非功能需求
