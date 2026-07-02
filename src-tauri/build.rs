@@ -1,6 +1,11 @@
 fn main() {
     tauri_build::build();
 
+    // 构建时注入 CC_SWITCH_DUMP_BODY：未设置时默认 "0"（关闭）
+    let dump_body = std::env::var("CC_SWITCH_DUMP_BODY").unwrap_or_else(|_| "0".into());
+    println!("cargo:rustc-env=CC_SWITCH_DUMP_BODY={dump_body}");
+    println!("cargo:rerun-if-env-changed=CC_SWITCH_DUMP_BODY");
+
     // Windows: Embed Common Controls v6 manifest for test binaries
     //
     // When running `cargo test`, the generated test executables don't include
