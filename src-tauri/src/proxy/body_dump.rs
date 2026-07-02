@@ -15,7 +15,6 @@
 //! 原始信号；导出日志前请自行清理敏感段。
 
 use axum::http::HeaderMap;
-use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -40,19 +39,34 @@ const REDACTED_HEADERS: &[&str] = &[
     "chatgpt-account-id",
 ];
 
-/// 缓存启动时读取到的开关值。避免每次请求都触发 `std::env` 全局锁。
-static DUMP_ENABLED: Lazy<bool> = Lazy::new(|| match std::env::var("CC_SWITCH_DUMP_BODY") {
-    Ok(val) => {
-        let trimmed = val.trim();
-        !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+/// 编译期常量：构建时由 build.rs 通过 cargo:rustc-env 注入，未设置时默认 "0"（关闭）。
+const DUMP_ENABLED: bool = {
+    let val = env!("CC_SWITCH_DUMP_BODY");
+    // const 上下文中 PartialEq / eq_ignore_ascii_case 尚未稳定，
+    // 因此用 const fn 辅助做字节级比较。
+    const fn is_zero(s: &str) -> bool {
+        let b = s.as_bytes();
+        b.len() == 1 && b[0] == b'0'
     }
-    Err(_) => false,
-});
+    const fn is_false_ignore_case(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() != 5 {
+            return false;
+        }
+        b[0].to_ascii_lowercase() == b'f'
+            && b[1].to_ascii_lowercase() == b'a'
+            && b[2].to_ascii_lowercase() == b'l'
+            && b[3].to_ascii_lowercase() == b's'
+            && b[4].to_ascii_lowercase() == b'e'
+    }
+
+    !val.is_empty() && !is_zero(val) && !is_false_ignore_case(val)
+};
 
 /// 是否启用 body dump。
 #[inline]
 pub fn is_enabled() -> bool {
-    *DUMP_ENABLED
+    DUMP_ENABLED
 }
 
 /// 单个请求生命周期的 body 落盘器。
