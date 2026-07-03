@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
-    "build": "pnpm tauri build",
+    "build": "pnpm run clean:dmg && pnpm tauri build",
     "dev:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri dev",
-    "build:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri build",
+    "build:dump": "pnpm run clean:dmg && CC_SWITCH_DUMP_BODY=1 pnpm tauri build",
+    "clean:dmg": "node scripts/clean-dmg.js",
     "tauri": "tauri",
     "dev:renderer": "vite",
     "build:renderer": "vite build",
