@@ -26,6 +26,10 @@ use std::sync::{Arc, Mutex};
 const SSE_HEAD_EVENTS: usize = 200;
 /// SSE 采样窗口：保留最后若干个事件用于观察异常结束时的上下文。
 const SSE_TAIL_EVENTS: usize = 50;
+/// body dump 文件扩展名。
+const DUMP_LOG_EXTENSION: &str = "log";
+/// body dump 文件名中的日期前缀长度（YYYYMMDD）。
+const DUMP_DATE_KEY_LEN: usize = 8;
 /// 需要脱敏的 header 名（大小写不敏感匹配）。
 const REDACTED_HEADERS: &[&str] = &[
     "authorization",
@@ -94,12 +98,11 @@ impl BodyDumper {
     fn try_new_inner(request_id: &str, endpoint: &str) -> std::io::Result<Self> {
         let dir = dump_dir()?;
         let now = chrono::Local::now();
+        let today_key = now.format("%Y%m%d").to_string();
+        cleanup_old_dump_files(&dir, &today_key);
         let file_name = format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), request_id);
         let path: PathBuf = dir.join(file_name);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         writeln!(
             file,
             "# CC Switch body dump\n\
@@ -252,6 +255,54 @@ fn dump_dir() -> std::io::Result<PathBuf> {
     Ok(base)
 }
 
+/// 清理早于今天的 body dump 日志；失败只记录警告，不影响代理主流程。
+fn cleanup_old_dump_files(dir: &std::path::Path, today_key: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        log::warn!(
+            "[BodyDump] 读取 dump 目录失败，跳过历史日志清理: {}",
+            dir.display()
+        );
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(date_key) = dump_file_date_key(&path) else {
+            continue;
+        };
+        if date_key >= today_key {
+            continue;
+        }
+        if let Err(err) = std::fs::remove_file(&path) {
+            log::warn!(
+                "[BodyDump] 删除过期 dump 文件失败: {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// 从 dump 文件名中提取 `YYYYMMDD` 日期键；无法确认是 dump log 时返回 `None`。
+fn dump_file_date_key(path: &std::path::Path) -> Option<&str> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some(DUMP_LOG_EXTENSION) {
+        return None;
+    }
+
+    let file_name = path.file_name()?.to_str()?;
+    if file_name.len() <= DUMP_DATE_KEY_LEN
+        || file_name.as_bytes().get(DUMP_DATE_KEY_LEN) != Some(&b'-')
+    {
+        return None;
+    }
+
+    let date_key = &file_name[..DUMP_DATE_KEY_LEN];
+    if date_key.bytes().all(|b| b.is_ascii_digit()) {
+        Some(date_key)
+    } else {
+        None
+    }
+}
+
 /// 把 header 集合格式化为多行字符串；敏感字段替换为 `***REDACTED***`。
 fn format_headers(headers: &HeaderMap) -> String {
     let mut out = String::new();
@@ -394,6 +445,52 @@ mod tests {
         assert_eq!(out, "not json");
     }
 
+    /// dump 文件名应从前 8 位提取日期键。
+    #[test]
+    fn dump_file_date_key_extracts_yyyymmdd_prefix() {
+        let path = std::path::Path::new("20260707-235959-request.log");
+        assert_eq!(dump_file_date_key(path), Some("20260707"));
+    }
+
+    /// 非 log 文件不参与清理。
+    #[test]
+    fn dump_file_date_key_ignores_non_log_files() {
+        let path = std::path::Path::new("20260707-235959-request.txt");
+        assert_eq!(dump_file_date_key(path), None);
+    }
+
+    /// 不符合日期前缀格式的 log 文件不参与清理。
+    #[test]
+    fn dump_file_date_key_ignores_malformed_log_names() {
+        let path = std::path::Path::new("body-dump.log");
+        assert_eq!(dump_file_date_key(path), None);
+    }
+
+    /// 清理策略删除早于今天的 dump log，保留今天和未来日期的 dump log。
+    #[test]
+    fn cleanup_old_dump_files_removes_only_logs_before_today() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("20260707-235959-old.log");
+        let today = dir.path().join("20260708-000001-today.log");
+        let future = dir.path().join("20260709-000001-future.log");
+        let malformed = dir.path().join("body-dump.log");
+        let note = dir.path().join("20260707-235959-note.txt");
+
+        std::fs::write(&old, "old").expect("write old");
+        std::fs::write(&today, "today").expect("write today");
+        std::fs::write(&future, "future").expect("write future");
+        std::fs::write(&malformed, "malformed").expect("write malformed");
+        std::fs::write(&note, "note").expect("write note");
+
+        cleanup_old_dump_files(dir.path(), "20260708");
+
+        assert!(!old.exists());
+        assert!(today.exists());
+        assert!(future.exists());
+        assert!(malformed.exists());
+        assert!(note.exists());
+    }
+
     /// 前 N 个事件全部保留，超出部分挤入末尾环形缓冲；中间被丢弃但总数正确。
     #[test]
     fn sse_sampler_keeps_head_and_tail() {
@@ -411,7 +508,10 @@ mod tests {
         assert_eq!(h.len(), head);
         assert_eq!(t.len(), tail);
         assert_eq!(h.first().map(String::as_str), Some("event-0"));
-        assert_eq!(t.last().map(String::as_str), Some(&*format!("event-{}", total - 1)));
+        assert_eq!(
+            t.last().map(String::as_str),
+            Some(&*format!("event-{}", total - 1))
+        );
     }
 
     /// 缓冲区中的完整事件被抽取；未闭合部分保留待续。
