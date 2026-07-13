@@ -331,6 +331,18 @@ pub struct CodexOfficialHistoryUnifyMigration {
     pub codex_config_dir: Option<String>,
 }
 
+/// Codex 单例配置迁移完成标记。
+///
+/// 旧 `proxy_live_backup` 的内容仍由数据库保存；该字段只记录它在后续
+/// Profile 化备份迁移中应归属的 Profile，不复制任何敏感配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfileMigrationCompleted {
+    pub completed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_live_backup_profile_id: Option<String>,
+}
+
 /// 应用设置结构
 ///
 /// 存储设备级别设置，保存在本地 `~/.cc-switch/settings.json`，不随数据库同步。
@@ -415,6 +427,14 @@ pub struct AppSettings {
     pub openclaw_config_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hermes_config_dir: Option<String>,
+
+    // ===== Codex Profile 本机上下文 =====
+    /// 当前选中的 Codex Profile。仅保存实例引用，不再写回旧单例目录字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_codex_profile_id: Option<String>,
+    /// 单例 Codex 设置已映射为 Profile 的完成标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_profile_migration_completed: Option<CodexProfileMigrationCompleted>,
 
     // ===== 当前供应商 ID（设备级）=====
     /// 当前 Claude 供应商 ID（本地存储，优先于数据库 is_current）
@@ -517,6 +537,8 @@ impl Default for AppSettings {
             opencode_config_dir: None,
             openclaw_config_dir: None,
             hermes_config_dir: None,
+            selected_codex_profile_id: None,
+            codex_profile_migration_completed: None,
             current_provider_claude: None,
             current_provider_claude_desktop: None,
             current_provider_codex: None,
@@ -730,6 +752,39 @@ pub fn update_settings(mut new_settings: AppSettings) -> Result<(), AppError> {
     });
     *guard = new_settings;
     Ok(())
+}
+
+/// 持久化 Codex Profile 的选中结果与一次性迁移完成标记。
+pub fn persist_codex_profile_migration(
+    selected_profile_id: &str,
+    legacy_live_backup_profile_id: Option<&str>,
+) -> Result<(), AppError> {
+    let selected_profile_id = selected_profile_id.to_string();
+    let legacy_live_backup_profile_id = legacy_live_backup_profile_id.map(str::to_string);
+    mutate_settings(|settings| {
+        apply_codex_profile_migration_marker(
+            settings,
+            &selected_profile_id,
+            legacy_live_backup_profile_id.as_deref(),
+        );
+    })
+}
+
+/// 首次迁移才写入选中 Profile，避免重跑覆盖用户之后的实例选择。
+fn apply_codex_profile_migration_marker(
+    settings: &mut AppSettings,
+    selected_profile_id: &str,
+    legacy_live_backup_profile_id: Option<&str>,
+) {
+    if settings.codex_profile_migration_completed.is_some() {
+        return;
+    }
+
+    settings.selected_codex_profile_id = Some(selected_profile_id.to_string());
+    settings.codex_profile_migration_completed = Some(CodexProfileMigrationCompleted {
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        legacy_live_backup_profile_id: legacy_live_backup_profile_id.map(str::to_string),
+    });
 }
 
 fn mutate_settings<F>(mutator: F) -> Result<(), AppError>
@@ -1112,6 +1167,80 @@ pub fn update_s3_sync_status(status: WebDavSyncStatus) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::app_config::AppType;
+
+    /// 旧 settings 缺少 Profile 字段时应保持兼容，新迁移标记应能持久化备份归属。
+    #[test]
+    fn legacy_codex_profile_migration_settings_are_optional_and_deserialize() {
+        let old_settings: AppSettings =
+            serde_json::from_value(serde_json::json!({})).expect("解析旧版 settings");
+        assert!(old_settings.selected_codex_profile_id.is_none());
+        assert!(old_settings.codex_profile_migration_completed.is_none());
+
+        let migrated_settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "selectedCodexProfileId": "legacy-profile",
+            "codexProfileMigrationCompleted": {
+                "completedAt": "2026-07-13T00:00:00Z",
+                "legacyLiveBackupProfileId": "legacy-profile"
+            }
+        }))
+        .expect("解析迁移后的 settings");
+        assert_eq!(
+            migrated_settings.selected_codex_profile_id.as_deref(),
+            Some("legacy-profile")
+        );
+        assert_eq!(
+            migrated_settings
+                .codex_profile_migration_completed
+                .as_ref()
+                .and_then(|marker| marker.legacy_live_backup_profile_id.as_deref()),
+            Some("legacy-profile")
+        );
+
+        let settings_without_legacy_backup: AppSettings =
+            serde_json::from_value(serde_json::json!({
+                "codexProfileMigrationCompleted": {
+                    "completedAt": "2026-07-13T00:00:00Z"
+                }
+            }))
+            .expect("解析没有 Live 备份的迁移标记");
+        assert!(settings_without_legacy_backup
+            .codex_profile_migration_completed
+            .as_ref()
+            .expect("读取迁移标记")
+            .legacy_live_backup_profile_id
+            .is_none());
+    }
+
+    /// 已完成迁移后，启动重跑迁移不得覆盖用户后来选择的 Profile。
+    #[test]
+    fn completed_codex_profile_migration_keeps_existing_selection() {
+        let mut settings = AppSettings {
+            selected_codex_profile_id: Some("user-selected".to_string()),
+            codex_profile_migration_completed: Some(CodexProfileMigrationCompleted {
+                completed_at: "2026-07-13T00:00:00Z".to_string(),
+                legacy_live_backup_profile_id: Some("legacy-profile".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+
+        apply_codex_profile_migration_marker(
+            &mut settings,
+            "legacy-profile",
+            Some("legacy-profile"),
+        );
+
+        assert_eq!(
+            settings.selected_codex_profile_id.as_deref(),
+            Some("user-selected")
+        );
+        assert_eq!(
+            settings
+                .codex_profile_migration_completed
+                .as_ref()
+                .and_then(|marker| marker.legacy_live_backup_profile_id.as_deref()),
+            Some("legacy-profile")
+        );
+    }
 
     #[test]
     fn visible_apps_old_settings_default_claude_desktop_visible() {

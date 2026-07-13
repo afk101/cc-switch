@@ -70,6 +70,50 @@ use tauri::RunEvent;
 use tauri::{Emitter, Manager};
 use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
+/// 在数据库初始化完成后，将旧单例 Codex 状态映射为 Profile。
+///
+/// 此阶段只写入 CC Switch 自己的持久化关系，不启动路由，也不改写任何 Home 文件。
+fn migrate_legacy_codex_profiles(db: Arc<Database>) {
+    let settings = crate::settings::get_settings();
+    let snapshot = match crate::codex_profile::LegacyCodexProfileSnapshot::from_legacy_state(
+        db.as_ref(),
+        crate::settings::get_codex_override_dir(),
+        settings.current_provider_codex,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            log::error!("读取旧 Codex 配置迁移快照失败: {error}");
+            return;
+        }
+    };
+    let canonicalizer = Arc::new(crate::codex_profile::SystemHomePathCanonicalizer);
+    let repository = crate::codex_profile::CodexProfileRepository::new(
+        db.clone(),
+        canonicalizer.clone(),
+        Arc::new(crate::codex_profile::SystemPortAvailability),
+    );
+    let default_home = crate::config::get_home_dir().join(".codex");
+    let migration = crate::codex_profile::CodexProfileMigrationService::new(
+        db,
+        repository,
+        canonicalizer,
+        default_home,
+    );
+
+    let legacy_live_backup_profile_id = snapshot.live_backup_json.is_some();
+    match migration.migrate(snapshot) {
+        Ok(selected_profile_id) => {
+            if let Err(error) = crate::settings::persist_codex_profile_migration(
+                &selected_profile_id,
+                legacy_live_backup_profile_id.then_some(selected_profile_id.as_str()),
+            ) {
+                log::error!("保存 Codex Profile 迁移标记失败: {error}");
+            }
+        }
+        Err(error) => log::error!("迁移旧 Codex 配置到 Profile 失败: {error}"),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_windows_app_user_model_id(app: &tauri::AppHandle) {
     let app_id = app.config().identifier.clone();
@@ -483,6 +527,8 @@ pub fn run() {
                     }
                 }
             }
+
+            migrate_legacy_codex_profiles(db.clone());
 
             let app_state = AppState::new(db);
 

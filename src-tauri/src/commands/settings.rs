@@ -48,6 +48,12 @@ fn merge_settings_for_save(
     // 开关）后、前端 query 缓存刷新前的一次全量保存会把旧 marker 重放回来，
     // 重新开启时被"复活"的标记挡住而漏迁。
     incoming.local_migrations = existing.local_migrations.clone();
+    // Codex Profile 迁移标记由后端启动期维护；旧前端的 settings payload 不含
+    // 新字段时，保留本机已选中的 Home 上下文，避免保存无关设置导致选中项丢失。
+    if incoming.selected_codex_profile_id.is_none() {
+        incoming.selected_codex_profile_id = existing.selected_codex_profile_id.clone();
+    }
+    incoming.codex_profile_migration_completed = existing.codex_profile_migration_completed.clone();
     incoming
 }
 
@@ -316,10 +322,37 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 mod tests {
     use super::merge_settings_for_save;
     use crate::settings::{
-        AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
-        CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
-        WebDavSyncSettings,
+        AppSettings, CodexOfficialHistoryUnifyMigration, CodexProfileMigrationCompleted,
+        CodexProviderTemplateMigration, CodexThirdPartyHistoryProviderBucketMigration,
+        LocalMigrations, S3SyncSettings, WebDavSyncSettings,
     };
+
+    /// 旧前端保存其他设置时，不能清空后端已经选择的 Codex Profile。
+    #[test]
+    fn save_settings_should_preserve_selected_codex_profile_when_payload_omits_it() {
+        let existing = AppSettings {
+            selected_codex_profile_id: Some("work-profile".to_string()),
+            codex_profile_migration_completed: Some(CodexProfileMigrationCompleted {
+                completed_at: "2026-07-13T00:00:00Z".to_string(),
+                legacy_live_backup_profile_id: Some("legacy-profile".to_string()),
+            }),
+            ..AppSettings::default()
+        };
+
+        let merged = merge_settings_for_save(AppSettings::default(), &existing);
+
+        assert_eq!(
+            merged.selected_codex_profile_id.as_deref(),
+            Some("work-profile")
+        );
+        assert_eq!(
+            merged
+                .codex_profile_migration_completed
+                .as_ref()
+                .and_then(|marker| marker.legacy_live_backup_profile_id.as_deref()),
+            Some("legacy-profile")
+        );
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {
