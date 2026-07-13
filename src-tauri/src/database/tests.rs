@@ -441,7 +441,19 @@ fn migrates_v11_to_v12_codex_profile_schema() {
          DROP TABLE codex_profile_failovers;
          DROP TABLE codex_profile_routes;
          DROP TABLE codex_profiles;
+         DROP TABLE proxy_request_logs;
+         DROP TABLE session_log_sync;
          DROP TABLE usage_daily_rollups;
+         CREATE TABLE proxy_request_logs (
+             request_id TEXT PRIMARY KEY,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE session_log_sync (
+             file_path TEXT PRIMARY KEY,
+             last_modified INTEGER NOT NULL,
+             last_line_offset INTEGER NOT NULL DEFAULT 0,
+             last_synced_at INTEGER NOT NULL
+         );
          CREATE TABLE usage_daily_rollups (
              date TEXT NOT NULL,
              app_type TEXT NOT NULL,
@@ -458,7 +470,14 @@ fn migrates_v11_to_v12_codex_profile_schema() {
              total_cost_usd TEXT NOT NULL DEFAULT '0',
              avg_latency_ms INTEGER NOT NULL DEFAULT 0,
              PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
-         );",
+         );
+         INSERT INTO usage_daily_rollups
+             (date, app_type, provider_id, model, request_model, pricing_model,
+              request_count, success_count, input_tokens, output_tokens,
+              cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms)
+         VALUES
+             ('2026-07-13', 'codex', 'provider-a', 'gpt-5', '', '',
+              7, 6, 700, 350, 70, 0, '0.07', 120);",
     )
     .expect("restore v11 profile and rollup schema");
     Database::set_user_version(&conn, 11).expect("set user_version=11");
@@ -491,6 +510,20 @@ fn migrates_v11_to_v12_codex_profile_schema() {
             "{table}.{column} 应在 v12 中创建"
         );
     }
+    let migrated_rollup: (i64, i64, String) = conn
+        .query_row(
+            "SELECT request_count, input_tokens, profile_id FROM usage_daily_rollups
+             WHERE date = '2026-07-13' AND app_type = 'codex' AND provider_id = 'provider-a'
+               AND model = 'gpt-5'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("read migrated v11 rollup");
+    assert_eq!(
+        migrated_rollup,
+        (7, 700, String::new()),
+        "旧 rollup 的数值应保留，且 Profile 归属应回填为空字符串"
+    );
 
     let profile_id = "profile-a";
     conn.execute(

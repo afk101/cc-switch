@@ -117,14 +117,14 @@ impl Database {
         let effective_filter = effective_usage_log_filter("l");
         // request_model 维度保留路由接管的「客户端别名 → 真实模型」映射，
         // pricing_model 维度保留写入时的计价基准（request 计价模式下与 model 分叉）；
-        // 明细行的这两列可能为 NULL（历史/手工数据），归一为 ''。
+        // profile_id 区分不同 CODEX_HOME 的用量归属；上述三列的历史 NULL 统一归一为 ''。
         let aggregation_sql = format!(
             "INSERT OR REPLACE INTO usage_daily_rollups
                 (date, app_type, provider_id, model, request_model, pricing_model,
                  request_count, success_count,
                  input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
-                 total_cost_usd, avg_latency_ms)
+                 total_cost_usd, avg_latency_ms, profile_id)
             SELECT
                 d, a, p, m, rm, pm,
                 COALESCE(old.request_count, 0) + new_req,
@@ -138,13 +138,15 @@ impl Database {
                     THEN (COALESCE(old.avg_latency_ms, 0) * COALESCE(old.request_count, 0)
                           + new_lat * new_req)
                          / (COALESCE(old.request_count, 0) + new_req)
-                    ELSE 0 END
+                    ELSE 0 END,
+                pid
             FROM (
                 SELECT
                     date(l.created_at, 'unixepoch', 'localtime') as d,
                     l.app_type as a, l.provider_id as p, l.model as m,
                     COALESCE(l.request_model, '') as rm,
                     COALESCE(l.pricing_model, '') as pm,
+                    COALESCE(l.profile_id, '') as pid,
                     COUNT(*) as new_req,
                     SUM(CASE WHEN l.status_code >= 200 AND l.status_code < 300 THEN 1 ELSE 0 END) as new_succ,
                     COALESCE(SUM(l.input_tokens), 0) as new_in,
@@ -155,12 +157,13 @@ impl Database {
                     COALESCE(AVG(l.latency_ms), 0) as new_lat
                 FROM proxy_request_logs l
                 WHERE l.created_at < ?1 AND {effective_filter}
-                GROUP BY d, a, p, m, rm, pm
+                GROUP BY d, a, p, m, rm, pm, pid
             ) agg
             LEFT JOIN usage_daily_rollups old
                 ON old.date = agg.d AND old.app_type = agg.a
                 AND old.provider_id = agg.p AND old.model = agg.m
-                AND old.request_model = agg.rm AND old.pricing_model = agg.pm"
+                AND old.request_model = agg.rm AND old.pricing_model = agg.pm
+                AND old.profile_id = agg.pid"
         );
 
         conn.execute(&aggregation_sql, [cutoff])
@@ -530,6 +533,73 @@ mod tests {
         )?;
         assert_eq!(count, 13, "10 existing + 3 new");
         assert_eq!(input, 1300, "1000 existing + 300 new");
+        Ok(())
+    }
+
+    #[test]
+    fn test_rollup_keeps_usage_separate_by_profile_id() -> Result<(), AppError> {
+        let db = Database::memory()?;
+        let old_ts = chrono::Utc::now().timestamp() - 40 * 86400;
+        let date_str = Local
+            .timestamp_opt(old_ts, 0)
+            .single()
+            .expect("old timestamp should be a valid local datetime")
+            .format("%Y-%m-%d")
+            .to_string();
+
+        {
+            let conn = crate::database::lock_conn!(db.conn);
+            conn.execute(
+                "INSERT INTO usage_daily_rollups
+                    (date, app_type, provider_id, model, request_count, success_count,
+                     input_tokens, output_tokens, total_cost_usd, avg_latency_ms, profile_id)
+                 VALUES (?1, 'codex', 'p1', 'gpt-5', 5, 5, 500, 250, '0.05', 100, 'profile-a')",
+                [&date_str],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, profile_id
+                ) VALUES ('profile-a-log', 'p1', 'codex', 'gpt-5', 100, 50, '0.01', 200, 200, ?1, 'profile-a')",
+                [old_ts],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, input_tokens, output_tokens,
+                    total_cost_usd, latency_ms, status_code, created_at, profile_id
+                ) VALUES ('profile-b-log', 'p1', 'codex', 'gpt-5', 200, 80, '0.02', 300, 200, ?1, 'profile-b')",
+                [old_ts],
+            )?;
+        }
+
+        assert_eq!(db.rollup_and_prune(30)?, 2);
+
+        let conn = crate::database::lock_conn!(db.conn);
+        let rows = conn
+            .prepare(
+                "SELECT profile_id, request_count, input_tokens, output_tokens
+                 FROM usage_daily_rollups
+                 WHERE app_type = 'codex' AND provider_id = 'p1' AND model = 'gpt-5'
+                 ORDER BY profile_id",
+            )?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![
+                ("profile-a".to_string(), 6, 600, 300),
+                ("profile-b".to_string(), 1, 200, 80),
+            ],
+            "不同 Profile 的旧明细必须分别汇总，且不能写入空 Profile"
+        );
+
         Ok(())
     }
 }
