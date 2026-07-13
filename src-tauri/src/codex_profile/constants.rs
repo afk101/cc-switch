@@ -20,3 +20,6 @@ pub const CODEX_PROFILE_SECRET_DIRECTORY: &str = "codex-profiles";
 pub const CODEX_PROFILE_TOKEN_FILENAME: &str = "listener-token";
 /// 旧单例代理接管配置中使用的兼容占位符。
 pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
+/// 已迁移旧路由等待创建兼容本地凭证时使用的数据库设置键。
+pub const CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING: &str =
+    "codex_legacy_token_pending_profile_id";

@@ -8,20 +8,20 @@ use std::sync::Arc;
 /// Codex Home 配置文件的当前快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexLiveConfigSnapshot {
-    pub config_path: PathBuf,
-    pub content: Option<Vec<u8>>,
-    pub fingerprint: String,
+    config_path: PathBuf,
+    content: Option<Vec<u8>>,
+    fingerprint: String,
 }
 
 /// 由当前配置和目标路由配置组成的无副作用写入计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexRouteConfigPlan {
-    pub home_path: PathBuf,
-    pub previous: CodexLiveConfigSnapshot,
-    pub target_content: Vec<u8>,
-    pub target_fingerprint: String,
+    home_path: PathBuf,
+    previous: CodexLiveConfigSnapshot,
+    target_content: Vec<u8>,
+    target_fingerprint: String,
     /// 预留给路由配置构建器记录模型选择变化，文件写入阶段不解释该字段。
-    pub model_changes: Vec<String>,
+    model_changes: Vec<String>,
 }
 
 /// 读写单个 Home 的 `config.toml`，使原子替换失败可被行为测试注入。
@@ -103,23 +103,34 @@ impl CodexHomeConfigService {
 
     /// 在当前配置未被外部修改时，原子应用路由接管计划。
     pub fn apply_route_plan(&self, plan: &CodexRouteConfigPlan) -> Result<(), AppError> {
+        let config_path = validated_plan_config_path(plan)?;
         let current = self.inspect(&plan.home_path)?;
         ensure_fingerprint(&plan.previous.fingerprint, &current.fingerprint)?;
         self.file_ops
-            .write_atomic(&plan.previous.config_path, &plan.target_content)
+            .write_atomic(&config_path, &plan.target_content)
     }
 
     /// 仅在仍由本计划接管时恢复接管前的配置，避免覆盖外部变更。
     pub fn restore(&self, plan: &CodexRouteConfigPlan) -> Result<(), AppError> {
+        let config_path = validated_plan_config_path(plan)?;
         let current = self.inspect(&plan.home_path)?;
         ensure_fingerprint(&plan.target_fingerprint, &current.fingerprint)?;
         match &plan.previous.content {
-            Some(content) => self
-                .file_ops
-                .write_atomic(&plan.previous.config_path, content),
-            None => self.file_ops.remove_file(&plan.previous.config_path),
+            Some(content) => self.file_ops.write_atomic(&config_path, content),
+            None => self.file_ops.remove_file(&config_path),
         }
     }
+}
+
+/// 从计划的 Home 重派生配置路径，并拒绝任何不一致的内部数据。
+fn validated_plan_config_path(plan: &CodexRouteConfigPlan) -> Result<PathBuf, AppError> {
+    let config_path = codex_config_path_for_home(&plan.home_path);
+    if config_path != plan.previous.config_path {
+        return Err(AppError::InvalidInput(
+            "Codex 路由配置计划的 Home 与配置路径不一致".to_string(),
+        ));
+    }
+    Ok(config_path)
 }
 
 /// 为存在状态和原始字节共同计算稳定指纹，区分缺失文件与空文件。
@@ -265,6 +276,37 @@ mod codex_home_config {
         assert_eq!(
             fs::read_to_string(config_path).expect("读取外部配置"),
             "model = \"external\"\n"
+        );
+        Ok(())
+    }
+
+    /// 即使内部计划被篡改为另一 Home 的路径，也不得跨 Home 写入配置。
+    #[test]
+    fn tampered_route_plan_cannot_write_another_home() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let home_a = temp_dir.path().join("home-a");
+        let home_b = temp_dir.path().join("home-b");
+        fs::create_dir_all(&home_a).expect("创建 A Home");
+        fs::create_dir_all(&home_b).expect("创建 B Home");
+        let config_a = codex_config_path_for_home(&home_a);
+        let config_b = codex_config_path_for_home(&home_b);
+        fs::write(&config_a, "model = \"a\"\n").expect("写入 A 配置");
+        fs::write(&config_b, "model = \"b\"\n").expect("写入 B 配置");
+        let service = CodexHomeConfigService::system();
+        let mut plan = service.build_route_plan(&home_a, "model = \"route\"\n")?;
+        plan.previous.config_path = config_b.clone();
+
+        assert!(matches!(
+            service.apply_route_plan(&plan),
+            Err(AppError::InvalidInput(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(config_a).expect("读取 A 配置"),
+            "model = \"a\"\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config_b).expect("读取 B 配置"),
+            "model = \"b\"\n"
         );
         Ok(())
     }

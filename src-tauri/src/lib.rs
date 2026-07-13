@@ -110,9 +110,15 @@ fn migrate_legacy_codex_profiles(db: Arc<Database>) {
             ) {
                 log::error!("保存 Codex Profile 迁移标记失败: {error}");
             }
-            if let Err(error) =
-                initialize_migrated_enabled_codex_profile_token(db.as_ref(), &result)
-            {
+            if let Some(migrated_profile) = result.migrated_enabled_profile() {
+                if let Err(error) = db.set_setting(
+                    crate::codex_profile::CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING,
+                    migrated_profile.profile_id(),
+                ) {
+                    log::error!("记录旧 Codex 路由兼容凭证待办失败: {error}");
+                }
+            }
+            if let Err(error) = initialize_pending_codex_profile_token(db.as_ref()) {
                 log::error!("初始化旧 Codex 路由兼容凭证失败: {error}");
             }
         }
@@ -120,15 +126,25 @@ fn migrate_legacy_codex_profiles(db: Arc<Database>) {
     }
 }
 
-/// 仅为迁移时已启用的旧 Codex 路由建立兼容本地凭证，不修改任何 Home 文件。
-fn initialize_migrated_enabled_codex_profile_token(
-    db: &Database,
-    migration_result: &crate::codex_profile::CodexProfileMigrationResult,
-) -> Result<(), AppError> {
-    let Some(migrated_profile) = migration_result.migrated_enabled_profile() else {
+/// 仅处理迁移流程记录的 pending Profile；成功后才清除待办，失败会在下次启动重试。
+fn initialize_pending_codex_profile_token(db: &Database) -> Result<(), AppError> {
+    let Some(profile_id) =
+        db.get_setting(crate::codex_profile::CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING)?
+    else {
         return Ok(());
     };
-    let profile = db.get_codex_profile(migrated_profile.profile_id())?;
+    if profile_id.trim().is_empty() {
+        return Ok(());
+    }
+    let profile = db.get_codex_profile(&profile_id)?;
+    let route = db.get_codex_profile_route(&profile_id)?.ok_or_else(|| {
+        AppError::InvalidInput("旧 Codex 路由兼容凭证待办缺少路由配置".to_string())
+    })?;
+    if !route.enabled {
+        return Err(AppError::InvalidInput(
+            "旧 Codex 路由兼容凭证待办指向未启用 Profile".to_string(),
+        ));
+    }
     let home = std::path::Path::new(&profile.canonical_home_path);
     let config_path = crate::codex_config::codex_config_path_for_home(home);
     let live_config = if config_path.exists() {
@@ -137,7 +153,11 @@ fn initialize_migrated_enabled_codex_profile_token(
         String::new()
     };
     crate::codex_profile::CodexProfileSecretStore::new()
-        .initialize_migrated_enabled_proxy_token(migrated_profile, &live_config)?;
+        .initialize_verified_pending_proxy_token(&profile_id, &live_config)?;
+    db.set_setting(
+        crate::codex_profile::CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING,
+        "",
+    )?;
     Ok(())
 }
 

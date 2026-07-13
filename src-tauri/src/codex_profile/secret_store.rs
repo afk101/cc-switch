@@ -7,9 +7,16 @@ use crate::config::get_app_config_dir;
 use crate::error::AppError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// 同一 Profile 的 token 创建与轮换必须串行，避免并发调用返回不同凭证。
+static PROFILE_TOKEN_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// 仅存放在 CC Switch 私有目录中的 Profile 本地监听凭证。
 pub struct CodexProfileSecretStore {
@@ -33,6 +40,8 @@ impl CodexProfileSecretStore {
 
     /// 创建或读取 Profile 的本地监听凭证，不会接触 CODEX_HOME。
     pub fn create(&self, profile_id: &str) -> Result<String, AppError> {
+        let lock = profile_token_lock(profile_id)?;
+        let _guard = lock.lock()?;
         match self.read(profile_id)? {
             Some(token) => Ok(token),
             None => self.write_token(profile_id, &generate_token()?),
@@ -52,6 +61,8 @@ impl CodexProfileSecretStore {
 
     /// 重新生成 Profile 的随机本地监听凭证。
     pub fn rotate(&self, profile_id: &str) -> Result<String, AppError> {
+        let lock = profile_token_lock(profile_id)?;
+        let _guard = lock.lock()?;
         self.write_token(profile_id, &generate_token()?)
     }
 
@@ -62,13 +73,32 @@ impl CodexProfileSecretStore {
         live_config: &str,
     ) -> Result<String, AppError> {
         let profile_id = migrated_profile.profile_id();
+        let lock = profile_token_lock(profile_id)?;
+        let _guard = lock.lock()?;
         if let Some(token) = self.read(profile_id)? {
             return Ok(token);
         }
         if live_config.contains(LEGACY_PROXY_MANAGED_TOKEN) {
             return self.write_token(profile_id, LEGACY_PROXY_MANAGED_TOKEN);
         }
-        self.create(profile_id)
+        self.write_token(profile_id, &generate_token()?)
+    }
+
+    /// 由启动迁移流程验证 pending 状态后调用，补建旧路由的兼容凭证。
+    pub(crate) fn initialize_verified_pending_proxy_token(
+        &self,
+        profile_id: &str,
+        live_config: &str,
+    ) -> Result<String, AppError> {
+        let lock = profile_token_lock(profile_id)?;
+        let _guard = lock.lock()?;
+        if let Some(token) = self.read(profile_id)? {
+            return Ok(token);
+        }
+        if live_config.contains(LEGACY_PROXY_MANAGED_TOKEN) {
+            return self.write_token(profile_id, LEGACY_PROXY_MANAGED_TOKEN);
+        }
+        self.write_token(profile_id, &generate_token()?)
     }
 
     /// 删除唯一的 token 文件；Profile 私有目录为空时才一并移除。
@@ -143,6 +173,16 @@ fn validate_profile_id(profile_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// 为已验证的 Profile 获取进程内独占锁。
+fn profile_token_lock(profile_id: &str) -> Result<Arc<Mutex<()>>, AppError> {
+    validate_profile_id(profile_id)?;
+    let mut locks = PROFILE_TOKEN_LOCKS.lock()?;
+    Ok(locks
+        .entry(profile_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
+}
+
 /// 用操作系统 CSPRNG 填满 32 个随机字节并编码为 URL-safe 本地监听凭证。
 fn generate_token() -> Result<String, AppError> {
     let mut bytes = [0_u8; LOCAL_TOKEN_BYTES];
@@ -172,9 +212,41 @@ fn write_private_file(path: &Path, content: &[u8]) -> Result<(), AppError> {
 /// 将同目录临时 token 文件替换到正式路径。
 fn replace_token_file(temporary_path: &Path, token_path: &Path) -> Result<(), AppError> {
     #[cfg(windows)]
-    if token_path.exists() {
-        fs::remove_file(token_path).map_err(|error| AppError::io(token_path, error))?;
+    {
+        let backup_path = token_path.with_file_name(format!(
+            ".{CODEX_PROFILE_TOKEN_FILENAME}.{}.backup",
+            uuid::Uuid::new_v4()
+        ));
+        let has_previous_token = token_path.exists();
+        if has_previous_token {
+            fs::rename(token_path, &backup_path).map_err(|error| AppError::IoContext {
+                context: format!(
+                    "备份旧 Codex Profile 本地凭证失败: {}",
+                    token_path.display()
+                ),
+                source: error,
+            })?;
+        }
+        if let Err(error) = fs::rename(temporary_path, token_path) {
+            if has_previous_token {
+                let _ = fs::rename(&backup_path, token_path);
+            }
+            return Err(AppError::IoContext {
+                context: format!(
+                    "替换 Codex Profile 本地凭证失败且已尝试恢复旧凭证: {} -> {}",
+                    temporary_path.display(),
+                    token_path.display()
+                ),
+                source: error,
+            });
+        }
+        if has_previous_token {
+            fs::remove_file(&backup_path).map_err(|error| AppError::io(&backup_path, error))?;
+        }
+        return Ok(());
     }
+
+    #[cfg(not(windows))]
     fs::rename(temporary_path, token_path).map_err(|error| AppError::IoContext {
         context: format!(
             "原子替换 Codex Profile 本地凭证失败: {} -> {}",
@@ -196,7 +268,8 @@ mod codex_profile_secret_store {
     use crate::error::AppError;
     use base64::Engine;
     use std::fs;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     /// 本地监听凭证必须按 Profile 隔离，且不会出现在数据库导出内容中。
     #[test]
@@ -298,6 +371,25 @@ mod codex_profile_secret_store {
         Ok(())
     }
 
+    /// 同一 Profile 的并发创建必须返回同一 token，且与最终落盘内容一致。
+    #[test]
+    fn concurrent_create_returns_the_single_persisted_token() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let store = Arc::new(CodexProfileSecretStore::with_root(
+            temp_dir.path().join("secrets"),
+        ));
+        let barrier = Arc::new(Barrier::new(3));
+        let first = spawn_create(store.clone(), barrier.clone());
+        let second = spawn_create(store.clone(), barrier.clone());
+        barrier.wait();
+
+        let first = first.join().expect("等待第一个创建线程")?;
+        let second = second.join().expect("等待第二个创建线程")?;
+        assert_eq!(first, second);
+        assert_eq!(store.read("profile-a")?, Some(first));
+        Ok(())
+    }
+
     /// 旋转后的 token 仍为 32 随机字节的 URL-safe 编码，并只删除自己的文件。
     #[test]
     fn rotate_and_delete_keep_profile_secret_scope() -> Result<(), AppError> {
@@ -337,5 +429,16 @@ mod codex_profile_secret_store {
             store.create("../outside"),
             Err(AppError::InvalidInput(_))
         ));
+    }
+
+    /// 同步释放两个创建线程，稳定覆盖同一 Profile 的竞争窗口。
+    fn spawn_create(
+        store: Arc<CodexProfileSecretStore>,
+        barrier: Arc<Barrier>,
+    ) -> thread::JoinHandle<Result<String, AppError>> {
+        thread::spawn(move || {
+            barrier.wait();
+            store.create("profile-a")
+        })
     }
 }
