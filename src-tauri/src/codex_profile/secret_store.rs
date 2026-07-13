@@ -269,7 +269,15 @@ fn replace_token_file(temporary_path: &Path, token_path: &Path) -> Result<(), Ap
         }
         if let Err(error) = fs::rename(temporary_path, token_path) {
             if has_previous_token {
-                let _ = fs::rename(&backup_path, token_path);
+                if let Err(restore_error) = fs::rename(&backup_path, token_path) {
+                    return Err(AppError::Message(format!(
+                        "替换 Codex Profile 本地凭证失败，且恢复旧凭证也失败；正式路径: {}，可恢复备份路径: {}；替换错误: {}；恢复错误: {}",
+                        token_path.display(),
+                        backup_path.display(),
+                        error,
+                        restore_error
+                    )));
+                }
             }
             return Err(AppError::IoContext {
                 context: format!(
