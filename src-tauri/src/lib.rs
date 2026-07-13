@@ -6,7 +6,7 @@ mod claude_mcp;
 mod claude_plugin;
 mod codex_config;
 mod codex_history_migration;
-mod codex_profile;
+pub mod codex_profile;
 mod commands;
 mod config;
 mod database;

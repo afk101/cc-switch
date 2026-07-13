@@ -1,7 +1,17 @@
-//! Codex Profile 的纯数据模型。
+//! Codex Profile 的领域模型与持久化编排。
 //!
-//! 本模块只定义数据库 DAO 需要的结构，不负责路径、端口或运行时行为。
+//! 本模块不读写 Home 配置文件，也不控制监听器运行时。
 
+mod constants;
 mod model;
+mod repository;
 
-pub(crate) use model::{CodexProfile, CodexProfileRef, CodexProfileRoute};
+pub use constants::*;
+pub use model::{
+    CodexProfile, CodexProfileRef, CodexProfileRoute, CodexProfileScope, CodexProfileState,
+    CodexRuntimeStatus,
+};
+pub use repository::{
+    CodexProfileRepository, HomePathCanonicalizer, PortAvailability, SystemHomePathCanonicalizer,
+    SystemPortAvailability,
+};
