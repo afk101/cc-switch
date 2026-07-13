@@ -67,6 +67,7 @@ struct LegacyCodexProfileMigrationPlan {
     profiles_to_update: Vec<CodexProfile>,
     selected_profile_id: String,
     should_apply_legacy_state: bool,
+    actual_home: PathBuf,
 }
 
 impl CodexProfileMigrationService {
@@ -85,9 +86,9 @@ impl CodexProfileMigrationService {
         }
     }
 
-    /// 将旧单例 Codex 状态幂等映射到 Profile，不修改任何 Home 文件。
+    /// 将旧单例 Codex 状态幂等映射到 Profile，不创建或改写任何 Codex 配置文件。
     pub fn migrate(&self, snapshot: LegacyCodexProfileSnapshot) -> Result<String, AppError> {
-        let default_home = self.canonicalizer.canonicalize(&self.default_home)?;
+        let default_home = self.canonicalize_default_home()?;
         let actual_home = match snapshot.override_home.as_ref() {
             Some(override_home) => self.canonicalizer.canonicalize(override_home)?,
             None => default_home.clone(),
@@ -96,6 +97,15 @@ impl CodexProfileMigrationService {
         let plan = self.plan_migration(&default_home, &actual_home, actual_home_is_default)?;
         self.apply_migration_plan(&plan, &snapshot)?;
         Ok(plan.selected_profile_id)
+    }
+
+    /// 确保内置默认 Home 可被登记；仅创建目录本身，不创建或改写任何 Codex 文件。
+    fn canonicalize_default_home(&self) -> Result<PathBuf, AppError> {
+        if !self.default_home.exists() {
+            std::fs::create_dir_all(&self.default_home)
+                .map_err(|error| AppError::io(&self.default_home, error))?;
+        }
+        self.canonicalizer.canonicalize(&self.default_home)
     }
 
     /// 计算默认与旧实际 Home 的 Profile 写入计划，不在此阶段修改数据库。
@@ -115,6 +125,7 @@ impl CodexProfileMigrationService {
                     profiles_to_update: Vec::new(),
                     selected_profile_id: profile.id,
                     should_apply_legacy_state: false,
+                    actual_home: actual_home.to_path_buf(),
                 }),
                 None => Ok(LegacyCodexProfileMigrationPlan {
                     profiles_to_insert: vec![CodexProfile::default_profile(
@@ -124,6 +135,7 @@ impl CodexProfileMigrationService {
                     profiles_to_update: Vec::new(),
                     selected_profile_id: DEFAULT_CODEX_PROFILE_ID.to_string(),
                     should_apply_legacy_state: true,
+                    actual_home: actual_home.to_path_buf(),
                 }),
             };
         }
@@ -178,6 +190,7 @@ impl CodexProfileMigrationService {
             profiles_to_update,
             selected_profile_id: actual_profile.id,
             should_apply_legacy_state,
+            actual_home: actual_home.to_path_buf(),
         })
     }
 
@@ -210,6 +223,7 @@ impl CodexProfileMigrationService {
                     .map_err(|error| AppError::Database(error.to_string()))?;
             }
         }
+        backfill_legacy_history_in_transaction(&tx, &plan.selected_profile_id, &plan.actual_home)?;
         tx.commit()
             .map_err(|error| AppError::Database(error.to_string()))
     }
@@ -318,6 +332,82 @@ fn replace_legacy_failovers_in_transaction(
     Ok(())
 }
 
+/// 回填能可靠识别为旧单例 Codex 的未归属历史；无法判断的行保持空归属。
+fn backfill_legacy_history_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    profile_id: &str,
+    actual_home: &std::path::Path,
+) -> Result<(), AppError> {
+    tx.execute(
+        "UPDATE proxy_request_logs
+         SET profile_id = ?1
+         WHERE app_type = 'codex' AND (profile_id IS NULL OR profile_id = '')",
+        [profile_id],
+    )
+    .map_err(|error| AppError::Database(error.to_string()))?;
+    // 目标 Profile 已有相同聚合键时不能仅改主键，否则会丢失或重复统计；
+    // 保留空归属行，留待具备合并语义的后续流程处理。
+    tx.execute(
+        "UPDATE usage_daily_rollups AS legacy
+         SET profile_id = ?1
+         WHERE legacy.app_type = 'codex' AND legacy.profile_id = ''
+           AND NOT EXISTS (
+               SELECT 1 FROM usage_daily_rollups AS assigned
+               WHERE assigned.date = legacy.date
+                 AND assigned.app_type = legacy.app_type
+                 AND assigned.provider_id = legacy.provider_id
+                 AND assigned.model = legacy.model
+                 AND assigned.request_model = legacy.request_model
+                 AND assigned.pricing_model = legacy.pricing_model
+                 AND assigned.profile_id = ?1
+           )",
+        [profile_id],
+    )
+    .map_err(|error| AppError::Database(error.to_string()))?;
+    backfill_legacy_session_sync_in_transaction(tx, profile_id, actual_home)
+}
+
+/// 仅按会话文件位于旧实际 Home 的 sessions/ 或 archived_sessions/ 下回填归属。
+fn backfill_legacy_session_sync_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    profile_id: &str,
+    actual_home: &std::path::Path,
+) -> Result<(), AppError> {
+    let file_paths = {
+        let mut statement = tx
+            .prepare(
+                "SELECT file_path FROM session_log_sync
+                 WHERE profile_id IS NULL OR profile_id = ''",
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        let file_paths = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| AppError::Database(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        file_paths
+    };
+    let session_root = actual_home.join("sessions");
+    let archived_root = actual_home.join("archived_sessions");
+
+    for file_path in file_paths {
+        // 旧记录的字符串路径可能含有 /var 与 /private/var 等别名；仅在文件仍存在、
+        // 规范化后明确位于当前 Home 的会话目录时才归属，无法确认的记录必须保持空归属。
+        let Ok(path) = std::fs::canonicalize(&file_path) else {
+            continue;
+        };
+        if path.starts_with(&session_root) || path.starts_with(&archived_root) {
+            tx.execute(
+                "UPDATE session_log_sync SET profile_id = ?1
+                 WHERE file_path = ?2 AND (profile_id IS NULL OR profile_id = '')",
+                params![profile_id, file_path],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CodexProfileMigrationService, LegacyCodexProfileSnapshot};
@@ -388,6 +478,37 @@ mod tests {
                 std::fs::read(&config_path).expect("再次读取配置文件"),
                 std::fs::read(&session_path).expect("再次读取会话文件"),
             ]
+        );
+        Ok(())
+    }
+
+    /// 旧 override Home 缺失时必须返回其路径相关的错误，迁移不得代为创建该目录。
+    #[test]
+    fn legacy_codex_profile_migration_rejects_missing_override_home() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let default_home = temp_dir.path().join(".codex");
+        let missing_override_home = temp_dir.path().join("missing-work-codex");
+        let db = Arc::new(Database::memory()?);
+
+        let error = migration_service(db, &default_home)
+            .migrate(LegacyCodexProfileSnapshot {
+                override_home: Some(missing_override_home.clone()),
+                current_provider_id: None,
+                route_enabled: false,
+                failover_provider_ids: Vec::new(),
+                live_backup_json: None,
+            })
+            .expect_err("缺失的 override Home 不得被自动创建");
+
+        match error {
+            AppError::Io { path, .. } => {
+                assert_eq!(path, missing_override_home.to_string_lossy());
+            }
+            other => panic!("应返回包含 override 路径的 IO 错误，实际为: {other}"),
+        }
+        assert!(
+            !missing_override_home.exists(),
+            "不得创建缺失的 override Home"
         );
         Ok(())
     }
@@ -535,6 +656,156 @@ mod tests {
             vec!["failover-provider".to_string()]
         );
         assert!(futures::executor::block_on(db.get_live_backup("codex"))?.is_none());
+        Ok(())
+    }
+
+    /// 旧 Codex 历史只归属实际旧 Home，其他应用和其他 Home 的数据必须保持未归属。
+    #[test]
+    fn legacy_codex_profile_migration_backfills_only_identifiable_legacy_history_idempotently(
+    ) -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let default_home = temp_dir.path().join(".codex");
+        let override_home = temp_dir.path().join("work-codex");
+        let other_home = temp_dir.path().join("other-codex");
+        std::fs::create_dir(&override_home).expect("创建旧 override Home");
+        std::fs::create_dir(&other_home).expect("创建其他 Home");
+        let legacy_session_path = override_home.join("sessions/2026/07/13/legacy.jsonl");
+        let other_session_path = other_home.join("sessions/2026/07/13/other.jsonl");
+        let missing_session_path = override_home.join("sessions/2026/07/13/missing.jsonl");
+        std::fs::create_dir_all(legacy_session_path.parent().expect("旧会话文件应有父目录"))
+            .expect("创建旧会话目录");
+        std::fs::create_dir_all(other_session_path.parent().expect("其他会话文件应有父目录"))
+            .expect("创建其他会话目录");
+        std::fs::write(&legacy_session_path, "{}").expect("创建旧会话文件");
+        std::fs::write(&other_session_path, "{}").expect("创建其他会话文件");
+        let legacy_session_path = std::fs::canonicalize(&legacy_session_path)
+            .expect("规范化旧会话文件")
+            .to_string_lossy()
+            .to_string();
+        let other_session_path = std::fs::canonicalize(&other_session_path)
+            .expect("规范化其他会话文件")
+            .to_string_lossy()
+            .to_string();
+        let missing_session_path = missing_session_path.to_string_lossy().to_string();
+        let db = Arc::new(Database::memory()?);
+        {
+            let conn = db.conn.lock().expect("获取数据库锁");
+            conn.execute_batch(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta) VALUES
+                    ('legacy-provider', 'codex', '旧 Codex 供应商', '{}', '{}');
+                 INSERT INTO proxy_request_logs
+                    (request_id, provider_id, app_type, model, latency_ms, status_code, created_at)
+                 VALUES
+                    ('codex-legacy', 'legacy-provider', 'codex', 'gpt-5', 1, 200, 1),
+                    ('claude-other', 'claude-provider', 'claude', 'claude', 1, 200, 1);
+                 INSERT INTO usage_daily_rollups
+                    (date, app_type, provider_id, model, request_model, pricing_model)
+                 VALUES
+                    ('2026-07-13', 'codex', 'legacy-provider', 'gpt-5', '', ''),
+                    ('2026-07-13', 'claude', 'claude-provider', 'claude', '', '');",
+            )
+            .expect("写入混合历史数据");
+            conn.execute(
+                "INSERT INTO session_log_sync
+                    (file_path, last_modified, last_line_offset, last_synced_at)
+                 VALUES (?1, 1, 0, 1), (?2, 1, 0, 1), (?3, 1, 0, 1)",
+                [
+                    legacy_session_path.clone(),
+                    other_session_path.clone(),
+                    missing_session_path.clone(),
+                ],
+            )
+            .expect("写入混合会话状态");
+        }
+        let snapshot = LegacyCodexProfileSnapshot {
+            override_home: Some(override_home.clone()),
+            current_provider_id: Some("legacy-provider".to_string()),
+            route_enabled: true,
+            failover_provider_ids: Vec::new(),
+            live_backup_json: None,
+        };
+        let service = migration_service(db.clone(), &default_home);
+
+        let selected_profile_id = service.migrate(snapshot.clone())?;
+        assert!(default_home.is_dir(), "默认 Home 不存在时应只创建目录");
+        for file_name in ["auth.json", "config.toml", "sessions"] {
+            assert!(
+                !default_home.join(file_name).exists(),
+                "迁移不得创建 {file_name}"
+            );
+        }
+        assert_history_ownership(
+            &db,
+            &selected_profile_id,
+            &legacy_session_path,
+            &other_session_path,
+            &missing_session_path,
+        )?;
+
+        assert_eq!(service.migrate(snapshot)?, selected_profile_id);
+        assert_history_ownership(
+            &db,
+            &selected_profile_id,
+            &legacy_session_path,
+            &other_session_path,
+            &missing_session_path,
+        )
+    }
+
+    /// 断言混合历史数据只被归属到旧实际 Home 对应的 Profile。
+    fn assert_history_ownership(
+        db: &Database,
+        selected_profile_id: &str,
+        legacy_session_path: &str,
+        other_session_path: &str,
+        missing_session_path: &str,
+    ) -> Result<(), AppError> {
+        let conn = db.conn.lock().expect("获取数据库锁");
+        let codex_request_profile: Option<String> = conn.query_row(
+            "SELECT profile_id FROM proxy_request_logs WHERE request_id = 'codex-legacy'",
+            [],
+            |row| row.get(0),
+        )?;
+        let claude_request_profile: Option<String> = conn.query_row(
+            "SELECT profile_id FROM proxy_request_logs WHERE request_id = 'claude-other'",
+            [],
+            |row| row.get(0),
+        )?;
+        let codex_rollup_profile: String = conn.query_row(
+            "SELECT profile_id FROM usage_daily_rollups
+             WHERE app_type = 'codex' AND provider_id = 'legacy-provider'",
+            [],
+            |row| row.get(0),
+        )?;
+        let claude_rollup_profile: String = conn.query_row(
+            "SELECT profile_id FROM usage_daily_rollups
+             WHERE app_type = 'claude' AND provider_id = 'claude-provider'",
+            [],
+            |row| row.get(0),
+        )?;
+        let legacy_session_profile: Option<String> = conn.query_row(
+            "SELECT profile_id FROM session_log_sync WHERE file_path = ?1",
+            [legacy_session_path],
+            |row| row.get(0),
+        )?;
+        let other_session_profile: Option<String> = conn.query_row(
+            "SELECT profile_id FROM session_log_sync WHERE file_path = ?1",
+            [other_session_path],
+            |row| row.get(0),
+        )?;
+        let missing_session_profile: Option<String> = conn.query_row(
+            "SELECT profile_id FROM session_log_sync WHERE file_path = ?1",
+            [missing_session_path],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(codex_request_profile.as_deref(), Some(selected_profile_id));
+        assert!(claude_request_profile.is_none());
+        assert_eq!(codex_rollup_profile, selected_profile_id);
+        assert!(claude_rollup_profile.is_empty());
+        assert_eq!(legacy_session_profile.as_deref(), Some(selected_profile_id));
+        assert!(other_session_profile.is_none());
+        assert!(missing_session_profile.is_none());
         Ok(())
     }
 }
