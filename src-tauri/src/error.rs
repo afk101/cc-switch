@@ -9,6 +9,11 @@ pub enum AppError {
     DuplicateCodexHome { profile_id: String },
     #[error("默认 Codex Profile 不可重新绑定或删除")]
     DefaultCodexProfileImmutable,
+    #[error("Codex Live 配置已被外部修改，预期指纹: {expected_fingerprint}，实际指纹: {actual_fingerprint}")]
+    CodexLiveConfigConflict {
+        expected_fingerprint: String,
+        actual_fingerprint: String,
+    },
     #[error("配置错误: {0}")]
     Config(String),
     #[error("无效输入: {0}")]

@@ -145,12 +145,35 @@ pub fn get_codex_config_dir() -> PathBuf {
 
 /// 获取 Codex auth.json 路径
 pub fn get_codex_auth_path() -> PathBuf {
-    get_codex_config_dir().join("auth.json")
+    codex_auth_path_for_home(&get_codex_config_dir())
 }
 
 /// 获取 Codex config.toml 路径
 pub fn get_codex_config_path() -> PathBuf {
-    get_codex_config_dir().join("config.toml")
+    codex_config_path_for_home(&get_codex_config_dir())
+}
+
+/// 根据显式 CODEX_HOME 获取认证文件路径。
+pub fn codex_auth_path_for_home(home: &Path) -> PathBuf {
+    home.join("auth.json")
+}
+
+/// 根据显式 CODEX_HOME 获取主配置文件路径。
+pub fn codex_config_path_for_home(home: &Path) -> PathBuf {
+    home.join("config.toml")
+}
+
+/// 根据显式 CODEX_HOME 获取模型目录路径。
+#[allow(dead_code)]
+pub fn codex_models_dir_for_home(home: &Path) -> PathBuf {
+    home.join("models")
+}
+
+/// 仅原子写入显式 CODEX_HOME 的 `config.toml`，不会触碰 `auth.json`。
+pub fn write_codex_live_atomic_for_home(home: &Path, content: &str) -> Result<(), AppError> {
+    let config_path = codex_config_path_for_home(home);
+    validate_config_toml(content)?;
+    write_text_file(&config_path, content)
 }
 
 pub fn get_codex_model_catalog_path() -> PathBuf {
@@ -286,17 +309,11 @@ pub(crate) fn is_custom_codex_model_provider_id(id: &str) -> bool {
 /// and provider-scoped bearer tokens live in `config.toml`. Provider switches
 /// should not overwrite the user's ChatGPT login cache.
 pub fn write_codex_live_config_atomic(config_text_opt: Option<&str>) -> Result<(), AppError> {
-    let config_path = get_codex_config_path();
     let cfg_text = match config_text_opt {
         Some(config_text) => config_text.to_string(),
         None => String::new(),
     };
-
-    if !cfg_text.trim().is_empty() {
-        toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
-    }
-
-    write_text_file(&config_path, &cfg_text)
+    write_codex_live_atomic_for_home(&get_codex_config_dir(), &cfg_text)
 }
 
 pub fn extract_codex_auth_api_key(auth: &Value) -> Option<String> {

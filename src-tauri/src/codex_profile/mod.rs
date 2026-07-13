@@ -1,13 +1,19 @@
 //! Codex Profile 的领域模型与持久化编排。
 //!
-//! 本模块不读写 Home 配置文件，也不控制监听器运行时。
+//! 除 `home_config` 外，本模块的持久化域代码不读写 Home 配置文件，也不控制监听器运行时。
 
 mod constants;
+mod home_config;
 mod migration;
 mod model;
 mod repository;
+mod secret_store;
 
 pub use constants::*;
+pub use home_config::{
+    CodexHomeConfigService, CodexHomeFileOps, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
+    SystemCodexHomeFileOps,
+};
 pub use migration::{CodexProfileMigrationService, LegacyCodexProfileSnapshot};
 pub use model::{
     CodexProfile, CodexProfileRef, CodexProfileRoute, CodexProfileScope, CodexProfileState,
@@ -17,3 +23,4 @@ pub use repository::{
     CodexProfileRepository, HomePathCanonicalizer, PortAvailability, SystemHomePathCanonicalizer,
     SystemPortAvailability,
 };
+pub use secret_store::CodexProfileSecretStore;
