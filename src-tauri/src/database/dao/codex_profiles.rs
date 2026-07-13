@@ -107,6 +107,40 @@ impl Database {
         Ok(())
     }
 
+    /// 在同一事务内写入 Profile 与关闭状态的空路由记录。
+    pub fn create_codex_profile_with_empty_route(
+        &self,
+        profile: &CodexProfile,
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO codex_profiles
+             (id, name, canonical_home_path, listen_port, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                profile.id,
+                profile.name,
+                profile.canonical_home_path,
+                profile.listen_port,
+                profile.created_at,
+                profile.updated_at,
+            ],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT INTO codex_profile_routes
+             (profile_id, current_provider_id, provider_app_type, enabled, updated_at)
+             VALUES (?1, NULL, ?2, 0, ?3)",
+            params![profile.id, AppType::Codex.as_str(), profile.updated_at],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// 更新已有 Codex Profile 的可持久化字段。
     pub fn update_codex_profile(&self, profile: &CodexProfile) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);

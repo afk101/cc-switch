@@ -4,7 +4,6 @@ use crate::codex_profile::constants::{
     DEFAULT_CODEX_PROFILE_ID, DEFAULT_CODEX_PROFILE_NAME, LEGACY_CODEX_ROUTE_PORT,
 };
 use crate::error::AppError;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -75,20 +74,16 @@ pub struct CodexProfileState {
 }
 
 impl CodexProfile {
-    /// 构造固定绑定 `~/.codex` 的默认 Profile。
-    pub fn default_profile() -> Result<Self, AppError> {
-        let home_dir = dirs::home_dir()
-            .ok_or_else(|| AppError::Config("无法确定当前用户主目录".to_string()))?;
-        let now = Utc::now().timestamp();
-
-        Ok(Self {
+    /// 用已规范化的默认 Home 路径构造默认 Profile。
+    pub fn default_profile(canonical_home_path: String, created_at: i64) -> Self {
+        Self {
             id: DEFAULT_CODEX_PROFILE_ID.to_string(),
             name: DEFAULT_CODEX_PROFILE_NAME.to_string(),
-            canonical_home_path: home_dir.join(".codex").to_string_lossy().into_owned(),
+            canonical_home_path,
             listen_port: LEGACY_CODEX_ROUTE_PORT,
-            created_at: now,
-            updated_at: now,
-        })
+            created_at,
+            updated_at: created_at,
+        }
     }
 
     /// 校验官方订阅操作；默认 Profile 与其他 Profile 权限相同。

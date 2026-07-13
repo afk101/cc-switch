@@ -1,5 +1,5 @@
 use crate::codex_profile::constants::{CODEX_ROUTE_LISTEN_HOST, FIRST_CUSTOM_CODEX_ROUTE_PORT};
-use crate::codex_profile::{CodexProfile, CodexProfileRoute, CodexRuntimeStatus};
+use crate::codex_profile::{CodexProfile, CodexRuntimeStatus};
 use crate::database::Database;
 use crate::error::AppError;
 use chrono::Utc;
@@ -87,11 +87,21 @@ impl CodexProfileRepository {
             updated_at: now,
         };
 
-        self.db.insert_codex_profile(&profile)?;
-        if let Err(error) = self.save_initial_route(&profile.id, now) {
-            let _ = self.db.delete_codex_profile(&profile.id);
-            return Err(error);
-        }
+        self.db.create_codex_profile_with_empty_route(&profile)?;
+        Ok(profile)
+    }
+
+    /// 使用同一套路径归一化规则创建默认 Codex Profile。
+    pub fn create_default_profile(
+        &self,
+        default_home_path: &Path,
+    ) -> Result<CodexProfile, AppError> {
+        let canonical_home = self.validate_new_home(default_home_path)?;
+        let profile = CodexProfile::default_profile(
+            canonical_home.to_string_lossy().into_owned(),
+            Utc::now().timestamp(),
+        );
+        self.db.create_codex_profile_with_empty_route(&profile)?;
         Ok(profile)
     }
 
@@ -178,15 +188,6 @@ impl CodexProfileRepository {
             .collect())
     }
 
-    /// 为新 Profile 创建关闭状态的空路由记录。
-    fn save_initial_route(&self, profile_id: &str, updated_at: i64) -> Result<(), AppError> {
-        self.db.save_codex_profile_route(&CodexProfileRoute {
-            profile_id: profile_id.to_string(),
-            current_provider_id: None,
-            enabled: false,
-            updated_at,
-        })
-    }
 }
 
 /// 校验并规范化用户输入的 Profile 显示名称。
@@ -262,7 +263,7 @@ mod tests {
 
     #[test]
     fn default_profile_has_no_capability_restrictions() -> Result<(), AppError> {
-        let profile = super::CodexProfile::default_profile()?;
+        let profile = super::CodexProfile::default_profile("/tmp/.codex".to_string(), 1);
 
         assert!(profile.validate_official_operation().is_ok());
         assert!(profile.validate_route_operation().is_ok());
@@ -273,6 +274,29 @@ mod tests {
         assert!(matches!(
             profile.validate_delete(),
             Err(AppError::DefaultCodexProfileImmutable)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn default_profile_canonical_home_rejects_symlink_alias() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let real_home = temp_dir.path().join("real-home");
+        let alias_home = temp_dir.path().join("alias-home");
+        std::fs::create_dir(&real_home).expect("创建默认 Home");
+        std::os::unix::fs::symlink(&real_home, &alias_home).expect("创建默认 Home 软链接");
+        let db = Arc::new(Database::memory()?);
+        let repository = CodexProfileRepository::new(
+            db,
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(SystemPortAvailability),
+        );
+
+        repository.create_default_profile(&real_home)?;
+
+        assert!(matches!(
+            repository.validate_new_home(&alias_home),
+            Err(AppError::DuplicateCodexHome { profile_id }) if profile_id == "codex-default"
         ));
         Ok(())
     }
@@ -326,6 +350,39 @@ mod tests {
                 .expect("规范化新 Home")
                 .to_string_lossy()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn create_profile_rolls_back_when_empty_route_insert_fails() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let home = temp_dir.path().join("home");
+        std::fs::create_dir(&home).expect("创建 Home");
+        let db = Arc::new(Database::memory()?);
+        {
+            let conn = db.conn.lock().expect("获取数据库锁");
+            conn.execute_batch(
+                "CREATE TRIGGER reject_empty_codex_profile_route
+                 BEFORE INSERT ON codex_profile_routes
+                 BEGIN SELECT RAISE(ABORT, '拒绝测试空路由'); END;",
+            )
+            .expect("创建失败注入触发器");
+        }
+        let repository = CodexProfileRepository::new(
+            db.clone(),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(SystemPortAvailability),
+        );
+
+        assert!(repository.create_profile("工作", &home).is_err());
+        assert!(db.list_codex_profiles()?.is_empty(), "Profile 写入必须回滚");
+        let route_count: i64 = db
+            .conn
+            .lock()
+            .expect("获取数据库锁")
+            .query_row("SELECT COUNT(*) FROM codex_profile_routes", [], |row| row.get(0))
+            .expect("读取路由数量");
+        assert_eq!(route_count, 0, "Route 写入也不能残留");
         Ok(())
     }
 }
