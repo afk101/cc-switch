@@ -136,6 +136,7 @@ impl Database {
         Self::apply_schema_migrations_on_conn(&temp_conn)?;
         Self::validate_basic_state(&temp_conn)?;
         if let Some(local_snapshot) = local_snapshot.as_ref() {
+            Self::validate_codex_profile_provider_references(local_snapshot, &temp_conn)?;
             Self::restore_tables(local_snapshot, &temp_conn, preserve_tables)?;
         }
 
@@ -240,6 +241,122 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// 确认本机 Codex Profile 的 Provider 引用在远端导入数据中仍然存在。
+    fn validate_codex_profile_provider_references(
+        source_conn: &Connection,
+        target_conn: &Connection,
+    ) -> Result<(), AppError> {
+        Self::validate_codex_profile_route_provider_references(source_conn, target_conn)?;
+        Self::validate_codex_profile_failover_provider_references(source_conn, target_conn)
+    }
+
+    /// 校验本机 Codex Profile 当前路由引用的 Provider。
+    fn validate_codex_profile_route_provider_references(
+        source_conn: &Connection,
+        target_conn: &Connection,
+    ) -> Result<(), AppError> {
+        if !Self::table_exists(source_conn, "codex_profile_routes")? {
+            return Ok(());
+        }
+
+        let mut stmt = source_conn
+            .prepare(
+                "SELECT profile_id, current_provider_id, provider_app_type
+                 FROM codex_profile_routes WHERE current_provider_id IS NOT NULL",
+            )
+            .map_err(|e| AppError::Database(format!("读取本机 Codex Profile 路由失败: {e}")))?;
+        let references = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| AppError::Database(format!("查询本机 Codex Profile 路由失败: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Database(format!("读取本机 Codex Profile 路由失败: {e}")))?;
+
+        for (profile_id, provider_id, app_type) in references {
+            Self::ensure_codex_profile_provider_exists(
+                target_conn,
+                &profile_id,
+                &provider_id,
+                &app_type,
+                "当前路由",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// 校验本机 Codex Profile 故障转移引用的 Provider。
+    fn validate_codex_profile_failover_provider_references(
+        source_conn: &Connection,
+        target_conn: &Connection,
+    ) -> Result<(), AppError> {
+        if !Self::table_exists(source_conn, "codex_profile_failovers")? {
+            return Ok(());
+        }
+
+        let mut stmt = source_conn
+            .prepare(
+                "SELECT profile_id, provider_id, provider_app_type
+                 FROM codex_profile_failovers",
+            )
+            .map_err(|e| AppError::Database(format!("读取本机 Codex Profile 故障转移失败: {e}")))?;
+        let references = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| AppError::Database(format!("查询本机 Codex Profile 故障转移失败: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| AppError::Database(format!("读取本机 Codex Profile 故障转移失败: {e}")))?;
+
+        for (profile_id, provider_id, app_type) in references {
+            Self::ensure_codex_profile_provider_exists(
+                target_conn,
+                &profile_id,
+                &provider_id,
+                &app_type,
+                "故障转移",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// 确认指定 Profile Provider 引用能在远端导入后的 Provider 表中解析。
+    fn ensure_codex_profile_provider_exists(
+        target_conn: &Connection,
+        profile_id: &str,
+        provider_id: &str,
+        app_type: &str,
+        reference_type: &str,
+    ) -> Result<(), AppError> {
+        let exists: bool = target_conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM providers WHERE id = ?1 AND app_type = ?2
+                 )",
+                [provider_id, app_type],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Database(format!("检查远端 Provider 引用失败: {e}")))?;
+
+        if exists {
+            return Ok(());
+        }
+
+        Err(AppError::Config(format!(
+            "无法恢复本机 Codex Profile「{profile_id}」的{reference_type}：供应商「{provider_id}」（{app_type}）不存在于远端同步数据。请先在远端恢复该供应商，或在本机 Profile 中移除该引用后重试同步。"
+        )))
     }
 
     /// Periodic backup: create a new backup if the latest one is older than the configured interval
@@ -821,6 +938,148 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM codex_profiles", [], |row| row.get(0))?
         };
         assert_eq!(profile_count, 1, "本机 Profile 表应在同步导入时保留");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_import_rejects_missing_provider_referenced_by_local_codex_profile(
+    ) -> Result<(), AppError> {
+        let remote_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(remote_db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('remote-provider', 'codex', '远端 Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        let remote_sql = remote_db.export_sql_string_for_sync()?;
+
+        let local_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('deleted-provider', 'codex', '本机已删 Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+                 VALUES ('profile-a', '本机 Profile', '/Users/test/.codex-a', 16701, 1, 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_profile_routes
+                    (profile_id, current_provider_id, provider_app_type, enabled, updated_at)
+                 VALUES ('profile-a', 'deleted-provider', 'codex', 1, 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_profile_failovers
+                    (profile_id, position, provider_id, provider_app_type)
+                 VALUES ('profile-a', 0, 'deleted-provider', 'codex')",
+                [],
+            )?;
+        }
+
+        let error = local_db
+            .import_sql_string_for_sync(&remote_sql)
+            .expect_err("缺少本机 Profile 引用的 Provider 时应拒绝同步");
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains("Codex Profile") && error_message.contains("deleted-provider"),
+            "应返回可定位的中文 Profile Provider 缺失错误，实际: {error_message}"
+        );
+
+        let (
+            deleted_provider_count,
+            profile_count,
+            route_count,
+            failover_count,
+            remote_provider_count,
+        ): (i64, i64, i64, i64, i64) = {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            let deleted_provider_count = conn.query_row(
+                "SELECT COUNT(*) FROM providers WHERE id = 'deleted-provider' AND app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )?;
+            let profile_count =
+                conn.query_row("SELECT COUNT(*) FROM codex_profiles", [], |row| row.get(0))?;
+            let route_count =
+                conn.query_row("SELECT COUNT(*) FROM codex_profile_routes", [], |row| {
+                    row.get(0)
+                })?;
+            let failover_count =
+                conn.query_row("SELECT COUNT(*) FROM codex_profile_failovers", [], |row| {
+                    row.get(0)
+                })?;
+            let remote_provider_count = conn.query_row(
+                "SELECT COUNT(*) FROM providers WHERE id = 'remote-provider' AND app_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )?;
+            (
+                deleted_provider_count,
+                profile_count,
+                route_count,
+                failover_count,
+                remote_provider_count,
+            )
+        };
+        assert_eq!(deleted_provider_count, 1, "主库原 Provider 应保持不变");
+        assert_eq!(profile_count, 1, "主库 Profile 应保持不变");
+        assert_eq!(route_count, 1, "主库 Route 应保持不变");
+        assert_eq!(failover_count, 1, "主库 Failover 应保持不变");
+        assert_eq!(remote_provider_count, 0, "失败同步不得写入远端 Provider");
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_import_rejects_missing_provider_referenced_by_local_codex_profile_failover(
+    ) -> Result<(), AppError> {
+        let remote_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(remote_db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('remote-provider', 'codex', '远端 Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        let remote_sql = remote_db.export_sql_string_for_sync()?;
+
+        let local_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('deleted-provider', 'codex', '本机已删 Provider', '{}', '{}')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+                 VALUES ('profile-a', '本机 Profile', '/Users/test/.codex-a', 16701, 1, 1)",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO codex_profile_failovers
+                    (profile_id, position, provider_id, provider_app_type)
+                 VALUES ('profile-a', 0, 'deleted-provider', 'codex')",
+                [],
+            )?;
+        }
+
+        let error = local_db
+            .import_sql_string_for_sync(&remote_sql)
+            .expect_err("缺少本机 Profile Failover 引用的 Provider 时应拒绝同步");
+        let error_message = error.to_string();
+        assert!(
+            error_message.contains("Codex Profile") && error_message.contains("deleted-provider"),
+            "应返回可定位的中文 Failover Provider 缺失错误，实际: {error_message}"
+        );
 
         Ok(())
     }
