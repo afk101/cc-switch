@@ -94,24 +94,51 @@ fn migrate_legacy_codex_profiles(db: Arc<Database>) {
     );
     let default_home = crate::config::get_home_dir().join(".codex");
     let migration = crate::codex_profile::CodexProfileMigrationService::new(
-        db,
+        db.clone(),
         repository,
         canonicalizer,
         default_home,
     );
 
     let legacy_live_backup_profile_id = snapshot.live_backup_json.is_some();
-    match migration.migrate(snapshot) {
-        Ok(selected_profile_id) => {
+    match migration.migrate_with_result(snapshot) {
+        Ok(result) => {
+            let selected_profile_id = result.selected_profile_id.clone();
             if let Err(error) = crate::settings::persist_codex_profile_migration(
                 &selected_profile_id,
                 legacy_live_backup_profile_id.then_some(selected_profile_id.as_str()),
             ) {
                 log::error!("保存 Codex Profile 迁移标记失败: {error}");
             }
+            if let Err(error) =
+                initialize_migrated_enabled_codex_profile_token(db.as_ref(), &result)
+            {
+                log::error!("初始化旧 Codex 路由兼容凭证失败: {error}");
+            }
         }
         Err(error) => log::error!("迁移旧 Codex 配置到 Profile 失败: {error}"),
     }
+}
+
+/// 仅为迁移时已启用的旧 Codex 路由建立兼容本地凭证，不修改任何 Home 文件。
+fn initialize_migrated_enabled_codex_profile_token(
+    db: &Database,
+    migration_result: &crate::codex_profile::CodexProfileMigrationResult,
+) -> Result<(), AppError> {
+    let Some(migrated_profile) = migration_result.migrated_enabled_profile() else {
+        return Ok(());
+    };
+    let profile = db.get_codex_profile(migrated_profile.profile_id())?;
+    let home = std::path::Path::new(&profile.canonical_home_path);
+    let config_path = crate::codex_config::codex_config_path_for_home(home);
+    let live_config = if config_path.exists() {
+        std::fs::read_to_string(&config_path).map_err(|error| AppError::io(&config_path, error))?
+    } else {
+        String::new()
+    };
+    crate::codex_profile::CodexProfileSecretStore::new()
+        .initialize_migrated_enabled_proxy_token(migrated_profile, &live_config)?;
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

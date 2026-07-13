@@ -14,7 +14,10 @@ pub use home_config::{
     CodexHomeConfigService, CodexHomeFileOps, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
     SystemCodexHomeFileOps,
 };
-pub use migration::{CodexProfileMigrationService, LegacyCodexProfileSnapshot};
+pub use migration::{
+    CodexProfileMigrationResult, CodexProfileMigrationService, LegacyCodexProfileSnapshot,
+    MigratedEnabledCodexProfile,
+};
 pub use model::{
     CodexProfile, CodexProfileRef, CodexProfileRoute, CodexProfileScope, CodexProfileState,
     CodexRuntimeStatus,

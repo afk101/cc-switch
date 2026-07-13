@@ -53,6 +53,35 @@ impl LegacyCodexProfileSnapshot {
     }
 }
 
+/// 已完成旧单例迁移且当时已启用路由的 Profile 证明。
+///
+/// 该类型只能由迁移服务产生，避免普通新 Profile 误用旧 `PROXY_MANAGED` 兼容凭证。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigratedEnabledCodexProfile {
+    profile_id: String,
+}
+
+impl MigratedEnabledCodexProfile {
+    /// 返回已由迁移服务绑定的 Profile 标识。
+    pub fn profile_id(&self) -> &str {
+        &self.profile_id
+    }
+}
+
+/// 旧单例迁移的结果，保留后续兼容初始化所需的受控证明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexProfileMigrationResult {
+    pub selected_profile_id: String,
+    migrated_enabled_profile: Option<MigratedEnabledCodexProfile>,
+}
+
+impl CodexProfileMigrationResult {
+    /// 仅在本次实际迁移了已启用旧路由时返回兼容 token 初始化证明。
+    pub fn migrated_enabled_profile(&self) -> Option<&MigratedEnabledCodexProfile> {
+        self.migrated_enabled_profile.as_ref()
+    }
+}
+
 /// 将旧单例 Codex 状态映射为 Profile 的服务。
 pub struct CodexProfileMigrationService {
     db: Arc<Database>,
@@ -88,6 +117,14 @@ impl CodexProfileMigrationService {
 
     /// 将旧单例 Codex 状态幂等映射到 Profile，不创建或改写任何 Codex 配置文件。
     pub fn migrate(&self, snapshot: LegacyCodexProfileSnapshot) -> Result<String, AppError> {
+        Ok(self.migrate_with_result(snapshot)?.selected_profile_id)
+    }
+
+    /// 将旧单例状态迁移为 Profile，并返回仅供受控兼容初始化使用的迁移结果。
+    pub fn migrate_with_result(
+        &self,
+        snapshot: LegacyCodexProfileSnapshot,
+    ) -> Result<CodexProfileMigrationResult, AppError> {
         let override_home = snapshot
             .override_home
             .as_ref()
@@ -98,7 +135,13 @@ impl CodexProfileMigrationService {
         let actual_home_is_default = actual_home == default_home;
         let plan = self.plan_migration(&default_home, &actual_home, actual_home_is_default)?;
         self.apply_migration_plan(&plan, &snapshot)?;
-        Ok(plan.selected_profile_id)
+        Ok(CodexProfileMigrationResult {
+            selected_profile_id: plan.selected_profile_id.clone(),
+            migrated_enabled_profile: (plan.should_apply_legacy_state && snapshot.route_enabled)
+                .then(|| MigratedEnabledCodexProfile {
+                    profile_id: plan.selected_profile_id,
+                }),
+        })
     }
 
     /// 确保内置默认 Home 可被登记；仅创建目录本身，不创建或改写任何 Codex 文件。
@@ -503,6 +546,29 @@ mod tests {
                 std::fs::read(&session_path).expect("再次读取会话文件"),
             ]
         );
+        Ok(())
+    }
+
+    /// 未启用的旧路由迁移不得产生旧占位符兼容凭证的初始化证明。
+    #[test]
+    fn disabled_legacy_migration_does_not_issue_compatibility_token_proof() -> Result<(), AppError>
+    {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let default_home = temp_dir.path().join(".codex");
+        std::fs::create_dir(&default_home).expect("创建默认 Home");
+        let db = Arc::new(Database::memory()?);
+
+        let result = migration_service(db, &default_home).migrate_with_result(
+            LegacyCodexProfileSnapshot {
+                override_home: None,
+                current_provider_id: None,
+                route_enabled: false,
+                failover_provider_ids: Vec::new(),
+                live_backup_json: None,
+            },
+        )?;
+
+        assert!(result.migrated_enabled_profile().is_none());
         Ok(())
     }
 

@@ -1,4 +1,8 @@
-use crate::codex_profile::LOCAL_TOKEN_BYTES;
+use crate::codex_profile::{
+    MigratedEnabledCodexProfile, CODEX_PROFILE_SECRET_DIRECTORY,
+    CODEX_PROFILE_SECRET_PARENT_DIRECTORY, CODEX_PROFILE_TOKEN_FILENAME,
+    LEGACY_PROXY_MANAGED_TOKEN, LOCAL_TOKEN_BYTES,
+};
 use crate::config::get_app_config_dir;
 use crate::error::AppError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -6,9 +10,6 @@ use base64::Engine;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-const TOKEN_FILENAME: &str = "listener-token";
-const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 
 /// 仅存放在 CC Switch 私有目录中的 Profile 本地监听凭证。
 pub struct CodexProfileSecretStore {
@@ -18,7 +19,11 @@ pub struct CodexProfileSecretStore {
 impl CodexProfileSecretStore {
     /// 使用默认的 CC Switch 私有密钥根目录构造存储。
     pub fn new() -> Self {
-        Self::with_root(get_app_config_dir().join("secrets").join("codex-profiles"))
+        Self::with_root(
+            get_app_config_dir()
+                .join(CODEX_PROFILE_SECRET_PARENT_DIRECTORY)
+                .join(CODEX_PROFILE_SECRET_DIRECTORY),
+        )
     }
 
     /// 使用指定私有根目录构造存储，供测试和受控迁移使用。
@@ -30,7 +35,7 @@ impl CodexProfileSecretStore {
     pub fn create(&self, profile_id: &str) -> Result<String, AppError> {
         match self.read(profile_id)? {
             Some(token) => Ok(token),
-            None => self.write_token(profile_id, &generate_token()),
+            None => self.write_token(profile_id, &generate_token()?),
         }
     }
 
@@ -47,15 +52,16 @@ impl CodexProfileSecretStore {
 
     /// 重新生成 Profile 的随机本地监听凭证。
     pub fn rotate(&self, profile_id: &str) -> Result<String, AppError> {
-        self.write_token(profile_id, &generate_token())
+        self.write_token(profile_id, &generate_token()?)
     }
 
-    /// 从已读取的旧 live 配置初始化兼容凭证，不会读取或写入 CODEX_HOME。
-    pub fn initialize_from_live_config(
+    /// 仅接受迁移服务的已启用证明来初始化旧路由兼容凭证，不会读取或写入 CODEX_HOME。
+    pub fn initialize_migrated_enabled_proxy_token(
         &self,
-        profile_id: &str,
+        migrated_profile: &MigratedEnabledCodexProfile,
         live_config: &str,
     ) -> Result<String, AppError> {
+        let profile_id = migrated_profile.profile_id();
         if let Some(token) = self.read(profile_id)? {
             return Ok(token);
         }
@@ -85,7 +91,9 @@ impl CodexProfileSecretStore {
 
     /// 返回经校验的 Profile 对应 token 路径。
     pub fn token_path(&self, profile_id: &str) -> Result<PathBuf, AppError> {
-        Ok(self.profile_dir(profile_id)?.join(TOKEN_FILENAME))
+        Ok(self
+            .profile_dir(profile_id)?
+            .join(CODEX_PROFILE_TOKEN_FILENAME))
     }
 
     /// 写入 token 并以同目录临时文件 rename 保证替换原子性。
@@ -95,8 +103,10 @@ impl CodexProfileSecretStore {
             .parent()
             .ok_or_else(|| AppError::Config("无效的 Codex Profile 密钥路径".to_string()))?;
         fs::create_dir_all(profile_dir).map_err(|error| AppError::io(profile_dir, error))?;
-        let temporary_path =
-            profile_dir.join(format!(".{TOKEN_FILENAME}.{}.tmp", uuid::Uuid::new_v4()));
+        let temporary_path = profile_dir.join(format!(
+            ".{CODEX_PROFILE_TOKEN_FILENAME}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
         write_private_file(&temporary_path, token.as_bytes())?;
         if let Err(error) = replace_token_file(&temporary_path, &token_path) {
             // rename 失败后不保留包含明文 token 的临时文件。
@@ -133,12 +143,12 @@ fn validate_profile_id(profile_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// 生成 32 个随机字节并编码为 URL-safe 本地监听凭证。
-fn generate_token() -> String {
+/// 用操作系统 CSPRNG 填满 32 个随机字节并编码为 URL-safe 本地监听凭证。
+fn generate_token() -> Result<String, AppError> {
     let mut bytes = [0_u8; LOCAL_TOKEN_BYTES];
-    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| AppError::Config(format!("生成 Codex 本地监听凭证失败: {error}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 /// 以 Unix owner-only 权限写入尚未公开的临时 token 文件。
@@ -178,10 +188,15 @@ fn replace_token_file(temporary_path: &Path, token_path: &Path) -> Result<(), Ap
 #[cfg(test)]
 mod codex_profile_secret_store {
     use super::*;
+    use crate::codex_profile::{
+        CodexProfileMigrationService, CodexProfileRepository, HomePathCanonicalizer,
+        LegacyCodexProfileSnapshot, SystemHomePathCanonicalizer, SystemPortAvailability,
+    };
     use crate::database::Database;
     use crate::error::AppError;
     use base64::Engine;
     use std::fs;
+    use std::sync::Arc;
 
     /// 本地监听凭证必须按 Profile 隔离，且不会出现在数据库导出内容中。
     #[test]
@@ -225,18 +240,61 @@ mod codex_profile_secret_store {
         fs::write(&config_path, config).expect("写入旧路由配置");
         let before = fs::read(&config_path).expect("读取旧路由配置");
         let store = CodexProfileSecretStore::with_root(temp_dir.path().join("secrets"));
+        let default_home = temp_dir.path().join(".codex");
+        fs::create_dir_all(&default_home).expect("创建默认 Home");
+        let db = Arc::new(Database::memory()?);
+        let canonicalizer: Arc<dyn HomePathCanonicalizer> = Arc::new(SystemHomePathCanonicalizer);
+        let repository = CodexProfileRepository::new(
+            db.clone(),
+            canonicalizer.clone(),
+            Arc::new(SystemPortAvailability),
+        );
+        let migration =
+            CodexProfileMigrationService::new(db, repository, canonicalizer, default_home);
+        let migration_result = migration.migrate_with_result(LegacyCodexProfileSnapshot {
+            override_home: Some(home.clone()),
+            current_provider_id: None,
+            route_enabled: true,
+            failover_provider_ids: Vec::new(),
+            live_backup_json: None,
+        })?;
+        let migrated_profile_id = migration_result.selected_profile_id.clone();
+        let migrated_profile = migration_result
+            .migrated_enabled_profile()
+            .expect("已启用的旧路由迁移应产生兼容初始化证明");
 
-        let token = store.initialize_from_live_config(
-            "legacy-profile",
+        let token = store.initialize_migrated_enabled_proxy_token(
+            migrated_profile,
             &fs::read_to_string(&config_path).expect("读取 live 配置"),
         )?;
 
         assert_eq!(token, LEGACY_PROXY_MANAGED_TOKEN);
         assert_eq!(
-            store.read("legacy-profile")?,
+            store.read(&migrated_profile_id)?,
             Some(LEGACY_PROXY_MANAGED_TOKEN.to_string())
         );
         assert_eq!(fs::read(config_path).expect("读取 Home 配置"), before);
+        Ok(())
+    }
+
+    /// 非迁移 Profile 即使碰巧出现旧占位符，也必须使用新的随机本地凭证。
+    #[test]
+    fn non_migrated_profile_never_reuses_proxy_managed_placeholder() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let store = CodexProfileSecretStore::with_root(temp_dir.path().join("secrets"));
+
+        let unrelated_config = "experimental_bearer_token = \"PROXY_MANAGED\"\n";
+        let token = store.create("new-profile")?;
+
+        assert_ne!(token, LEGACY_PROXY_MANAGED_TOKEN);
+        assert!(unrelated_config.contains(LEGACY_PROXY_MANAGED_TOKEN));
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(token.as_bytes())
+                .expect("解码 token")
+                .len(),
+            LOCAL_TOKEN_BYTES
+        );
         Ok(())
     }
 

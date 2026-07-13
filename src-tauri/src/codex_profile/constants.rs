@@ -12,3 +12,11 @@ pub const FIRST_CUSTOM_CODEX_ROUTE_PORT: u16 = 15_722;
 pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
 /// 每个本地监听凭证使用的随机字节数。
 pub const LOCAL_TOKEN_BYTES: usize = 32;
+/// CC Switch 私有密钥根目录下的通用 secrets 目录名。
+pub const CODEX_PROFILE_SECRET_PARENT_DIRECTORY: &str = "secrets";
+/// Codex Profile 私有密钥目录名。
+pub const CODEX_PROFILE_SECRET_DIRECTORY: &str = "codex-profiles";
+/// 单个 Profile 本地监听凭证的文件名。
+pub const CODEX_PROFILE_TOKEN_FILENAME: &str = "listener-token";
+/// 旧单例代理接管配置中使用的兼容占位符。
+pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
