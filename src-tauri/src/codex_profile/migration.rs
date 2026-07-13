@@ -88,11 +88,13 @@ impl CodexProfileMigrationService {
 
     /// 将旧单例 Codex 状态幂等映射到 Profile，不创建或改写任何 Codex 配置文件。
     pub fn migrate(&self, snapshot: LegacyCodexProfileSnapshot) -> Result<String, AppError> {
+        let override_home = snapshot
+            .override_home
+            .as_ref()
+            .map(|home| self.canonicalizer.canonicalize(home))
+            .transpose()?;
         let default_home = self.canonicalize_default_home()?;
-        let actual_home = match snapshot.override_home.as_ref() {
-            Some(override_home) => self.canonicalizer.canonicalize(override_home)?,
-            None => default_home.clone(),
-        };
+        let actual_home = override_home.unwrap_or_else(|| default_home.clone());
         let actual_home_is_default = actual_home == default_home;
         let plan = self.plan_migration(&default_home, &actual_home, actual_home_is_default)?;
         self.apply_migration_plan(&plan, &snapshot)?;
@@ -345,23 +347,45 @@ fn backfill_legacy_history_in_transaction(
         [profile_id],
     )
     .map_err(|error| AppError::Database(error.to_string()))?;
-    // 目标 Profile 已有相同聚合键时不能仅改主键，否则会丢失或重复统计；
-    // 保留空归属行，留待具备合并语义的后续流程处理。
+    // 与目标 Profile 聚合键冲突时沿用日聚合逻辑合并计数、Token、成本，
+    // 平均延迟按请求数加权；完成后删除空桶，避免同一历史被重复统计。
     tx.execute(
-        "UPDATE usage_daily_rollups AS legacy
-         SET profile_id = ?1
-         WHERE legacy.app_type = 'codex' AND legacy.profile_id = ''
-           AND NOT EXISTS (
-               SELECT 1 FROM usage_daily_rollups AS assigned
-               WHERE assigned.date = legacy.date
-                 AND assigned.app_type = legacy.app_type
-                 AND assigned.provider_id = legacy.provider_id
-                 AND assigned.model = legacy.model
-                 AND assigned.request_model = legacy.request_model
-                 AND assigned.pricing_model = legacy.pricing_model
-                 AND assigned.profile_id = ?1
-           )",
+        "INSERT INTO usage_daily_rollups
+            (date, app_type, provider_id, model, request_model, pricing_model,
+             request_count, success_count, input_tokens, output_tokens,
+             cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, profile_id)
+         SELECT date, app_type, provider_id, model, request_model, pricing_model,
+                request_count, success_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, ?1
+         FROM usage_daily_rollups
+         WHERE app_type = 'codex' AND profile_id = ''
+         ON CONFLICT(date, app_type, provider_id, model, request_model, pricing_model, profile_id)
+         DO UPDATE SET
+             request_count = usage_daily_rollups.request_count + excluded.request_count,
+             success_count = usage_daily_rollups.success_count + excluded.success_count,
+             input_tokens = usage_daily_rollups.input_tokens + excluded.input_tokens,
+             output_tokens = usage_daily_rollups.output_tokens + excluded.output_tokens,
+             cache_read_tokens = usage_daily_rollups.cache_read_tokens + excluded.cache_read_tokens,
+             cache_creation_tokens = usage_daily_rollups.cache_creation_tokens + excluded.cache_creation_tokens,
+             total_cost_usd = CAST(
+                 COALESCE(CAST(usage_daily_rollups.total_cost_usd AS REAL), 0)
+                 + COALESCE(CAST(excluded.total_cost_usd AS REAL), 0)
+                 AS TEXT
+             ),
+             avg_latency_ms = CASE
+                 WHEN usage_daily_rollups.request_count + excluded.request_count > 0 THEN
+                     (usage_daily_rollups.avg_latency_ms * usage_daily_rollups.request_count
+                      + excluded.avg_latency_ms * excluded.request_count)
+                     / (usage_daily_rollups.request_count + excluded.request_count)
+                 ELSE 0
+             END",
         [profile_id],
+    )
+    .map_err(|error| AppError::Database(error.to_string()))?;
+    tx.execute(
+        "DELETE FROM usage_daily_rollups
+         WHERE app_type = 'codex' AND profile_id = ''",
+        [],
     )
     .map_err(|error| AppError::Database(error.to_string()))?;
     backfill_legacy_session_sync_in_transaction(tx, profile_id, actual_home)
@@ -509,6 +533,10 @@ mod tests {
         assert!(
             !missing_override_home.exists(),
             "不得创建缺失的 override Home"
+        );
+        assert!(
+            !default_home.exists(),
+            "缺失 override 时不得提前创建默认 Home"
         );
         Ok(())
     }
@@ -752,6 +780,67 @@ mod tests {
         )
     }
 
+    /// 旧空 Profile 聚合桶与目标桶冲突时，迁移必须按现有聚合语义合并并删除旧桶。
+    #[test]
+    fn legacy_codex_profile_migration_merges_conflicting_legacy_rollup_idempotently(
+    ) -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let default_home = temp_dir.path().join(".codex");
+        let override_home = temp_dir.path().join("work-codex");
+        std::fs::create_dir(&default_home).expect("创建默认 Home");
+        std::fs::create_dir(&override_home).expect("创建旧 override Home");
+        let db = Arc::new(Database::memory()?);
+        {
+            let conn = db.conn.lock().expect("获取数据库锁");
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('legacy-provider', 'codex', '旧 Codex 供应商', '{}', '{}')",
+                [],
+            )
+            .expect("写入旧供应商");
+        }
+        let snapshot = LegacyCodexProfileSnapshot {
+            override_home: Some(override_home),
+            current_provider_id: Some("legacy-provider".to_string()),
+            route_enabled: false,
+            failover_provider_ids: Vec::new(),
+            live_backup_json: None,
+        };
+        let service = migration_service(db.clone(), &default_home);
+        let selected_profile_id = service.migrate(snapshot.clone())?;
+        {
+            let conn = db.conn.lock().expect("获取数据库锁");
+            conn.execute(
+                "INSERT INTO usage_daily_rollups
+                    (date, app_type, provider_id, model, request_model, pricing_model,
+                     request_count, success_count, input_tokens, output_tokens,
+                     cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, profile_id)
+                 VALUES
+                    ('2026-07-13', 'codex', 'legacy-provider', 'gpt-5', '', '',
+                     2, 1, 10, 20, 4, 5, '0.25', 100, ?1)",
+                [&selected_profile_id],
+            )
+            .expect("写入目标聚合桶");
+            conn.execute(
+                "INSERT INTO usage_daily_rollups
+                    (date, app_type, provider_id, model, request_model, pricing_model,
+                     request_count, success_count, input_tokens, output_tokens,
+                     cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, profile_id)
+                 VALUES
+                    ('2026-07-13', 'codex', 'legacy-provider', 'gpt-5', '', '',
+                     3, 2, 30, 40, 6, 7, '0.75', 200, '')",
+                [],
+            )
+            .expect("写入冲突的旧聚合桶");
+        }
+
+        assert_eq!(service.migrate(snapshot.clone())?, selected_profile_id);
+        assert_merged_rollup(&db, &selected_profile_id)?;
+
+        assert_eq!(service.migrate(snapshot)?, selected_profile_id);
+        assert_merged_rollup(&db, &selected_profile_id)
+    }
+
     /// 断言混合历史数据只被归属到旧实际 Home 对应的 Profile。
     fn assert_history_ownership(
         db: &Database,
@@ -806,6 +895,45 @@ mod tests {
         assert_eq!(legacy_session_profile.as_deref(), Some(selected_profile_id));
         assert!(other_session_profile.is_none());
         assert!(missing_session_profile.is_none());
+        Ok(())
+    }
+
+    /// 断言冲突聚合桶已被精确合并，且不会遗留空 Profile 桶。
+    fn assert_merged_rollup(db: &Database, selected_profile_id: &str) -> Result<(), AppError> {
+        let conn = db.conn.lock().expect("获取数据库锁");
+        let merged: (i64, i64, i64, i64, i64, i64, f64, i64) = conn.query_row(
+            "SELECT request_count, success_count, input_tokens, output_tokens,
+                    cache_read_tokens, cache_creation_tokens,
+                    CAST(total_cost_usd AS REAL), avg_latency_ms
+             FROM usage_daily_rollups
+             WHERE date = '2026-07-13' AND app_type = 'codex'
+               AND provider_id = 'legacy-provider' AND model = 'gpt-5'
+               AND profile_id = ?1",
+            [selected_profile_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )?;
+        let empty_rollup_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usage_daily_rollups
+             WHERE date = '2026-07-13' AND app_type = 'codex'
+               AND provider_id = 'legacy-provider' AND model = 'gpt-5'
+               AND profile_id = ''",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(merged, (5, 3, 40, 60, 10, 12, 1.0, 160));
+        assert_eq!(empty_rollup_count, 0, "合并后不得保留空 Profile 桶");
         Ok(())
     }
 }
