@@ -2,8 +2,8 @@
 
 use crate::app_config::AppType;
 use crate::codex_profile::{
-    CodexProfile, CodexProfileRepository, HomePathCanonicalizer, DEFAULT_CODEX_PROFILE_ID,
-    LEGACY_CODEX_ROUTE_PORT,
+    CodexProfile, CodexProfileRepository, HomePathCanonicalizer,
+    CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING, DEFAULT_CODEX_PROFILE_ID, LEGACY_CODEX_ROUTE_PORT,
 };
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
@@ -266,6 +266,16 @@ impl CodexProfileMigrationService {
             if snapshot.live_backup_json.is_some() {
                 tx.execute("DELETE FROM proxy_live_backup WHERE app_type = 'codex'", [])
                     .map_err(|error| AppError::Database(error.to_string()))?;
+            }
+            if snapshot.route_enabled {
+                tx.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                    params![
+                        CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING,
+                        plan.selected_profile_id
+                    ],
+                )
+                .map_err(|error| AppError::Database(error.to_string()))?;
             }
         }
         backfill_legacy_history_in_transaction(&tx, &plan.selected_profile_id, &plan.actual_home)?;

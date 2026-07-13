@@ -110,14 +110,6 @@ fn migrate_legacy_codex_profiles(db: Arc<Database>) {
             ) {
                 log::error!("保存 Codex Profile 迁移标记失败: {error}");
             }
-            if let Some(migrated_profile) = result.migrated_enabled_profile() {
-                if let Err(error) = db.set_setting(
-                    crate::codex_profile::CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING,
-                    migrated_profile.profile_id(),
-                ) {
-                    log::error!("记录旧 Codex 路由兼容凭证待办失败: {error}");
-                }
-            }
             if let Err(error) = initialize_pending_codex_profile_token(db.as_ref()) {
                 log::error!("初始化旧 Codex 路由兼容凭证失败: {error}");
             }

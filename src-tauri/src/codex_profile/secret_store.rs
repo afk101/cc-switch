@@ -44,7 +44,7 @@ impl CodexProfileSecretStore {
         let _guard = lock.lock()?;
         match self.read(profile_id)? {
             Some(token) => Ok(token),
-            None => self.write_token(profile_id, &generate_token()?),
+            None => self.create_token_if_absent(profile_id),
         }
     }
 
@@ -144,6 +144,46 @@ impl CodexProfileSecretStore {
             return Err(error);
         }
         Ok(token.to_string())
+    }
+
+    /// 仅在 token 尚不存在时发布新文件；跨进程竞争失败时读取胜者已发布的 token。
+    fn create_token_if_absent(&self, profile_id: &str) -> Result<String, AppError> {
+        let token = generate_token()?;
+        let token_path = self.token_path(profile_id)?;
+        let profile_dir = token_path
+            .parent()
+            .ok_or_else(|| AppError::Config("无效的 Codex Profile 密钥路径".to_string()))?;
+        fs::create_dir_all(profile_dir).map_err(|error| AppError::io(profile_dir, error))?;
+        let temporary_path = profile_dir.join(format!(
+            ".{CODEX_PROFILE_TOKEN_FILENAME}.{}.tmp",
+            uuid::Uuid::new_v4()
+        ));
+        write_private_file(&temporary_path, token.as_bytes())?;
+        match fs::hard_link(&temporary_path, &token_path) {
+            Ok(()) => {
+                fs::remove_file(&temporary_path)
+                    .map_err(|error| AppError::io(&temporary_path, error))?;
+                Ok(token)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temporary_path);
+                self.read(profile_id)?.ok_or_else(|| {
+                    AppError::Config(
+                        "并发创建 Codex Profile 本地凭证后未找到已发布文件".to_string(),
+                    )
+                })
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                Err(AppError::IoContext {
+                    context: format!(
+                        "原子创建 Codex Profile 本地凭证失败: {}",
+                        token_path.display()
+                    ),
+                    source: error,
+                })
+            }
+        }
     }
 
     /// 根据已验证的 Profile 标识派生其私有目录。
@@ -375,12 +415,11 @@ mod codex_profile_secret_store {
     #[test]
     fn concurrent_create_returns_the_single_persisted_token() -> Result<(), AppError> {
         let temp_dir = tempfile::tempdir().expect("创建临时目录");
-        let store = Arc::new(CodexProfileSecretStore::with_root(
-            temp_dir.path().join("secrets"),
-        ));
+        let secret_root = temp_dir.path().join("secrets");
+        let store = Arc::new(CodexProfileSecretStore::with_root(secret_root.clone()));
         let barrier = Arc::new(Barrier::new(3));
-        let first = spawn_create(store.clone(), barrier.clone());
-        let second = spawn_create(store.clone(), barrier.clone());
+        let first = spawn_create(secret_root.clone(), barrier.clone());
+        let second = spawn_create(secret_root, barrier.clone());
         barrier.wait();
 
         let first = first.join().expect("等待第一个创建线程")?;
@@ -433,12 +472,12 @@ mod codex_profile_secret_store {
 
     /// 同步释放两个创建线程，稳定覆盖同一 Profile 的竞争窗口。
     fn spawn_create(
-        store: Arc<CodexProfileSecretStore>,
+        secret_root: std::path::PathBuf,
         barrier: Arc<Barrier>,
     ) -> thread::JoinHandle<Result<String, AppError>> {
         thread::spawn(move || {
             barrier.wait();
-            store.create("profile-a")
+            CodexProfileSecretStore::with_root(secret_root).create("profile-a")
         })
     }
 }
