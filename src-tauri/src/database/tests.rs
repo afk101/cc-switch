@@ -429,7 +429,7 @@ fn migration_v10_to_v11_rebuilds_rollups_with_request_model_dimension() {
 }
 
 #[test]
-fn migrates_v11_to_v12_codex_profile_schema() {
+fn migrates_v11_to_current_codex_profile_schema() {
     let conn = Connection::open_in_memory().expect("open memory db");
     conn.execute("PRAGMA foreign_keys = ON;", [])
         .expect("enable foreign keys");
@@ -482,12 +482,12 @@ fn migrates_v11_to_v12_codex_profile_schema() {
     .expect("restore v11 profile and rollup schema");
     Database::set_user_version(&conn, 11).expect("set user_version=11");
 
-    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v11 to v12");
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v11 to current");
 
     assert_eq!(
         Database::get_user_version(&conn).expect("read version"),
-        12,
-        "迁移后应写入 v12 user_version"
+        13,
+        "迁移后应写入 v13 user_version"
     );
     for table in [
         "codex_profiles",
@@ -504,10 +504,11 @@ fn migrates_v11_to_v12_codex_profile_schema() {
     for (table, column) in [
         ("proxy_request_logs", "profile_id"),
         ("session_log_sync", "profile_id"),
+        ("codex_profile_routes", "live_backup_json"),
     ] {
         assert!(
             Database::has_column(&conn, table, column).expect("check column"),
-            "{table}.{column} 应在 v12 中创建"
+            "{table}.{column} 应在当前迁移中创建"
         );
     }
     let migrated_rollup: (i64, i64, String) = conn
@@ -540,6 +541,39 @@ fn migrates_v11_to_v12_codex_profile_schema() {
         [],
     )
     .expect("different profile id should use a distinct rollup key");
+}
+
+/// v12 升级后应把旧路由表补齐为 Profile 私有 Live 备份结构。
+#[test]
+fn migrates_v12_to_v13_profile_route_live_backup_schema() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+    Database::create_tables_on_conn(&conn).expect("create current tables");
+    conn.execute_batch(
+        "DROP TABLE codex_profile_routes;
+         CREATE TABLE codex_profile_routes (
+             profile_id TEXT PRIMARY KEY,
+             current_provider_id TEXT,
+             provider_app_type TEXT NOT NULL DEFAULT 'codex'
+                 CHECK (provider_app_type = 'codex'),
+             enabled BOOLEAN NOT NULL DEFAULT 0,
+             updated_at INTEGER NOT NULL DEFAULT 0,
+             FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
+             FOREIGN KEY (current_provider_id, provider_app_type)
+                 REFERENCES providers(id, app_type) ON DELETE RESTRICT
+         );",
+    )
+    .expect("restore v12 route schema");
+    Database::set_user_version(&conn, 12).expect("set user_version=12");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v12 to v13");
+
+    assert_eq!(Database::get_user_version(&conn).expect("read version"), 13);
+    assert!(
+        Database::has_column(&conn, "codex_profile_routes", "live_backup_json")
+            .expect("check live backup column")
+    );
 }
 
 #[test]
@@ -651,6 +685,7 @@ fn codex_profile_dao_persists_route_failover_order_and_provider_refs() -> Result
         profile_id: "profile-a".to_string(),
         current_provider_id: Some("provider-a".to_string()),
         enabled: true,
+        live_backup_json: Some("{\"config\":\"profile\"}".to_string()),
         updated_at: 2,
     };
     db.save_codex_profile_route(&route).expect("save route");

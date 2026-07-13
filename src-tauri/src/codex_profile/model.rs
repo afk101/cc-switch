@@ -26,6 +26,8 @@ pub struct CodexProfileRoute {
     pub profile_id: String,
     pub current_provider_id: Option<String>,
     pub enabled: bool,
+    /// 该 Profile 接管前的 Live 配置备份，仅保存在所属 Profile 关系中。
+    pub live_backup_json: Option<String>,
     pub updated_at: i64,
 }
 

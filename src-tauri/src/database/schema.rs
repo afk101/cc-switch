@@ -454,6 +454,11 @@ impl Database {
                         Self::migrate_v11_to_v12(conn)?;
                         Self::set_user_version(conn, 12)?;
                     }
+                    12 => {
+                        log::info!("迁移数据库从 v12 到 v13（Codex Profile 路由 Live 备份归属）");
+                        Self::migrate_v12_to_v13(conn)?;
+                        Self::set_user_version(conn, 13)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1297,6 +1302,7 @@ impl Database {
                 provider_app_type TEXT NOT NULL DEFAULT 'codex'
                     CHECK (provider_app_type = 'codex'),
                 enabled BOOLEAN NOT NULL DEFAULT 0,
+                live_backup_json TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
                 FOREIGN KEY (current_provider_id, provider_app_type)
@@ -1438,6 +1444,14 @@ impl Database {
         }
 
         Self::create_codex_profile_tables(conn)?;
+        Ok(())
+    }
+
+    /// v12 -> v13：将 Codex Live 配置备份改为 Profile 路由私有数据。
+    fn migrate_v12_to_v13(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "codex_profile_routes")? {
+            Self::add_column_if_missing(conn, "codex_profile_routes", "live_backup_json", "TEXT")?;
+        }
         Ok(())
     }
 
