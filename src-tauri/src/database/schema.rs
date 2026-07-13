@@ -195,7 +195,8 @@ impl Database {
             duration_ms INTEGER, status_code INTEGER NOT NULL, error_message TEXT, session_id TEXT,
             provider_type TEXT, is_streaming INTEGER NOT NULL DEFAULT 0,
             cost_multiplier TEXT NOT NULL DEFAULT '1.0', created_at INTEGER NOT NULL,
-            data_source TEXT NOT NULL DEFAULT 'proxy'
+            data_source TEXT NOT NULL DEFAULT 'proxy',
+            profile_id TEXT
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_request_logs_provider ON proxy_request_logs(provider_id, app_type)", [])
@@ -277,7 +278,8 @@ impl Database {
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd TEXT NOT NULL DEFAULT '0',
                 avg_latency_ms INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+                profile_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, profile_id)
             )",
             [],
         )
@@ -289,11 +291,14 @@ impl Database {
                 file_path TEXT PRIMARY KEY,
                 last_modified INTEGER NOT NULL,
                 last_line_offset INTEGER NOT NULL DEFAULT 0,
-                last_synced_at INTEGER NOT NULL
+                last_synced_at INTEGER NOT NULL,
+                profile_id TEXT
             )",
             [],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        Self::create_codex_profile_tables(conn)?;
 
         // 尝试添加 live_takeover_active 列到 proxy_config 表
         let _ = conn.execute(
@@ -443,6 +448,11 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!("迁移数据库从 v11 到 v12（Codex 多 Home Profile 持久化）");
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1267,6 +1277,167 @@ impl Database {
         log::info!(
             "v10 -> v11 迁移完成：usage_daily_rollups 已保留 request_model/pricing_model 维度"
         );
+        Ok(())
+    }
+
+    /// 创建 Codex Profile 相关表及其查询索引。
+    fn create_codex_profile_tables(conn: &Connection) -> Result<(), AppError> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS codex_profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                canonical_home_path TEXT NOT NULL UNIQUE,
+                listen_port INTEGER NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS codex_profile_routes (
+                profile_id TEXT PRIMARY KEY,
+                current_provider_id TEXT,
+                provider_app_type TEXT NOT NULL DEFAULT 'codex'
+                    CHECK (provider_app_type = 'codex'),
+                enabled BOOLEAN NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
+                FOREIGN KEY (current_provider_id, provider_app_type)
+                    REFERENCES providers(id, app_type) ON DELETE RESTRICT
+            );
+            CREATE TABLE IF NOT EXISTS codex_profile_failovers (
+                profile_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                provider_id TEXT NOT NULL,
+                provider_app_type TEXT NOT NULL DEFAULT 'codex'
+                    CHECK (provider_app_type = 'codex'),
+                PRIMARY KEY (profile_id, position),
+                FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
+                FOREIGN KEY (provider_id, provider_app_type)
+                    REFERENCES providers(id, app_type) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS codex_profile_mcp_servers (
+                profile_id TEXT NOT NULL,
+                mcp_server_id TEXT NOT NULL,
+                PRIMARY KEY (profile_id, mcp_server_id),
+                FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
+                FOREIGN KEY (mcp_server_id) REFERENCES mcp_servers(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS codex_profile_skills (
+                profile_id TEXT NOT NULL,
+                skill_id TEXT NOT NULL,
+                PRIMARY KEY (profile_id, skill_id),
+                FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
+                FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_routes_current_provider
+                ON codex_profile_routes(current_provider_id, provider_app_type);
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_routes_enabled
+                ON codex_profile_routes(enabled);
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_failovers_provider
+                ON codex_profile_failovers(provider_id, provider_app_type);
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_failovers_order
+                ON codex_profile_failovers(profile_id, position);
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_mcp_servers_reverse
+                ON codex_profile_mcp_servers(mcp_server_id);
+            CREATE INDEX IF NOT EXISTS idx_codex_profile_skills_reverse
+                ON codex_profile_skills(skill_id);",
+        )
+        .map_err(|e| AppError::Database(format!("创建 Codex Profile 表失败: {e}")))?;
+
+        Self::create_profile_usage_index_if_supported(
+            conn,
+            "proxy_request_logs",
+            "idx_request_logs_profile_created_at",
+            &["profile_id", "created_at"],
+            "profile_id, created_at",
+        )?;
+        Self::create_profile_usage_index_if_supported(
+            conn,
+            "session_log_sync",
+            "idx_session_log_sync_profile",
+            &["profile_id"],
+            "profile_id",
+        )?;
+        Self::create_profile_usage_index_if_supported(
+            conn,
+            "usage_daily_rollups",
+            "idx_usage_daily_rollups_profile",
+            &["profile_id", "date"],
+            "profile_id, date",
+        )
+    }
+
+    /// 仅当旧表已具备所需列时创建 Profile 用量索引。
+    fn create_profile_usage_index_if_supported(
+        conn: &Connection,
+        table: &str,
+        index_name: &str,
+        required_columns: &[&str],
+        index_columns: &str,
+    ) -> Result<(), AppError> {
+        if !Self::table_exists(conn, table)? {
+            return Ok(());
+        }
+        for column in required_columns {
+            if !Self::has_column(conn, table, column)? {
+                return Ok(());
+            }
+        }
+
+        conn.execute(
+            &format!("CREATE INDEX IF NOT EXISTS {index_name} ON {table}({index_columns})"),
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 Profile 用量索引 {index_name} 失败: {e}")))?;
+        Ok(())
+    }
+
+    /// v11 -> v12：增加 Codex 多 Home Profile 持久化结构和 Profile 用量归属。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(conn, "proxy_request_logs", "profile_id", "TEXT")?;
+        }
+        if Self::table_exists(conn, "session_log_sync")? {
+            Self::add_column_if_missing(conn, "session_log_sync", "profile_id", "TEXT")?;
+        }
+
+        if Self::table_exists(conn, "usage_daily_rollups")?
+            && !Self::has_column(conn, "usage_daily_rollups", "profile_id")?
+        {
+            conn.execute_batch(
+                "ALTER TABLE usage_daily_rollups RENAME TO usage_daily_rollups_v11;
+                 CREATE TABLE usage_daily_rollups (
+                     date TEXT NOT NULL,
+                     app_type TEXT NOT NULL,
+                     provider_id TEXT NOT NULL,
+                     model TEXT NOT NULL,
+                     request_model TEXT NOT NULL DEFAULT '',
+                     pricing_model TEXT NOT NULL DEFAULT '',
+                     request_count INTEGER NOT NULL DEFAULT 0,
+                     success_count INTEGER NOT NULL DEFAULT 0,
+                     input_tokens INTEGER NOT NULL DEFAULT 0,
+                     output_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                     total_cost_usd TEXT NOT NULL DEFAULT '0',
+                     avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+                     profile_id TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model, profile_id)
+                 );
+                 INSERT INTO usage_daily_rollups
+                     (date, app_type, provider_id, model, request_model, pricing_model,
+                      request_count, success_count, input_tokens, output_tokens,
+                      cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, profile_id)
+                 SELECT date, app_type, provider_id, model, request_model, pricing_model,
+                        request_count, success_count, input_tokens, output_tokens,
+                        cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, ''
+                 FROM usage_daily_rollups_v11;
+                 DROP TABLE usage_daily_rollups_v11;",
+            )
+            .map_err(|e| {
+                AppError::Database(format!("v11 -> v12 重建 usage_daily_rollups 失败: {e}"))
+            })?;
+        }
+
+        Self::create_codex_profile_tables(conn)?;
         Ok(())
     }
 

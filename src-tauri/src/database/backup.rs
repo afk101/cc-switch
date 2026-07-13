@@ -22,6 +22,11 @@ const SYNC_SKIP_TABLES: &[&str] = &[
     "provider_health",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "codex_profiles",
+    "codex_profile_routes",
+    "codex_profile_failovers",
+    "codex_profile_mcp_servers",
+    "codex_profile_skills",
 ];
 
 /// Tables whose local data is preserved (restored from local snapshot) during WebDAV import.
@@ -31,6 +36,11 @@ const SYNC_PRESERVE_TABLES: &[&str] = &[
     "stream_check_logs",
     "proxy_live_backup",
     "usage_daily_rollups",
+    "codex_profiles",
+    "codex_profile_routes",
+    "codex_profile_failovers",
+    "codex_profile_mcp_servers",
+    "codex_profile_skills",
 ];
 
 /// A database backup entry for the UI
@@ -777,6 +787,40 @@ mod tests {
             stream_logs, 1,
             "local stream check logs should be preserved"
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_import_preserves_local_codex_profile_tables() -> Result<(), AppError> {
+        let remote_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(remote_db.conn);
+            conn.execute(
+                "INSERT INTO providers (id, app_type, name, settings_config, meta)
+                 VALUES ('remote-provider', 'codex', 'Remote Provider', '{}', '{}')",
+                [],
+            )?;
+        }
+        let remote_sql = remote_db.export_sql_string_for_sync()?;
+
+        let local_db = Database::memory()?;
+        {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            conn.execute(
+                "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+                 VALUES ('profile-a', '本机 Profile', '/Users/test/.codex-a', 16701, 1, 1)",
+                [],
+            )?;
+        }
+
+        local_db.import_sql_string_for_sync(&remote_sql)?;
+
+        let profile_count: i64 = {
+            let conn = crate::database::lock_conn!(local_db.conn);
+            conn.query_row("SELECT COUNT(*) FROM codex_profiles", [], |row| row.get(0))?
+        };
+        assert_eq!(profile_count, 1, "本机 Profile 表应在同步导入时保留");
 
         Ok(())
     }

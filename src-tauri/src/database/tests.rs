@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::app_config::MultiAppConfig;
+use crate::codex_profile::{CodexProfile, CodexProfileRoute};
+use crate::error::AppError;
 use crate::provider::{Provider, ProviderManager};
 use indexmap::IndexMap;
 use rusqlite::{params, Connection};
@@ -424,6 +426,242 @@ fn migration_v10_to_v11_rebuilds_rollups_with_request_model_dimension() {
         Database::get_user_version(&conn).expect("version after migration"),
         SCHEMA_VERSION
     );
+}
+
+#[test]
+fn migrates_v11_to_v12_codex_profile_schema() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    Database::create_tables_on_conn(&conn).expect("create v11 tables");
+    conn.execute_batch(
+        "DROP TABLE codex_profile_mcp_servers;
+         DROP TABLE codex_profile_skills;
+         DROP TABLE codex_profile_failovers;
+         DROP TABLE codex_profile_routes;
+         DROP TABLE codex_profiles;
+         DROP TABLE usage_daily_rollups;
+         CREATE TABLE usage_daily_rollups (
+             date TEXT NOT NULL,
+             app_type TEXT NOT NULL,
+             provider_id TEXT NOT NULL,
+             model TEXT NOT NULL,
+             request_model TEXT NOT NULL DEFAULT '',
+             pricing_model TEXT NOT NULL DEFAULT '',
+             request_count INTEGER NOT NULL DEFAULT 0,
+             success_count INTEGER NOT NULL DEFAULT 0,
+             input_tokens INTEGER NOT NULL DEFAULT 0,
+             output_tokens INTEGER NOT NULL DEFAULT 0,
+             cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+             cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+             total_cost_usd TEXT NOT NULL DEFAULT '0',
+             avg_latency_ms INTEGER NOT NULL DEFAULT 0,
+             PRIMARY KEY (date, app_type, provider_id, model, request_model, pricing_model)
+         );",
+    )
+    .expect("restore v11 profile and rollup schema");
+    Database::set_user_version(&conn, 11).expect("set user_version=11");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v11 to v12");
+
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        12,
+        "迁移后应写入 v12 user_version"
+    );
+    for table in [
+        "codex_profiles",
+        "codex_profile_routes",
+        "codex_profile_failovers",
+        "codex_profile_mcp_servers",
+        "codex_profile_skills",
+    ] {
+        assert!(
+            Database::table_exists(&conn, table).expect("check table"),
+            "{table} 应在 v12 中创建"
+        );
+    }
+    for (table, column) in [
+        ("proxy_request_logs", "profile_id"),
+        ("session_log_sync", "profile_id"),
+    ] {
+        assert!(
+            Database::has_column(&conn, table, column).expect("check column"),
+            "{table}.{column} 应在 v12 中创建"
+        );
+    }
+
+    let profile_id = "profile-a";
+    conn.execute(
+        "INSERT INTO usage_daily_rollups (
+            date, app_type, provider_id, model, request_model, pricing_model, profile_id
+        ) VALUES ('2026-07-13', 'codex', 'provider-a', 'gpt-5', '', '', ?1)",
+        [profile_id],
+    )
+    .expect("insert rollup with profile id");
+    conn.execute(
+        "INSERT INTO usage_daily_rollups (
+            date, app_type, provider_id, model, request_model, pricing_model, profile_id
+        ) VALUES ('2026-07-13', 'codex', 'provider-a', 'gpt-5', '', '', 'profile-b')",
+        [],
+    )
+    .expect("different profile id should use a distinct rollup key");
+}
+
+#[test]
+fn codex_profile_schema_enforces_profile_and_failover_uniqueness() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    Database::set_user_version(&conn, 11).expect("set user_version=11");
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v11 to v12");
+
+    conn.execute(
+        "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+         VALUES ('profile-a', '个人', '/Users/test/.codex-a', 16701, 1, 1)",
+        [],
+    )
+    .expect("insert profile");
+
+    conn.execute(
+        "INSERT INTO providers (id, app_type, name, settings_config, meta)
+         VALUES ('provider-a', 'codex', 'Provider A', '{}', '{}')",
+        [],
+    )
+    .expect("insert failover provider");
+
+    assert!(
+        conn.execute(
+            "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+             VALUES ('profile-b', '重复路径', '/Users/test/.codex-a', 16702, 1, 1)",
+            [],
+        )
+        .is_err(),
+        "canonical_home_path 必须唯一"
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO codex_profiles (id, name, canonical_home_path, listen_port, created_at, updated_at)
+             VALUES ('profile-c', '重复端口', '/Users/test/.codex-c', 16701, 1, 1)",
+            [],
+        )
+        .is_err(),
+        "listen_port 必须唯一"
+    );
+
+    conn.execute(
+        "INSERT INTO codex_profile_failovers (profile_id, position, provider_id, provider_app_type)
+         VALUES ('profile-a', 0, 'provider-a', 'codex')",
+        [],
+    )
+    .expect("insert first failover");
+    assert!(
+        conn.execute(
+            "INSERT INTO codex_profile_failovers (profile_id, position, provider_id, provider_app_type)
+             VALUES ('profile-a', 0, 'provider-b', 'codex')",
+            [],
+        )
+        .is_err(),
+        "同一 Profile 的故障转移位置必须唯一"
+    );
+}
+
+#[test]
+fn codex_profile_dao_persists_route_failover_order_and_provider_refs() -> Result<(), AppError> {
+    let db = Database::memory().expect("create memory db");
+    {
+        let conn = lock_conn!(db.conn);
+        conn.execute(
+            "INSERT INTO providers (id, app_type, name, settings_config, meta)
+             VALUES ('provider-a', 'codex', 'Provider A', '{}', '{}'),
+                    ('provider-b', 'codex', 'Provider B', '{}', '{}')",
+            [],
+        )
+        .expect("insert providers");
+    }
+
+    let profile = CodexProfile {
+        id: "profile-a".to_string(),
+        name: "工作".to_string(),
+        canonical_home_path: "/Users/test/.codex-work".to_string(),
+        listen_port: 16701,
+        created_at: 1,
+        updated_at: 1,
+    };
+    db.insert_codex_profile(&profile).expect("insert profile");
+    assert_eq!(
+        db.list_codex_profiles().expect("list profiles"),
+        vec![profile.clone()]
+    );
+    assert_eq!(
+        db.get_codex_profile("profile-a").expect("get profile"),
+        profile
+    );
+
+    let updated_profile = CodexProfile {
+        name: "工作更新".to_string(),
+        updated_at: 2,
+        ..profile.clone()
+    };
+    db.update_codex_profile(&updated_profile)
+        .expect("update profile");
+    assert_eq!(
+        db.get_codex_profile("profile-a")
+            .expect("get updated profile"),
+        updated_profile
+    );
+
+    let route = CodexProfileRoute {
+        profile_id: "profile-a".to_string(),
+        current_provider_id: Some("provider-a".to_string()),
+        enabled: true,
+        updated_at: 2,
+    };
+    db.save_codex_profile_route(&route).expect("save route");
+    assert_eq!(
+        db.get_codex_profile_route("profile-a").expect("get route"),
+        Some(route)
+    );
+
+    db.replace_codex_profile_failovers(
+        "profile-a",
+        &["provider-b".to_string(), "provider-a".to_string()],
+    )
+    .expect("replace failovers");
+    assert_eq!(
+        db.list_codex_profile_failovers("profile-a")
+            .expect("list failovers"),
+        vec!["provider-b".to_string(), "provider-a".to_string()]
+    );
+    assert_eq!(
+        db.list_codex_provider_profile_refs("provider-a")
+            .expect("list profile refs")
+            .into_iter()
+            .map(|profile_ref| (profile_ref.id, profile_ref.name))
+            .collect::<Vec<_>>(),
+        vec![("profile-a".to_string(), "工作更新".to_string())]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn codex_profile_dao_rejects_operations_for_missing_profile() -> Result<(), AppError> {
+    let db = Database::memory().expect("create memory db");
+
+    assert!(matches!(
+        db.get_codex_profile("missing-profile"),
+        Err(AppError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        db.delete_codex_profile("missing-profile"),
+        Err(AppError::InvalidInput(_))
+    ));
+
+    Ok(())
 }
 
 #[test]
