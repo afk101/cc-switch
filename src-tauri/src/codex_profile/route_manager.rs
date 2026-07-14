@@ -91,6 +91,7 @@ pub struct CodexRouteManager {
 
 /// 补偿记录只保存路由标识与开关状态，避免把 Home 正文或凭证写入数据库。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RouteRecoveryRecord {
     operation: String,
     before: RouteRecoverySnapshot,
@@ -101,6 +102,7 @@ struct RouteRecoveryRecord {
 
 /// 可恢复的路由快照不包含 live backup、token 或认证配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RouteRecoverySnapshot {
     current_provider_id: Option<String>,
     enabled: bool,
@@ -1533,7 +1535,7 @@ mod codex_route_manager {
         db.save_provider(AppType::Codex.as_str(), &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None))?;
         db.insert_codex_profile(&CodexProfile { id: "profile-a".to_string(), name: "A".to_string(), canonical_home_path: "/tmp/a".to_string(), listen_port: 16001, created_at: 1, updated_at: 1 })?;
         let tokens = Arc::new(TrackingTokenStore { ensured: AtomicUsize::new(0), deleted: AtomicUsize::new(0) });
-        for json in ["{", r#"{"operation":"unknown","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#, r#"{"operation":"switch","phase":"delete_token_pending","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#] {
+        for json in ["{", r#"{"operation":"unknown","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#, r#"{"operation":"switch","phase":"delete_token_pending","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#, r#"{"operation":"switch","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[],"token":"secret"},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null,"auth":"secret","home":"secret"}"#] {
             db.save_codex_profile_route(&CodexProfileRoute { profile_id: "profile-a".to_string(), current_provider_id: Some("provider-a".to_string()), enabled: true, live_backup_json: None, last_error: None, recovery_json: Some(json.to_string()), updated_at: 1 })?;
             let manager = CodexRouteManager::new(db.clone(), Arc::new(CodexHomeConfigService::system()), tokens.clone(), Arc::new(FakeFactory));
             assert!(manager.switch_provider("profile-a", "provider-a", vec![]).await.is_err());
