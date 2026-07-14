@@ -40,7 +40,7 @@ Codex 页面加载 Profile 列表后，从 `selected_codex_profile_id` 恢复选
 
 每个 Profile 只有一把生命周期锁，startup restore、enable、switch、disable 和 delete 都必须在该锁内执行。`ProxyServer` 对 Profile listener 暴露可观察状态：`Running`、`StopRequested`、`Stopped`、`StopFailed`。发送 shutdown 后若等待超时，必须保留 join handle 和停止请求；后续 `stop()` 继续等待同一 handle，而不是返回不可重试的 `NotRunning`。
 
-route 持久化增加仅供恢复的补偿记录：保存“原 route/failover 快照、目标 route/failover 快照、当前阶段、无敏感信息的错误摘要”。switch 在 runtime 切至目标快照后才推进持久化阶段；任何阶段失败都按该记录恢复。若本次无法恢复，保留补偿记录和 `last_error`，下一次对该 Profile 的生命周期操作先完成补偿，再拒绝新 mutation。UI 将此状态显示为错误，绝不把旧 Profile 的状态带给新选择的 Home。
+route 持久化增加唯一的 lifecycle operation 记录：`operation` 为 enable/switch/disable/delete，`phase` 表示最近已完成步骤，`before` 与 `target` 保存 route/failover 的无敏感快照，`last_error` 保存无敏感摘要。每个不可逆步骤前必须先持久化 operation，步骤成功后再推进 phase；任何失败都只根据 operation/phase 补偿或完成。若本次无法收敛，保留 operation 和 `last_error`，下一次对该 Profile 的生命周期操作先完成恢复，再拒绝新 mutation。UI 将此状态显示为错误，绝不把旧 Profile 的状态带给新选择的 Home。
 
 drain 必须先拒绝新请求，再以条件循环等待 Profile in-flight 归零。等待器注册后立即重新读取计数；达到 timeout 时保留可观察停止状态并返回超时错误，不丢弃后续可重试句柄。
 

@@ -37,17 +37,17 @@ Run: `cargo test codex_route_manager --lib`
 
 Expected: FAIL，因为 `CodexRouteManager` 尚不存在。
 
-- [ ] **Step 3: 定义可恢复的 route 补偿记录与迁移**
+- [ ] **Step 3: 定义统一 lifecycle operation 与迁移**
 
-为 route 增加补偿记录字段，内容只包含旧/新 provider、failover、阶段和无敏感错误摘要；新增兼容迁移与 DAO 读写。禁止存 token、Home 配置正文或 auth 内容。
+为 route 增加 operation 记录字段：`operation`、`phase`、`before`、`target`、无敏感 `last_error`。每个 enable/switch/disable/delete 在首个不可逆步骤前持久化 operation，每成功一步推进 phase。新增兼容迁移、模型和 DAO 读写；禁止存 token、Home 配置正文或 auth 内容。
 
 - [ ] **Step 4: 实现幂等 listener stop 和无丢通知 drain**
 
 `ProxyServer::stop` 在 timeout 后保留 shutdown sender 与 join handle，后续调用继续等待；只有 join handle 完成后才清空。Profile drain 在 waiter 注册后重新检查 in-flight，使用 deadline 循环等待归零或 timeout。
 
-- [ ] **Step 5: 实现同锁生命周期与补偿恢复**
+- [ ] **Step 5: 实现同锁 lifecycle operation 执行器**
 
-实现 `enable`、`switch_provider`、`disable`、`delete_custom_profile`、`restore_enabled_profiles`。所有入口先取得同一 `profile_id` 锁；若存在未完成补偿，先恢复再执行新请求。switch 将 runtime 和 DB 状态按补偿记录收敛；delete 在同一锁内 disable、删除 token、删除 DB，任一步失败不推进后续步骤。
+实现 `enable`、`switch_provider`、`disable`、`delete_custom_profile`、`restore_enabled_profiles`。所有入口先取得同一 `profile_id` 锁；若存在 operation，执行器根据 operation/phase 补偿或完成后才允许新 mutation。switch、enable、disable、delete 都使用相同的“持久 operation -> 执行一步 -> 推进 phase”协议；delete 在同一锁内 disable、删除 token、删除 DB，任一步失败不推进后续步骤。
 
 
 - [ ] **Step 6: 验证并提交**

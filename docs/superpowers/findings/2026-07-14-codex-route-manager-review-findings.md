@@ -25,3 +25,10 @@
 | route manager 使用明确的持久化补偿状态 | runtime snapshot、route/failover 的目标状态和补偿状态必须可恢复，不能依赖失败后分散回写。 |
 | 启动恢复取得同一 Profile 锁 | 防止恢复与 enable/disable/delete 交错。 |
 | drain 改为无丢通知的条件循环 | 每次注册 waiter 后重新检查 in-flight，直到归零或超时。 |
+| 统一 lifecycle operation 状态机 | 每个 enable/switch/disable/delete 都以持久操作记录推进 phase，防止任一失败分支遗漏补偿记录。 |
+
+## 第二次架构确认
+
+- 用户确认：`recovery_json` 不再只是失败时附加的记录，而是每个生命周期操作的唯一操作记录。
+- 记录包含 operation、phase、before、target 和无敏感 `last_error`；每一步不可逆状态变化前先持久化记录，成功后推进 phase。
+- 恢复逻辑只根据 operation 与 phase 补偿或完成；无法收敛时保留记录并拒绝该 Profile 后续 mutation。
