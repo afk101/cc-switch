@@ -1656,9 +1656,9 @@ mod codex_route_manager {
         Ok(())
     }
 
-    /// 一个 Profile 恢复健康检查失败必须停止自身，不能影响其他 Profile 成功恢复。
+    /// 含非法恢复记录的 Profile 不得有副作用，且不能影响其他 Profile 恢复。
     #[tokio::test]
-    async fn restoring_unhealthy_profile_stops_it_and_keeps_healthy_profile_running(
+    async fn restoring_invalid_recovery_isolated_from_healthy_profile(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         let mut runtimes = HashMap::new();
@@ -1686,7 +1686,7 @@ mod codex_route_manager {
                 enabled: true,
                 live_backup_json: None,
                 last_error: None,
-                recovery_json: None,
+                recovery_json: (!healthy).then(|| r#"{"operation":"unknown","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#.to_string()),
                 updated_at: 1,
             })?;
             runtimes.insert(
@@ -1711,8 +1711,8 @@ mod codex_route_manager {
         );
 
         manager.restore_enabled_profiles().await?;
-        assert!(bad_runtime.started.load(Ordering::SeqCst));
-        assert!(bad_runtime.stopped.load(Ordering::SeqCst));
+        assert!(!bad_runtime.started.load(Ordering::SeqCst));
+        assert!(!bad_runtime.stopped.load(Ordering::SeqCst));
         assert!(manager.status("profile-bad").await.is_err());
         assert!(good_runtime.started.load(Ordering::SeqCst));
         assert!(!good_runtime.stopped.load(Ordering::SeqCst));
