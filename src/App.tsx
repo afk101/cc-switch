@@ -29,7 +29,12 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
-import { useProvidersQuery, useSettingsQuery } from "@/lib/query";
+import {
+  useCodexProfileState,
+  useCodexProfiles,
+  useProvidersQuery,
+  useSettingsQuery,
+} from "@/lib/query";
 import {
   providersApi,
   settingsApi,
@@ -94,6 +99,9 @@ import ToolsPanel from "@/components/openclaw/ToolsPanel";
 import AgentsDefaultsPanel from "@/components/openclaw/AgentsDefaultsPanel";
 import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel from "@/components/hermes/HermesMemoryPanel";
+import { CodexHomeContextBar } from "@/components/codex/CodexHomeContextBar";
+import { CodexProfileManagerDialog } from "@/components/codex/CodexProfileManagerDialog";
+import { codexProfilesApi } from "@/lib/api/codexProfiles";
 
 type View =
   | "providers"
@@ -178,12 +186,52 @@ function App() {
   const [settingsDefaultTab, setSettingsDefaultTab] = useState("general");
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
+  const [selectedCodexProfileId, setSelectedCodexProfileId] = useState<
+    string | null
+  >(null);
+  const [isCodexProfileManagerOpen, setIsCodexProfileManagerOpen] =
+    useState(false);
 
   useEffect(() => {
     localStorage.setItem(VIEW_STORAGE_KEY, currentView);
   }, [currentView]);
 
   const { data: settingsData } = useSettingsQuery();
+  const { data: codexProfiles = [], refetch: refetchCodexProfiles } =
+    useCodexProfiles();
+  const {
+    data: codexProfileState,
+    isLoading: isCodexProfileStateLoading,
+    refetch: refetchCodexProfileState,
+  } = useCodexProfileState(selectedCodexProfileId);
+
+  useEffect(() => {
+    if (codexProfiles.length === 0) return;
+    const configuredId = settingsData?.selectedCodexProfileId;
+    const validId = [selectedCodexProfileId, configuredId].find(
+      (candidate) =>
+        candidate && codexProfiles.some((profile) => profile.id === candidate),
+    );
+    if (validId && validId !== selectedCodexProfileId) {
+      setSelectedCodexProfileId(validId);
+    } else if (!validId) {
+      setSelectedCodexProfileId(codexProfiles[0].id);
+    }
+  }, [
+    codexProfiles,
+    selectedCodexProfileId,
+    settingsData?.selectedCodexProfileId,
+  ]);
+
+  const selectCodexProfile = (profileId: string) => {
+    setSelectedCodexProfileId(profileId);
+    if (settingsData) {
+      void settingsApi.save({
+        ...settingsData,
+        selectedCodexProfileId: profileId,
+      });
+    }
+  };
   const useAppWindowControls =
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
@@ -307,6 +355,26 @@ function App() {
     isProxyRunning,
     isProxyRunning && isCurrentAppTakeoverActive,
   );
+
+  const handleSwitchProvider = (provider: Provider) => {
+    if (activeApp !== "codex") {
+      switchProvider(provider);
+      return;
+    }
+    if (!selectedCodexProfileId) {
+      toast.error("请先选择 CODEX_HOME");
+      return;
+    }
+    const routeEnabled = codexProfileState?.route?.enabled === true;
+    const request = routeEnabled
+      ? codexProfilesApi.switchProvider(selectedCodexProfileId, provider.id, [])
+      : codexProfilesApi.enableRoute(selectedCodexProfileId, provider.id, []);
+    void request
+      .then(() => {
+        void refetchCodexProfileState();
+      })
+      .catch((error) => toast.error(extractErrorMessage(error)));
+  };
 
   const disableOmoMutation = useDisableCurrentOmo();
   const handleDisableOmo = () => {
@@ -961,9 +1029,23 @@ function App() {
                     transition={{ duration: 0.15 }}
                     className="space-y-4"
                   >
+                    {activeApp === "codex" && (
+                      <CodexHomeContextBar
+                        profiles={codexProfiles}
+                        selectedProfileId={selectedCodexProfileId}
+                        state={codexProfileState}
+                        isStateLoading={isCodexProfileStateLoading}
+                        onSelectProfile={selectCodexProfile}
+                        onManage={() => setIsCodexProfileManagerOpen(true)}
+                      />
+                    )}
                     <ProviderList
                       providers={providers}
-                      currentProviderId={currentProviderId}
+                      currentProviderId={
+                        activeApp === "codex"
+                          ? (codexProfileState?.route?.currentProviderId ?? "")
+                          : currentProviderId
+                      }
                       appId={activeApp}
                       isLoading={isLoading}
                       isProxyRunning={isProxyRunning}
@@ -971,7 +1053,7 @@ function App() {
                         isProxyRunning && isCurrentAppTakeoverActive
                       }
                       activeProviderId={activeProviderId}
-                      onSwitch={switchProvider}
+                      onSwitch={handleSwitchProvider}
                       onEdit={(provider) => {
                         setEditingProvider(provider);
                       }}
@@ -1009,6 +1091,65 @@ function App() {
                             : undefined
                       }
                     />
+                    {activeApp === "codex" && (
+                      <CodexProfileManagerDialog
+                        open={isCodexProfileManagerOpen}
+                        profiles={codexProfiles}
+                        onOpenChange={setIsCodexProfileManagerOpen}
+                        onUpdatePort={(profileId, listenPort) => {
+                          void codexProfilesApi
+                            .updatePort(profileId, listenPort)
+                            .then(() => {
+                              void refetchCodexProfiles();
+                              void refetchCodexProfileState();
+                            })
+                            .catch((error) =>
+                              toast.error(extractErrorMessage(error)),
+                            );
+                        }}
+                        onDelete={(profileId) => {
+                          void codexProfilesApi
+                            .delete(profileId)
+                            .then(() => {
+                              void refetchCodexProfiles();
+                              if (profileId === selectedCodexProfileId) {
+                                setSelectedCodexProfileId(null);
+                              }
+                            })
+                            .catch((error) =>
+                              toast.error(extractErrorMessage(error)),
+                            );
+                        }}
+                        onRebind={(profileId) => {
+                          const homePath =
+                            window.prompt("新的 CODEX_HOME 路径");
+                          if (!homePath) return;
+                          void codexProfilesApi
+                            .rebind(profileId, homePath)
+                            .then(() => {
+                              void refetchCodexProfiles();
+                              void refetchCodexProfileState();
+                            })
+                            .catch((error) =>
+                              toast.error(extractErrorMessage(error)),
+                            );
+                        }}
+                        onCreate={() => {
+                          const name = window.prompt("Profile 名称");
+                          const homePath = window.prompt("CODEX_HOME 路径");
+                          if (!name || !homePath) return;
+                          void codexProfilesApi
+                            .create(name, homePath)
+                            .then((profile) => {
+                              selectCodexProfile(profile.id);
+                              void refetchCodexProfiles();
+                            })
+                            .catch((error) =>
+                              toast.error(extractErrorMessage(error)),
+                            );
+                        }}
+                      />
+                    )}
                   </motion.div>
                 </AnimatePresence>
               </div>

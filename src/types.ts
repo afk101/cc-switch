@@ -405,6 +405,8 @@ export interface Settings {
   currentProviderClaudeDesktop?: string;
   // 当前 Codex 供应商 ID（优先于数据库 is_current）
   currentProviderCodex?: string;
+  // 当前选中的 Codex Profile（独立 CODEX_HOME）
+  selectedCodexProfileId?: string;
   // 当前 Gemini 供应商 ID（优先于数据库 is_current）
   currentProviderGemini?: string;
 
