@@ -18,6 +18,21 @@ const TEMPLATE_TYPE_BALANCE: &str = "balance";
 const TEMPLATE_TYPE_OFFICIAL_SUBSCRIPTION: &str = "official_subscription";
 const COPILOT_UNIT_PREMIUM: &str = "requests";
 
+/// 确保删除供应商不会留下仍指向它的 Codex Profile 路由。
+fn ensure_codex_provider_can_be_deleted(
+    refs: Vec<crate::codex_profile::CodexProfileRef>,
+) -> Result<(), String> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let profiles = refs
+        .into_iter()
+        .map(|profile| format!("{} ({})", profile.name, profile.id))
+        .collect::<Vec<_>>()
+        .join("、");
+    Err(format!("Codex 供应商仍被以下 Profile 引用: {profiles}"))
+}
+
 /// 获取所有供应商
 #[tauri::command]
 pub fn get_providers(
@@ -70,18 +85,34 @@ pub fn delete_provider(
             .db
             .list_codex_provider_profile_refs(&id)
             .map_err(|error| error.to_string())?;
-        if !refs.is_empty() {
-            let profiles = refs
-                .into_iter()
-                .map(|profile| format!("{} ({})", profile.name, profile.id))
-                .collect::<Vec<_>>()
-                .join("、");
-            return Err(format!("Codex 供应商仍被以下 Profile 引用: {profiles}"));
-        }
+        ensure_codex_provider_can_be_deleted(refs)?;
     }
     ProviderService::delete(state.inner(), app_type, &id)
         .map(|_| true)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::codex_profile::CodexProfileRef;
+
+    #[test]
+    fn provider_delete_is_allowed_without_codex_profile_references() {
+        assert_eq!(super::ensure_codex_provider_can_be_deleted(vec![]), Ok(()));
+    }
+
+    #[test]
+    fn provider_delete_is_rejected_when_a_codex_profile_references_it() {
+        let result = super::ensure_codex_provider_can_be_deleted(vec![CodexProfileRef {
+            id: "work".to_string(),
+            name: "工作实例".to_string(),
+        }]);
+
+        assert_eq!(
+            result,
+            Err("Codex 供应商仍被以下 Profile 引用: 工作实例 (work)".to_string())
+        );
+    }
 }
 
 #[tauri::command]
