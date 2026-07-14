@@ -32,7 +32,7 @@
 - Modify: `src/App.tsx`
 - Test: existing App integration/fixture tests that cover the providers header
 
-- [ ] **Step 1: Add failing Profile mutation tests**
+- [x] **Step 1: Add failing Profile mutation tests**
 
 Add `useEnableCodexProfileRoute` and a unified `useSetCodexProfileRouteEnabled`-level behavior test proving:
 
@@ -49,7 +49,7 @@ pnpm vitest run src/lib/query/codexProfiles.test.ts
 
 Expected before implementation: FAIL because the Profile enable mutation/hook does not exist.
 
-- [ ] **Step 2: Add failing component tests**
+- [x] **Step 2: Add failing component tests**
 
 Cover these cases in `CodexProfileRouteToggle.test.tsx`:
 
@@ -68,13 +68,13 @@ pnpm vitest run src/components/codex/CodexProfileRouteToggle.test.tsx
 
 Expected before implementation: FAIL because the component does not exist.
 
-- [ ] **Step 3: Implement focused query mutations and the dedicated component**
+- [x] **Step 3: Implement focused query mutations and the dedicated component**
 
 Use a mutation input object containing `profileId`, `providerId`, and `enabled`. Keep API selection in a small documented adapter and cache invalidation in the query hook. The component owns only presentation, validation, and toast/error handling.
 
 The component must not import `useProxyStatus`, `ProxyToggle`, `takeoverStatus`, or application-global provider settings.
 
-- [ ] **Step 4: Wire the header by application scope**
+- [x] **Step 4: Wire the header by application scope**
 
 In `App.tsx`:
 
@@ -84,7 +84,7 @@ In `App.tsx`:
 - derive Codex ProviderList running/takeover/active values from `codexProfileState`, while leaving other apps unchanged;
 - retain the existing `enableLocalProxy` feature gate.
 
-- [ ] **Step 5: Run focused frontend verification**
+- [x] **Step 5: Run focused frontend verification**
 
 ```bash
 pnpm vitest run src/lib/query/codexProfiles.test.ts src/components/codex/CodexProfileRouteToggle.test.tsx src/components/codex/CodexHomeContextBar.test.tsx
@@ -93,7 +93,7 @@ pnpm exec tsc --noEmit
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the frontend slice**
+- [x] **Step 6: Commit the frontend slice**
 
 ```bash
 git add src/components/codex/CodexProfileRouteToggle.tsx src/components/codex/CodexProfileRouteToggle.test.tsx src/lib/query/codexProfiles.ts src/lib/query/codexProfiles.test.ts src/App.tsx
@@ -109,7 +109,7 @@ git commit -m "fix(codex): scope route toggle to selected profile"
 - Modify: `src-tauri/src/codex_config.rs`
 - Test: inline `codex_home_config` and route manager tests
 
-- [ ] **Step 1: Add failing pure configuration tests**
+- [x] **Step 1: Add failing pure configuration tests**
 
 Add tests proving:
 
@@ -127,7 +127,7 @@ cargo test --manifest-path src-tauri/Cargo.toml codex_home_config --lib
 
 Expected before implementation: FAIL because the builder has no listener-token parameter and preserves the placeholder.
 
-- [ ] **Step 2: Make the token a required plan input**
+- [x] **Step 2: Make the token a required plan input**
 
 Expose the existing provider-aware Codex token setter only at crate scope. Change:
 
@@ -138,7 +138,7 @@ build_codex_profile_route_toml(toml, listen_port, provider, listener_token)
 
 The builder must replace, not append, the effective `experimental_bearer_token`. It must not update `auth.json`.
 
-- [ ] **Step 3: Add a failing manager ordering test**
+- [x] **Step 3: Add a failing manager ordering test**
 
 Use a token-store fake returning a distinctive token and a Home fixture containing `PROXY_MANAGED`. Enable a Profile and assert:
 
@@ -155,11 +155,11 @@ cargo test --manifest-path src-tauri/Cargo.toml profile_listener_token --lib
 
 Expected before implementation: FAIL because the plan is built before `ensure_token` and does not receive it.
 
-- [ ] **Step 4: Reorder enable without weakening compensation**
+- [x] **Step 4: Reorder enable without weakening compensation**
 
 Inside the Profile lock, ensure the token before plan construction and pass the same owned value to both the Home plan and runtime factory. Preserve the existing operation record, health check, backup, atomic Home apply, final route save, and reverse-order compensation semantics.
 
-- [ ] **Step 5: Run focused Rust verification**
+- [x] **Step 5: Run focused Rust verification**
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml codex_home_config --lib
@@ -168,7 +168,7 @@ cargo test --manifest-path src-tauri/Cargo.toml codex_profile::route_manager --l
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the token slice**
+- [x] **Step 6: Commit the token slice**
 
 ```bash
 git add src-tauri/src/codex_config.rs src-tauri/src/codex_profile/home_config.rs src-tauri/src/codex_profile/route_manager.rs
@@ -186,7 +186,7 @@ git commit -m "fix(codex): align profile home and listener token"
 - Modify: `src-tauri/src/lib.rs`
 - Test: focused migration/startup tests and existing proxy service tests
 
-- [ ] **Step 1: Add failing retirement tests**
+- [x] **Step 1: Add failing retirement tests**
 
 Cover both branches:
 
@@ -205,7 +205,7 @@ cargo test --manifest-path src-tauri/Cargo.toml restore_proxy_state_candidates -
 
 Expected before implementation: FAIL because no retirement boundary exists and startup still enumerates Codex.
 
-- [ ] **Step 2: Add a narrow idempotent retirement service**
+- [x] **Step 2: Add a narrow idempotent retirement service**
 
 Separate decisions from effects:
 
@@ -216,7 +216,7 @@ Separate decisions from effects:
 
 Do not infer that only the default Profile may use subscriptions or routes.
 
-- [ ] **Step 3: Serialize startup ownership**
+- [x] **Step 3: Serialize startup ownership**
 
 Remove the early independent Profile-restore spawn. In the existing startup async sequence:
 
@@ -227,7 +227,7 @@ Remove the early independent Profile-restore spawn. In the existing startup asyn
 
 If step 1 fails, log the failure and skip step 3 in that startup pass so two writers cannot race on a Codex Home. Keep the existing comments and update/add Chinese explanation rather than deleting them.
 
-- [ ] **Step 4: Run retirement and proxy regression tests**
+- [x] **Step 4: Run retirement and proxy regression tests**
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml legacy_codex_takeover_retirement --lib
@@ -237,7 +237,7 @@ cargo test --manifest-path src-tauri/Cargo.toml codex_profile --lib
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the retirement slice**
+- [x] **Step 5: Commit the retirement slice**
 
 ```bash
 git add src-tauri/src/codex_profile src-tauri/src/database/dao/proxy.rs src-tauri/src/services/proxy.rs src-tauri/src/lib.rs
@@ -253,7 +253,7 @@ git commit -m "fix(codex): retire global takeover lifecycle"
 - Modify: `src-tauri/src/codex_profile/route_manager.rs`
 - Test: inline route manager and Home configuration tests
 
-- [ ] **Step 1: Add failing Home-backup rebase tests**
+- [x] **Step 1: Add failing Home-backup rebase tests**
 
 Add focused tests proving that rebasing a route backup:
 
@@ -262,7 +262,7 @@ Add focused tests proving that rebasing a route backup:
 - rejects a current Home that matches neither the old target nor a recognized legacy-managed placeholder;
 - never serializes a listener token into the backup metadata beyond the already existing Home bytes policy.
 
-- [ ] **Step 2: Add failing startup reconciliation tests**
+- [x] **Step 2: Add failing startup reconciliation tests**
 
 Cover:
 
@@ -282,11 +282,11 @@ cargo test --manifest-path src-tauri/Cargo.toml restoring_enabled_profile_home -
 
 Expected before implementation: FAIL because startup only starts runtime and never inspects/applies Home.
 
-- [ ] **Step 3: Add fingerprint-only reconcile recovery metadata**
+- [x] **Step 3: Add fingerprint-only reconcile recovery metadata**
 
 Add constants for the operation and phases in `constants.rs`. Extend the recovery record with an optional reconcile transition that stores only old/new fingerprints. Existing serialized recovery JSON must remain readable through `serde(default)` and omit the field when unused.
 
-- [ ] **Step 4: Implement idempotent reconcile-then-start**
+- [x] **Step 4: Implement idempotent reconcile-then-start**
 
 Extract focused helpers for:
 
@@ -298,7 +298,7 @@ Extract focused helpers for:
 
 Do not add one large branch to `restore_enabled_profiles`; keep per-Profile failure isolation intact.
 
-- [ ] **Step 5: Run focused recovery verification**
+- [x] **Step 5: Run focused recovery verification**
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml restoring_enabled_profile_home --lib
@@ -307,7 +307,7 @@ cargo test --manifest-path src-tauri/Cargo.toml codex_profile::route_manager --l
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit the recovery slice**
+- [x] **Step 6: Commit the recovery slice**
 
 ```bash
 git add src-tauri/src/codex_profile/constants.rs src-tauri/src/codex_profile/home_config.rs src-tauri/src/codex_profile/route_manager.rs
@@ -318,7 +318,7 @@ git commit -m "fix(codex): reconcile enabled profile homes on startup"
 
 **Files:** all modified files
 
-- [ ] **Step 1: Format and lint**
+- [x] **Step 1: Format and lint**
 
 ```bash
 pnpm exec prettier --check src docs/superpowers/findings/2026-07-14-codex-profile-route-isolation-auth-findings.md docs/superpowers/specs/2026-07-14-codex-profile-route-isolation-auth-design.md docs/superpowers/plans/2026-07-14-codex-profile-route-isolation-auth.md
@@ -326,20 +326,20 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 pnpm exec tsc --noEmit
 ```
 
-- [ ] **Step 2: Run frontend tests**
+- [x] **Step 2: Run frontend tests**
 
 ```bash
 pnpm vitest run src/lib/query/codexProfiles.test.ts src/components/codex
 ```
 
-- [ ] **Step 3: Run Rust focused and full library tests**
+- [x] **Step 3: Run Rust focused and full library tests**
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml codex_profile --lib
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-- [ ] **Step 4: Review the final diff**
+- [x] **Step 4: Review the final diff**
 
 ```bash
 git diff --check
@@ -353,11 +353,11 @@ Resolve only task-related failures. Record any environment-only blocker without 
 
 **Files/Runtime:** real CC Switch dev app, `/Users/qihoo/.codex`, `/Users/qihoo/.codex-api`, `~/.cc-switch/logs`, `~/.cc-switch/logs/proxy-bodies`
 
-- [ ] **Step 1: Capture safe pre-verification evidence**
+- [x] **Step 1: Capture safe pre-verification evidence**
 
 Record only non-secret values: selected Profile IDs, route enabled flags, ports, process listeners, config/listener token lengths and hashes, and relevant file mtimes. Never print actual tokens or provider keys.
 
-- [ ] **Step 2: Start the required build**
+- [x] **Step 2: Start the required build**
 
 ```bash
 pnpm run dev:dump
@@ -365,28 +365,28 @@ pnpm run dev:dump
 
 Wait for both the frontend and rebuilt Rust backend to be ready. Confirm logs show legacy Codex retirement before Profile reconciliation/runtime restore.
 
-- [ ] **Step 3: Verify UI isolation with Computer Use**
+- [x] **Step 3: Verify UI isolation with Computer Use**
 
 1. Select default `~/.codex`; verify its route switch reflects only the default Profile and official subscription remains usable.
 2. Select `codex-api · /Users/qihoo/.codex-api`; verify the switch reflects only this Profile at port 15722.
 3. Toggle `codex-api` off/on and switch back to default between operations; verify neither checked state, provider selection, Home config, nor error crosses Profile boundaries.
 4. Verify the old OpenAI Official global warning does not appear when operating `codex-api`.
 
-- [ ] **Step 4: Verify local and real request authentication**
+- [x] **Step 4: Verify local and real request authentication**
 
 - call `/v1/models` with the Home-configured bearer and expect 200;
 - issue a real Codex `/v1/responses` request through `/Users/qihoo/.codex-api` and confirm it reaches the configured upstream rather than failing local authentication;
 - compare only SHA-256/length of Home token and listener token and require equality;
 - inspect Profile body-dump/log ownership and require the request to be attributed to the `codex-api` Profile.
 
-- [ ] **Step 5: Verify restart stability**
+- [x] **Step 5: Verify restart stability**
 
 Stop the dev app cleanly, restart `pnpm run dev:dump`, and repeat Profile selection plus `/v1/models` authentication. Confirm old global Codex `enabled/live_backup` does not reappear and `PROXY_MANAGED` is not written back.
 
-- [ ] **Step 6: Diagnose before modifying if reality differs**
+- [x] **Step 6: Diagnose before modifying if reality differs**
 
 If any UI or request check fails, first add a narrowly scoped Chinese diagnostic log at the relevant lifecycle boundary, reproduce once, use the evidence to update the finding, then make a targeted TDD fix. Do not guess or repeat an unchanged failed operation.
 
-- [ ] **Step 7: Final verification commit**
+- [x] **Step 7: Final verification commit**
 
 Update the finding with real verification evidence, run the affected focused tests once more, and commit only after every acceptance item passes.

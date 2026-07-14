@@ -95,6 +95,29 @@
 3. **测试覆盖缺口让两个问题同时漏过。** UI 没有断言 Codex 顶部开关按 selected Profile 调用 enable/disable；Home 配置测试没有断言计划写入精确 listener token，也没有覆盖旧 `PROXY_MANAGED` 被新 Profile token 替换。
 4. **启动恢复缺少配置对账，让已启用的错误状态永久化。** `restore_enabled_profiles()` 只恢复 runtime，不校准 Home 配置；所以重启进程不会修复 401。同时旧应用级 Codex `enabled/live_backup` 仍存在，使用旧全局开关时会继续暴露过期状态。
 
+## 实施与真实验收结果
+
+- Codex 顶部开关已替换为 Profile 专用开关；状态、启停命令、供应商引用和查询失效范围都强制绑定当前选中的 Profile。默认 Profile 与自定义 Profile 权限完全相同，任何 Profile 都可以选择官方订阅或独立路由。
+- Profile 启用流程已改为先取得唯一 listener token，再将同一 token 同时传给 runtime 和 Home 配置计划；关闭、重复关闭与失败补偿采用幂等状态边界。启动时先退役旧全局 Codex 接管，再按 Profile 串行对账 Home、备份指纹、恢复 listener；Claude/Gemini 旧逻辑保持不变。
+- 启动对账覆盖配置正确、旧 `PROXY_MANAGED`、配置陈旧、外部修改、写入后崩溃和恢复失败边界。现场遗留的 pending disable 最终安全恢复原 Home，旧全局 Codex `enabled/live_backup` 被清理且重启后没有再出现。
+- Profile listener 的请求日志和 body dump 已绑定 `profile_id`。真实 `/v1/responses` 请求返回 200 后，数据库最新请求行归属 `b341359e-437d-452c-a7ee-1019d99ae939`，body dump 写入同一 Profile ID 目录，不再依赖端口或当前选中 Home 反推归属。
+- `cargo test` 曾因 NVM 目录下名为 `cc` 的 Node 脚本遮蔽系统 C 编译器而不能稳定重建；项目 `.cargo/config.toml` 现显式使用 `/usr/bin/cc`，避免 shell PATH 改变 Rust 链接器。
+
+### 真实 UI 与请求证据
+
+- 使用当前 Rust debug 二进制和 `dev:renderer` 启动现有 debug App bundle 后，Computer Use 可操作真实 Tauri UI。默认 Home 显示 `/Users/qihoo/.codex`、端口 15721、路由关闭；切到 `codex-api` 显示 `/Users/qihoo/.codex-api`、端口 15722、路由关闭，两个开关状态互不串用。
+- 在 `codex-api` 页面开启路由后仅该 Profile 变为“端口 15722 · 路由已启用”；切回默认 Profile 仍为关闭，且没有再出现读取默认 OpenAI Official 的旧全局告警。
+- Home `config.toml` 与 Profile listener token 均为 43 字节，SHA-256 完全相同；使用 Home token 调用 `/v1/models` 返回 200。
+- 真实 `/v1/responses` 请求经 15722 返回 200，Home 配置文件 mtime 在请求及进程重启前后保持不变；重启后 listener 自动恢复，默认 Profile 仍关闭，自定义 Profile 仍开启，两个 Profile 均无 recovery/error 状态。
+- 验收过程中临时把 `silentStartup` 改为 `false` 以观察窗口，结束后已恢复为 `true`；所有临时 dev/renderer/listener 进程均已停止，端口 13000、15721、15722、15723 无残留监听。
+
+### 最终自动化验证
+
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib --quiet`：1844 通过、0 失败、2 忽略。
+- `pnpm run test:unit`：70 个测试文件、434 个测试全部通过。
+- `pnpm run typecheck`、`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`：通过。
+- 首次误用 `pnpm test -- --run` 被 shell 解析为系统 `test`，未执行任何测试；随后读取 `package.json` 后改用项目实际脚本 `pnpm run test:unit`，没有重复失败命令。
+
 ## 资源
 
 - 截图 1：`/Users/qihoo/.codex/attachments/4a07bc73-22f0-4615-bdc5-8a8120affecb/image-1.png`
