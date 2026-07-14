@@ -28,6 +28,8 @@ pub struct CodexProfileRoute {
     pub enabled: bool,
     /// 该 Profile 接管前的 Live 配置备份，仅保存在所属 Profile 关系中。
     pub live_backup_json: Option<String>,
+    /// 该 Profile 最近一次独立路由生命周期失败摘要，绝不保存本地凭证。
+    pub last_error: Option<String>,
     pub updated_at: i64,
 }
 

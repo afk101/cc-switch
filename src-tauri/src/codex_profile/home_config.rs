@@ -1,5 +1,7 @@
 use crate::codex_config::codex_config_path_for_home;
 use crate::error::AppError;
+use crate::provider::Provider;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,6 +24,13 @@ pub struct CodexRouteConfigPlan {
     target_fingerprint: String,
     /// 预留给路由配置构建器记录模型选择变化，文件写入阶段不解释该字段。
     model_changes: Vec<String>,
+}
+
+/// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
+#[derive(Serialize, Deserialize)]
+struct CodexRouteBackup {
+    previous_content: Option<Vec<u8>>,
+    target_fingerprint: String,
 }
 
 /// 读写单个 Home 的 `config.toml`，使原子替换失败可被行为测试注入。
@@ -101,6 +110,27 @@ impl CodexHomeConfigService {
         })
     }
 
+    /// 从当前 Home 配置构造指定 Profile 端口的接管计划。
+    pub fn build_profile_route_plan(
+        &self,
+        home: &Path,
+        listen_port: u16,
+        provider: Option<&Provider>,
+    ) -> Result<CodexRouteConfigPlan, AppError> {
+        let current = self.inspect(home)?;
+        let current_toml = current
+            .content
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
+            .unwrap_or("");
+        self.build_route_plan(
+            home,
+            &build_codex_profile_route_toml(current_toml, listen_port, provider),
+        )
+    }
+
     /// 在当前配置未被外部修改时，原子应用路由接管计划。
     pub fn apply_route_plan(&self, plan: &CodexRouteConfigPlan) -> Result<(), AppError> {
         let config_path = validated_plan_config_path(plan)?;
@@ -120,6 +150,50 @@ impl CodexHomeConfigService {
             None => self.file_ops.remove_file(&config_path),
         }
     }
+
+    /// 将计划的原始配置编码为 Profile 私有恢复备份。
+    pub fn serialize_backup(&self, plan: &CodexRouteConfigPlan) -> Result<String, AppError> {
+        serde_json::to_string(&CodexRouteBackup {
+            previous_content: plan.previous.content.clone(),
+            target_fingerprint: plan.target_fingerprint.clone(),
+        })
+        .map_err(|error| AppError::JsonSerialize { source: error })
+    }
+
+    /// 仅当 Home 仍是该 Profile 接管版本时恢复其备份配置。
+    pub fn restore_backup(&self, home: &Path, backup_json: &str) -> Result<(), AppError> {
+        let backup: CodexRouteBackup = serde_json::from_str(backup_json)
+            .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))?;
+        let current = self.inspect(home)?;
+        ensure_fingerprint(&backup.target_fingerprint, &current.fingerprint)?;
+        let config_path = codex_config_path_for_home(home);
+        match backup.previous_content {
+            Some(content) => self.file_ops.write_atomic(&config_path, &content),
+            None => self.file_ops.remove_file(&config_path),
+        }
+    }
+}
+
+/// 根据指定 Profile 的本地端口构造纯 Codex 路由配置，不读取全局代理配置。
+pub fn build_codex_profile_route_toml(
+    toml_str: &str,
+    listen_port: u16,
+    provider: Option<&Provider>,
+) -> String {
+    let proxy_url = format!("http://127.0.0.1:{listen_port}/v1");
+    let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", &proxy_url)
+        .unwrap_or_else(|_| toml_str.to_string());
+    let mut updated =
+        crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
+            .unwrap_or(updated);
+
+    if let Some(upstream_model) =
+        provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
+    {
+        updated = crate::codex_config::update_codex_toml_field(&updated, "model", &upstream_model)
+            .unwrap_or(updated);
+    }
+    updated
 }
 
 /// 从计划的 Home 重派生配置路径，并拒绝任何不一致的内部数据。

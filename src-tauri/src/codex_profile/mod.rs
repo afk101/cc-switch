@@ -7,13 +7,14 @@ mod home_config;
 mod migration;
 mod model;
 mod repository;
+mod route_manager;
 mod route_runtime;
 mod secret_store;
 
 pub use constants::*;
 pub use home_config::{
-    CodexHomeConfigService, CodexHomeFileOps, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
-    SystemCodexHomeFileOps,
+    build_codex_profile_route_toml, CodexHomeConfigService, CodexHomeFileOps,
+    CodexLiveConfigSnapshot, CodexRouteConfigPlan, SystemCodexHomeFileOps,
 };
 pub use migration::{
     CodexProfileMigrationResult, CodexProfileMigrationService, LegacyCodexProfileSnapshot,
@@ -27,5 +28,9 @@ pub use repository::{
     CodexProfileRepository, HomePathCanonicalizer, PortAvailability, SystemHomePathCanonicalizer,
     SystemPortAvailability,
 };
-pub use route_runtime::{CodexRouteProviderSnapshot, RouteRuntime};
+pub use route_manager::CodexRouteManager;
+pub use route_runtime::{
+    CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
+    CodexRouteRuntimeFuture, RouteRuntime, SystemCodexRouteRuntimeFactory,
+};
 pub use secret_store::CodexProfileSecretStore;

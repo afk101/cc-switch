@@ -8,7 +8,62 @@ use crate::database::Database;
 use crate::provider::Provider;
 use crate::proxy::{server::ProxyServer, ProxyError, ProxyServerInfo, ProxyStatus};
 use std::sync::Arc;
+use std::{future::Future, pin::Pin};
 use tokio::sync::RwLock;
+
+/// Route manager 使用的异步返回类型，避免将测试替身绑定到真实监听器。
+pub type CodexRouteRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Profile 路由运行时的最小生命周期契约。
+pub trait CodexRouteRuntime: Send + Sync {
+    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>>;
+    fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool>;
+    fn swap_provider_snapshot(
+        &self,
+        snapshot: CodexRouteProviderSnapshot,
+    ) -> CodexRouteRuntimeFuture<'_, ()>;
+    fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()>;
+    fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>>;
+    fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus>;
+}
+
+/// 生产与测试共用的 Profile 路由运行时构造契约。
+pub trait CodexRouteRuntimeFactory: Send + Sync {
+    fn create(
+        &self,
+        scope: CodexProfileScope,
+        local_token: String,
+        snapshot: CodexRouteProviderSnapshot,
+    ) -> Arc<dyn CodexRouteRuntime>;
+}
+
+/// 创建真实独立监听器的生产工厂。
+pub struct SystemCodexRouteRuntimeFactory {
+    db: Arc<Database>,
+}
+
+impl SystemCodexRouteRuntimeFactory {
+    /// 使用共享数据库创建生产运行时工厂。
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+impl CodexRouteRuntimeFactory for SystemCodexRouteRuntimeFactory {
+    fn create(
+        &self,
+        scope: CodexProfileScope,
+        local_token: String,
+        snapshot: CodexRouteProviderSnapshot,
+    ) -> Arc<dyn CodexRouteRuntime> {
+        Arc::new(RouteRuntime::new(
+            self.db.clone(),
+            scope,
+            local_token,
+            snapshot,
+        ))
+    }
+}
 
 /// 一个 Profile 在某个时刻可用于新请求的供应商快照。
 #[derive(Clone)]
@@ -177,6 +232,40 @@ impl RouteRuntime {
         &self,
     ) -> Arc<crate::proxy::providers::codex_chat_history::CodexChatHistoryStore> {
         self.server.codex_chat_history()
+    }
+}
+
+impl CodexRouteRuntime for RouteRuntime {
+    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        Box::pin(async move {
+            RouteRuntime::start(self)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+        Box::pin(async move { RouteRuntime::health_check(self).await })
+    }
+
+    fn swap_provider_snapshot(
+        &self,
+        snapshot: CodexRouteProviderSnapshot,
+    ) -> CodexRouteRuntimeFuture<'_, ()> {
+        Box::pin(async move { RouteRuntime::swap_provider_snapshot(self, snapshot).await })
+    }
+
+    fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+        Box::pin(async move { RouteRuntime::begin_draining(self).await })
+    }
+
+    fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        Box::pin(async move { RouteRuntime::stop(self).await.map_err(|e| e.to_string()) })
+    }
+
+    fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+        Box::pin(async move { RouteRuntime::status(self).await })
     }
 }
 

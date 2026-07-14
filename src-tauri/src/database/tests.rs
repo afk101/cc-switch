@@ -171,6 +171,35 @@ fn schema_migration_sets_user_version_when_missing() {
     );
 }
 
+/// 从 v13 升级时，Profile 路由必须获得独立的错误摘要列。
+#[test]
+fn schema_migration_adds_codex_profile_route_last_error() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute_batch(
+        "CREATE TABLE codex_profiles (id TEXT PRIMARY KEY);
+         CREATE TABLE codex_profile_routes (
+             profile_id TEXT PRIMARY KEY,
+             current_provider_id TEXT,
+             enabled BOOLEAN NOT NULL DEFAULT 0,
+             live_backup_json TEXT,
+             updated_at INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .expect("create v13 tables");
+    Database::set_user_version(&conn, 13).expect("set v13");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v13");
+
+    assert_eq!(
+        get_column_info(&conn, "codex_profile_routes", "last_error").r#type,
+        "TEXT"
+    );
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        SCHEMA_VERSION
+    );
+}
+
 #[test]
 fn schema_migration_rejects_future_version() {
     let conn = Connection::open_in_memory().expect("open memory db");
@@ -686,6 +715,7 @@ fn codex_profile_dao_persists_route_failover_order_and_provider_refs() -> Result
         current_provider_id: Some("provider-a".to_string()),
         enabled: true,
         live_backup_json: Some("{\"config\":\"profile\"}".to_string()),
+        last_error: None,
         updated_at: 2,
     };
     db.save_codex_profile_route(&route).expect("save route");

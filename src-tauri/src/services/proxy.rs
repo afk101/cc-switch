@@ -2289,6 +2289,7 @@ impl ProxyService {
     // ==================== Live 配置读写辅助方法 ====================
 
     /// 更新 TOML 字符串中的 base_url（委托给 codex_config 共享实现）
+    #[allow(dead_code)] // 保留给尚未迁移的单字段配置更新调用方。
     fn update_toml_base_url(toml_str: &str, new_url: &str) -> String {
         crate::codex_config::update_codex_toml_field(toml_str, "base_url", new_url)
             .unwrap_or_else(|_| toml_str.to_string())
@@ -2301,20 +2302,12 @@ impl ProxyService {
         proxy_url: &str,
         provider: Option<&Provider>,
     ) -> String {
-        let updated = Self::update_toml_base_url(toml_str, proxy_url);
-        let mut updated =
-            crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
-                .unwrap_or(updated);
-
-        if let Some(upstream_model) =
-            provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
-        {
-            updated =
-                crate::codex_config::update_codex_toml_field(&updated, "model", &upstream_model)
-                    .unwrap_or(updated);
-        }
-
-        updated
+        let port = proxy_url
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.trim_end_matches("/v1").parse::<u16>().ok())
+            .unwrap_or(15_721);
+        crate::codex_profile::build_codex_profile_route_toml(toml_str, port, provider)
     }
 
     fn attach_codex_model_catalog_from_provider(
