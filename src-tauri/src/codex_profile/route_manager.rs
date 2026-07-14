@@ -1439,6 +1439,22 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 操作错误摘要不能把 token、认证字段或 Home 路径写入恢复记录。
+    #[test]
+    fn operation_error_summary_redacts_token_auth_and_home_path() {
+        for sensitive in [
+            "token=secret-value",
+            "auth header: Bearer secret-value",
+            "/Users/example/.codex/config.toml",
+            "C:\\Users\\example\\config.toml",
+        ] {
+            let summary = CodexRouteManager::safe_error_summary(sensitive);
+            assert!(!summary.contains("secret-value"));
+            assert!(!summary.contains("/Users"));
+            assert!(!summary.contains("C:\\Users"));
+        }
+    }
+
     /// Home 写入失败且停止失败时，操作记录必须保留并阻断后续变更。
     #[tokio::test]
     async fn enabling_home_apply_failure_with_stop_failure_keeps_operation_and_rejects_mutation(
