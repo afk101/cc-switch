@@ -752,7 +752,7 @@ impl CodexRouteManager {
                 "上次启用路由未完成，拒绝继续变更".to_string(),
             ));
         }
-        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED {
+        if recovery.operation == "delete" {
             self.secret_store.ensure_token(profile_id)?;
             let mut recovered = route;
             recovered.recovery_json = None;
@@ -1859,6 +1859,24 @@ mod codex_route_manager {
             .is_err());
         assert!(tokens.ensured.load(Ordering::SeqCst) >= 1);
         assert!(tokens.deleted.load(Ordering::SeqCst) >= 2);
+        Ok(())
+    }
+
+    /// token 删除后第二次保存（delete 阶段推进）失败，下一次操作必须先补建 token。
+    #[tokio::test]
+    async fn deleting_token_phase_save_failure_recovers_token_before_retry() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        db.insert_codex_profile(&CodexProfile { id: "custom-profile".to_string(), name: "自定义".to_string(), canonical_home_path: "/tmp/custom".to_string(), listen_port: 16001, created_at: 1, updated_at: 1 })?;
+        db.save_codex_profile_route(&CodexProfileRoute { profile_id: "custom-profile".to_string(), current_provider_id: None, enabled: false, live_backup_json: None, last_error: None, recovery_json: None, updated_at: 1 })?;
+        let tokens = Arc::new(TrackingTokenStore { ensured: AtomicUsize::new(0), deleted: AtomicUsize::new(0) });
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence { db: db.clone(), save_count: AtomicUsize::new(0), fail_on_save: 2, fail_replace: false }),
+            Arc::new(CodexHomeConfigService::system()), tokens.clone(), Arc::new(FakeFactory),
+        );
+        assert!(manager.delete_custom_profile("custom-profile").await.is_err());
+        assert!(db.get_codex_profile_route("custom-profile")?.expect("路由").recovery_json.is_some());
+        manager.delete_custom_profile("custom-profile").await?;
+        assert!(tokens.ensured.load(Ordering::SeqCst) >= 1);
         Ok(())
     }
 
