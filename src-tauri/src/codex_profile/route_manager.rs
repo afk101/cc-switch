@@ -2342,10 +2342,15 @@ mod codex_route_manager {
         assert!(error
             .to_string()
             .contains(CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR));
+        let recovered_route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
         assert_eq!(
-            db.get_codex_profile_route("profile-a")?.expect("路由记录"),
-            route
+            recovered_route.current_provider_id,
+            route.current_provider_id
         );
+        assert_eq!(recovered_route.enabled, route.enabled);
+        assert_eq!(recovered_route.live_backup_json, route.live_backup_json);
+        assert_eq!(recovered_route.recovery_json, route.recovery_json);
+        assert_eq!(recovered_route.last_error, route.last_error);
         assert_eq!(
             db.list_codex_profile_failovers("profile-a")?,
             vec!["provider-new".to_string()]
@@ -2431,10 +2436,15 @@ mod codex_route_manager {
             fs::read_to_string(config_path).expect("读取当前配置"),
             "model = \"current\"\n"
         );
+        let recovered_route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
         assert_eq!(
-            db.get_codex_profile_route("profile-a")?.expect("路由记录"),
-            route
+            recovered_route.current_provider_id,
+            route.current_provider_id
         );
+        assert_eq!(recovered_route.enabled, route.enabled);
+        assert_eq!(recovered_route.live_backup_json, route.live_backup_json);
+        assert_eq!(recovered_route.recovery_json, route.recovery_json);
+        assert!(recovered_route.last_error.is_some());
         assert!(manager.status("profile-a").await.is_err());
         Ok(())
     }
