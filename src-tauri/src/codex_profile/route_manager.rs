@@ -139,9 +139,9 @@ impl CodexRouteManager {
         let _ = self.provider_snapshot(provider_id, &failover_ids)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
-        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_route_operation()?;
+        self.recover_pending_locked(profile_id).await?;
         let previous = self
             .persistence
             .get_route(profile_id)?
@@ -246,10 +246,10 @@ impl CodexRouteManager {
         let _ = self.provider_snapshot(provider_id, &failover_ids)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
-        self.recover_pending_locked(profile_id).await?;
         self.persistence
             .get_profile(profile_id)?
             .validate_route_operation()?;
+        self.recover_pending_locked(profile_id).await?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let route = self
             .persistence
@@ -326,8 +326,9 @@ impl CodexRouteManager {
         self.validate_route_operation_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
-        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
+        profile.validate_route_operation()?;
+        self.recover_pending_locked(profile_id).await?;
         let route = self
             .persistence
             .get_route(profile_id)?
@@ -407,9 +408,9 @@ impl CodexRouteManager {
         self.validate_delete_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
-        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_delete()?;
+        self.recover_pending_locked(profile_id).await?;
         if let Some(route) = self.persistence.get_route(profile_id)? {
             if route.enabled {
                 self.disable_locked(profile_id, &profile, route).await?;
@@ -461,9 +462,9 @@ impl CodexRouteManager {
             let result = async {
                 let lock = self.profile_lock(&profile.id)?;
                 let _guard = lock.lock().await;
-                self.recover_pending_locked(&profile.id).await?;
                 let profile = self.persistence.get_profile(&profile.id)?;
                 profile.validate_route_operation()?;
+                self.recover_pending_locked(&profile.id).await?;
                 let Some(route) = self.persistence.get_route(&profile.id)? else {
                     return Ok(());
                 };
