@@ -662,7 +662,13 @@ async fn log_usage_internal(
 ) {
     use super::usage::logger::UsageLogger;
 
-    let logger = UsageLogger::new(&state.db);
+    let logger = UsageLogger::new_scoped(
+        &state.db,
+        state
+            .codex_profile_scope
+            .as_ref()
+            .map(|scope| scope.profile_id.as_str()),
+    );
     let (multiplier, pricing_model_source) =
         logger.resolve_pricing_config(provider_id, app_type).await;
     let pricing_model = if pricing_model_source == PRICING_SOURCE_REQUEST {
