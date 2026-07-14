@@ -464,10 +464,11 @@ impl CodexRouteManager {
             None,
         )?;
         if let Some(backup) = &route.live_backup_json {
-            if let Err(error) = self
-                .home_config
-                .restore_backup(std::path::Path::new(&profile.canonical_home_path), backup)
-            {
+            if let Err(error) = self.home_config.restore_profile_backup(
+                std::path::Path::new(&profile.canonical_home_path),
+                backup,
+                profile.listen_port,
+            ) {
                 self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
@@ -1057,10 +1058,11 @@ impl CodexRouteManager {
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             if let Some(backup) = route.live_backup_json.as_deref() {
                 let profile = self.persistence.get_profile(profile_id)?;
-                if let Err(error) = self
-                    .home_config
-                    .restore_backup(std::path::Path::new(&profile.canonical_home_path), backup)
-                {
+                if let Err(error) = self.home_config.restore_profile_backup(
+                    std::path::Path::new(&profile.canonical_home_path),
+                    backup,
+                    profile.listen_port,
+                ) {
                     self.persist_operation_error(
                         profile_id,
                         CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
@@ -1881,6 +1883,74 @@ experimental_bearer_token = "PROXY_MANAGED"
                 CodexRuntimeStatus::Running
             );
         }
+        Ok(())
+    }
+
+    /// 旧全局占位覆盖 Profile 目标后，未完成关闭仍应恢复原始 Home 并收敛为关闭。
+    #[tokio::test]
+    async fn restoring_enabled_profile_home_completes_pending_disable_from_legacy_placeholder(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-pending-disable",
+            16_001,
+            "old-listener-token",
+        )?;
+        fs::write(
+            codex_config_path_for_home(home.path()),
+            "model_provider = \"provider-profile-pending-disable\"\n\n[model_providers.provider-profile-pending-disable]\nname = \"Legacy\"\nbase_url = \"http://127.0.0.1:16001/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n",
+        )
+        .expect("写入旧全局占位配置");
+        let mut route = db
+            .get_codex_profile_route("profile-pending-disable")?
+            .expect("路由存在");
+        let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+        let mut target = before.clone();
+        target.enabled = false;
+        route.recovery_json = Some(
+            serde_json::to_string(&RouteRecoveryRecord {
+                operation: "disable".to_string(),
+                before,
+                target,
+                phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
+                last_error: Some("CODEX_PROFILE_OPERATION_FAILURE".to_string()),
+                reconcile: None,
+            })
+            .expect("编码关闭恢复记录"),
+        );
+        db.save_codex_profile_route(&route)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        let restored =
+            fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取恢复后的 Home");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&restored).as_deref(),
+            Some("upstream-token")
+        );
+        let route = db
+            .get_codex_profile_route("profile-pending-disable")?
+            .expect("路由仍存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
         Ok(())
     }
 

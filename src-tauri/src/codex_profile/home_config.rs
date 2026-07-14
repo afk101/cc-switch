@@ -189,11 +189,39 @@ impl CodexHomeConfigService {
     /// 仅当 Home 仍是该 Profile 接管版本时恢复其备份配置。
     pub fn restore_backup(&self, home: &Path, backup_json: &str) -> Result<(), AppError> {
         let backup = Self::decode_route_backup(backup_json)?;
+        self.restore_decoded_backup(home, backup, None)
+    }
+
+    /// 关闭 Profile 时兼容同端口的旧全局占位配置，其他外部修改仍拒绝覆盖。
+    pub fn restore_profile_backup(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+    ) -> Result<(), AppError> {
+        let backup = Self::decode_route_backup(backup_json)?;
+        self.restore_decoded_backup(home, backup, Some(listen_port))
+    }
+
+    /// 按指纹和可选旧占位所有权证明恢复已解码备份。
+    fn restore_decoded_backup(
+        &self,
+        home: &Path,
+        backup: CodexRouteBackup,
+        legacy_listen_port: Option<u16>,
+    ) -> Result<(), AppError> {
         let current = self.inspect(home)?;
         if current.fingerprint == backup.previous_fingerprint {
             return Ok(());
         }
-        ensure_fingerprint(&backup.target_fingerprint, &current.fingerprint)?;
+        let legacy_managed = legacy_listen_port
+            .map(|listen_port| {
+                Self::is_legacy_managed_home(current.content.as_deref(), listen_port)
+            })
+            .unwrap_or(false);
+        if !legacy_managed {
+            ensure_fingerprint(&backup.target_fingerprint, &current.fingerprint)?;
+        }
         let config_path = codex_config_path_for_home(home);
         match backup.previous_content {
             Some(content) => self.file_ops.write_atomic(&config_path, &content),
@@ -507,6 +535,9 @@ experimental_bearer_token = "PROXY_MANAGED"
             service.build_profile_route_plan(home.path(), 15_722, None, "new-token")?;
         assert!(service
             .classify_profile_reconcile(&external_plan, &backup, 15_722)
+            .is_err());
+        assert!(service
+            .restore_profile_backup(home.path(), &backup, 15_722)
             .is_err());
         assert_eq!(
             fs::read_to_string(&config_path).expect("重读外部配置"),
