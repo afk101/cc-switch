@@ -28,7 +28,7 @@ pub use repository::{
     CodexProfileRepository, HomePathCanonicalizer, PortAvailability, SystemHomePathCanonicalizer,
     SystemPortAvailability,
 };
-pub use route_manager::CodexRouteManager;
+pub use route_manager::{CodexProfileRoutePersistence, CodexProfileTokenStore, CodexRouteManager};
 pub use route_runtime::{
     CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
     CodexRouteRuntimeFuture, RouteRuntime, SystemCodexRouteRuntimeFactory,

@@ -571,6 +571,14 @@ pub fn run() {
 
             let app_state = AppState::new(db);
 
+            // Codex Profile 路由使用独立监听器；单个恢复失败由管理器隔离，不影响应用启动。
+            let codex_route_manager = app_state.codex_route_manager.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = codex_route_manager.restore_enabled_profiles().await {
+                    log::warn!("恢复 Codex Profile 路由失败: {error}");
+                }
+            });
+
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
 

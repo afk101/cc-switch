@@ -10,6 +10,8 @@ pub const LEGACY_CODEX_ROUTE_PORT: u16 = 15_721;
 pub const FIRST_CUSTOM_CODEX_ROUTE_PORT: u16 = 15_722;
 /// Codex 本地路由仅允许监听 loopback 地址。
 pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
+/// Profile 排空已进入请求的最长等待时间，超时后仍停止监听器。
+pub const CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS: u64 = 15;
 /// 每个本地监听凭证使用的随机字节数。
 pub const LOCAL_TOKEN_BYTES: usize = 32;
 /// CC Switch 私有密钥根目录下的通用 secrets 目录名。

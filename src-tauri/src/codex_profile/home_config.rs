@@ -30,6 +30,7 @@ pub struct CodexRouteConfigPlan {
 #[derive(Serialize, Deserialize)]
 struct CodexRouteBackup {
     previous_content: Option<Vec<u8>>,
+    previous_fingerprint: String,
     target_fingerprint: String,
 }
 
@@ -155,6 +156,7 @@ impl CodexHomeConfigService {
     pub fn serialize_backup(&self, plan: &CodexRouteConfigPlan) -> Result<String, AppError> {
         serde_json::to_string(&CodexRouteBackup {
             previous_content: plan.previous.content.clone(),
+            previous_fingerprint: plan.previous.fingerprint.clone(),
             target_fingerprint: plan.target_fingerprint.clone(),
         })
         .map_err(|error| AppError::JsonSerialize { source: error })
@@ -165,6 +167,9 @@ impl CodexHomeConfigService {
         let backup: CodexRouteBackup = serde_json::from_str(backup_json)
             .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))?;
         let current = self.inspect(home)?;
+        if current.fingerprint == backup.previous_fingerprint {
+            return Ok(());
+        }
         ensure_fingerprint(&backup.target_fingerprint, &current.fingerprint)?;
         let config_path = codex_config_path_for_home(home);
         match backup.previous_content {
