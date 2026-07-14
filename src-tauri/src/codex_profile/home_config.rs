@@ -187,6 +187,17 @@ pub fn build_codex_profile_route_toml(
     provider: Option<&Provider>,
     listener_token: &str,
 ) -> String {
+    let updated = build_codex_route_toml_base(toml_str, listen_port, provider);
+    crate::codex_config::set_codex_experimental_bearer_token(&updated, listener_token)
+        .unwrap_or(updated)
+}
+
+/// 构造 Codex 本地路由共享字段，不决定旧全局接管或 Profile 的凭证策略。
+pub(crate) fn build_codex_route_toml_base(
+    toml_str: &str,
+    listen_port: u16,
+    provider: Option<&Provider>,
+) -> String {
     let proxy_url = format!("http://127.0.0.1:{listen_port}/v1");
     let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", &proxy_url)
         .unwrap_or_else(|_| toml_str.to_string());
@@ -200,8 +211,7 @@ pub fn build_codex_profile_route_toml(
         updated = crate::codex_config::update_codex_toml_field(&updated, "model", &upstream_model)
             .unwrap_or(updated);
     }
-    crate::codex_config::set_codex_experimental_bearer_token(&updated, listener_token)
-        .unwrap_or(updated)
+    updated
 }
 
 /// 从计划的 Home 重派生配置路径，并拒绝任何不一致的内部数据。

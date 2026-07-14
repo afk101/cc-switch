@@ -127,6 +127,21 @@ impl CodexRouteManager {
         }
     }
 
+    /// 判断是否存在任意已启用的 Profile 路由，用于启动时裁决 Codex Home 所有权。
+    pub fn has_enabled_profile_routes(&self) -> Result<bool, AppError> {
+        for profile in self.persistence.list_profiles()? {
+            if self
+                .persistence
+                .get_route(&profile.id)?
+                .map(|route| route.enabled)
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// 启动指定 Profile 的独立监听器并原子接管其 Home 配置。
     pub async fn enable(
         &self,
@@ -1367,6 +1382,44 @@ mod codex_route_manager {
             self.deleted.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// 启动所有权判断必须基于任意 Profile 路由，而不是默认 Home 身份。
+    #[test]
+    fn legacy_codex_takeover_retirement_detects_any_enabled_profile_route() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        db.insert_codex_profile(&CodexProfile {
+            id: "custom-profile".to_string(),
+            name: "自定义 Profile".to_string(),
+            canonical_home_path: "/tmp/custom-profile".to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        assert!(!manager.has_enabled_profile_routes()?);
+
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "custom-profile".to_string(),
+            current_provider_id: None,
+            enabled: true,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+
+        assert!(manager.has_enabled_profile_routes()?);
+        Ok(())
     }
 
     /// 启用 Profile 路由时，Home 与监听器必须使用同一份本地凭证，关闭后恢复原配置。

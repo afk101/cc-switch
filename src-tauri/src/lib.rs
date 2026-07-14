@@ -571,13 +571,8 @@ pub fn run() {
 
             let app_state = AppState::new(db);
 
-            // Codex Profile 路由使用独立监听器；单个恢复失败由管理器隔离，不影响应用启动。
-            let codex_route_manager = app_state.codex_route_manager.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = codex_route_manager.restore_enabled_profiles().await {
-                    log::warn!("恢复 Codex Profile 路由失败: {error}");
-                }
-            });
+            // Codex Profile 路由使用独立监听器；恢复必须等待旧全局 Codex 所有权退役完成。
+            // 单个 Profile 恢复失败仍由管理器隔离，不影响应用启动。
 
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
@@ -1119,29 +1114,69 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 let state = app_handle.state::<AppState>();
 
-                // 检查是否有 Live 备份（表示上次异常退出时可能处于接管状态）
-                let has_backups = match state.db.has_any_live_backup().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::error!("检查 Live 备份失败: {e}");
+                // 先裁决 Codex Home 所有权：Profile 已启用时只退役旧数据库状态，
+                // 否则先通过旧代理的安全恢复路径还原 Home。失败时本轮不得并发恢复 Profile。
+                let codex_ownership_ready = match state
+                    .codex_route_manager
+                    .has_enabled_profile_routes()
+                {
+                    Ok(profile_route_enabled) => match state
+                        .proxy_service
+                        .retire_legacy_codex_takeover(profile_route_enabled)
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::error!("退役旧全局 Codex 接管失败，本轮跳过 Profile 恢复: {error}");
+                            false
+                        }
+                    },
+                    Err(error) => {
+                        log::error!("读取 Codex Profile 路由状态失败，本轮跳过所有权变更: {error}");
                         false
                     }
                 };
-                // 检查 Live 配置是否仍处于被接管状态（包含占位符）
-                let live_taken_over = state.proxy_service.detect_takeover_in_live_configs();
 
-                if has_backups || live_taken_over {
-                    log::warn!("检测到上次异常退出（存在接管残留），正在恢复 Live 配置...");
-                    if let Err(e) = state.proxy_service.recover_from_crash().await {
-                        log::error!("恢复 Live 配置失败: {e}");
+                // 检查旧全局代理应用是否有 Live 备份或接管残留。
+                // Codex 已从这条生命周期移除，避免异常恢复覆盖 Profile Home。
+                let has_global_proxy_residue = match state
+                    .proxy_service
+                    .has_global_proxy_crash_residue()
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        log::error!("检查旧全局代理 Live 残留失败: {e}");
+                        false
+                    }
+                };
+
+                if has_global_proxy_residue {
+                    log::warn!("检测到旧全局代理异常退出残留，正在恢复 Claude/Gemini Live 配置...");
+                    if let Err(e) = state
+                        .proxy_service
+                        .recover_global_proxy_apps_from_crash()
+                        .await
+                    {
+                        log::error!("恢复 Claude/Gemini Live 配置失败: {e}");
                     } else {
-                        log::info!("Live 配置已恢复");
+                        log::info!("Claude/Gemini Live 配置已恢复");
                     }
                 }
 
                 initialize_common_config_snippets(&state);
 
-                // 检查 settings 表中的代理状态，自动恢复代理服务
+                if codex_ownership_ready {
+                    if let Err(error) = state
+                        .codex_route_manager
+                        .restore_enabled_profiles()
+                        .await
+                    {
+                        log::warn!("恢复 Codex Profile 路由失败: {error}");
+                    }
+                }
+
+                // 检查 settings 表中的旧全局代理状态，只恢复 Claude/Gemini。
                 restore_proxy_state_on_startup(&state).await;
 
                 // Periodic backup check (on startup)
@@ -1827,6 +1862,14 @@ pub(crate) fn remove_tray_icon_before_exit(app_handle: &tauri::AppHandle) {
 // 启动时恢复代理状态
 // ============================================================
 
+/// 返回仍由旧全局代理生命周期管理的启动恢复候选。
+fn global_proxy_startup_app_types() -> [crate::app_config::AppType; 2] {
+    [
+        crate::app_config::AppType::Claude,
+        crate::app_config::AppType::Gemini,
+    ]
+}
+
 /// 启动时根据 proxy_config 表中的代理状态自动恢复代理服务
 ///
 /// 检查 `proxy_config.enabled` 字段，如果有任一应用的状态为 `true`，
@@ -1834,10 +1877,10 @@ pub(crate) fn remove_tray_icon_before_exit(app_handle: &tauri::AppHandle) {
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
     let mut apps_to_restore = Vec::new();
-    for app_type in ["claude", "codex", "gemini"] {
-        if let Ok(config) = state.db.get_proxy_config_for_app(app_type).await {
+    for app in global_proxy_startup_app_types() {
+        if let Ok(config) = state.db.get_proxy_config_for_app(app.as_str()).await {
             if config.enabled {
-                apps_to_restore.push(app_type);
+                apps_to_restore.push(app);
             }
         }
     }
@@ -1850,7 +1893,8 @@ async fn restore_proxy_state_on_startup(state: &store::AppState) {
     log::info!("检测到上次代理状态需要恢复，应用列表: {apps_to_restore:?}");
 
     // 逐个恢复接管状态
-    for app_type in apps_to_restore {
+    for app in apps_to_restore {
+        let app_type = app.as_str();
         match state
             .proxy_service
             .set_takeover_for_app(app_type, true)
@@ -2158,7 +2202,16 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_exit_request, ExitRequestAction};
+    use super::{classify_exit_request, global_proxy_startup_app_types, ExitRequestAction};
+    use crate::app_config::AppType;
+
+    #[test]
+    fn restore_proxy_state_candidates_exclude_codex_profiles() {
+        assert_eq!(
+            global_proxy_startup_app_types(),
+            [AppType::Claude, AppType::Gemini]
+        );
+    }
 
     #[test]
     fn no_code_keeps_app_alive_in_tray() {

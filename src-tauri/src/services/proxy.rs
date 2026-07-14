@@ -611,6 +611,42 @@ impl ProxyService {
         })
     }
 
+    /// 退役旧全局 Codex 接管；Profile 已拥有 Home 时只清状态，否则先安全恢复 Home。
+    pub async fn retire_legacy_codex_takeover(
+        &self,
+        profile_route_enabled: bool,
+    ) -> Result<(), String> {
+        let app = AppType::Codex;
+        let app_type = app.as_str();
+        let _guard = self.switch_locks.lock_for_app(app_type).await;
+        let config = self
+            .db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .map_err(|error| format!("读取旧 Codex 接管状态失败: {error}"))?;
+        let backup_exists = self
+            .db
+            .get_live_backup(app_type)
+            .await
+            .map_err(|error| format!("读取旧 Codex 接管备份失败: {error}"))?
+            .is_some();
+        let live_has_legacy_takeover = self.detect_takeover_in_live_config_for_app(&app);
+
+        if !config.enabled && !backup_exists && !live_has_legacy_takeover {
+            return Ok(());
+        }
+
+        if !profile_route_enabled {
+            self.restore_live_config_for_app_with_fallback_inner(&app)
+                .await?;
+        }
+
+        self.db
+            .retire_legacy_codex_proxy_state()
+            .await
+            .map_err(|error| format!("清理旧 Codex 接管状态失败: {error}"))
+    }
+
     /// 为指定应用开启/关闭 Live 接管
     ///
     /// - 开启：自动启动代理服务，仅接管当前 app 的 Live 配置
@@ -1896,6 +1932,45 @@ impl ProxyService {
         Ok(())
     }
 
+    /// 检测仍由旧全局代理管理的应用是否存在异常退出残留。
+    pub async fn has_global_proxy_crash_residue(&self) -> Result<bool, String> {
+        for app in Self::global_proxy_app_types() {
+            if self
+                .db
+                .get_live_backup(app.as_str())
+                .await
+                .map_err(|error| format!("检查 {} Live 备份失败: {error}", app.as_str()))?
+                .is_some()
+                || self.detect_takeover_in_live_config_for_app(&app)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// 恢复 Claude/Gemini 的旧全局接管残留，不读取或写入任何 Codex Home。
+    pub async fn recover_global_proxy_apps_from_crash(&self) -> Result<(), String> {
+        for app in Self::global_proxy_app_types() {
+            self.restore_live_config_for_app_with_fallback(&app).await?;
+            self.db
+                .delete_live_backup(app.as_str())
+                .await
+                .map_err(|error| format!("删除 {} Live 备份失败: {error}", app.as_str()))?;
+        }
+        self.db
+            .set_live_takeover_active(false)
+            .await
+            .map_err(|error| format!("清除旧全局代理接管状态失败: {error}"))?;
+        log::info!("已恢复 Claude/Gemini 的旧全局代理配置");
+        Ok(())
+    }
+
+    /// 返回仍使用旧全局代理生命周期的应用类型。
+    fn global_proxy_app_types() -> [AppType; 2] {
+        [AppType::Claude, AppType::Gemini]
+    }
+
     /// 检测 Live 配置是否处于"被接管"的残留状态
     ///
     /// 用于兜底处理：当数据库备份缺失但 Live 文件已经写成代理占位符时，
@@ -2307,12 +2382,15 @@ impl ProxyService {
             .next()
             .and_then(|value| value.trim_end_matches("/v1").parse::<u16>().ok())
             .unwrap_or(15_721);
-        crate::codex_profile::build_codex_profile_route_toml(
-            toml_str,
-            port,
-            provider,
+        let updated = crate::codex_profile::build_codex_route_toml_base(toml_str, port, provider);
+        if !crate::settings::preserve_codex_official_auth_on_switch() {
+            return updated;
+        }
+        crate::codex_config::set_codex_experimental_bearer_token(
+            &updated,
             crate::codex_profile::LEGACY_PROXY_MANAGED_TOKEN,
         )
+        .unwrap_or(updated)
     }
 
     fn attach_codex_model_catalog_from_provider(
@@ -2783,6 +2861,186 @@ mod tests {
     async fn running_codex_base_url(service: &ProxyService) -> String {
         let status = service.get_status().await.expect("get proxy status");
         format!("http://127.0.0.1:{}/v1", status.port)
+    }
+
+    /// Profile 已接管 Home 时，退役旧 Codex 状态不得改写 Home 或其它应用状态。
+    #[tokio::test]
+    #[serial]
+    async fn legacy_codex_takeover_retirement_preserves_profile_home_and_other_apps() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("初始化测试数据库"));
+        let service = ProxyService::new(db.clone());
+        let managed_live = json!({
+            "auth": {"OPENAI_API_KEY": "subscription-token"},
+            "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"profile-token\"\n"
+        });
+        service
+            .write_codex_live(&managed_live)
+            .expect("写入 Profile 管理的 Home");
+        let config_path = crate::codex_config::get_codex_config_path();
+        let home_before = std::fs::read(&config_path).expect("读取接管前 Home");
+
+        for app_type in ["claude", "codex", "gemini"] {
+            let mut config = db
+                .get_proxy_config_for_app(app_type)
+                .await
+                .expect("读取旧代理状态");
+            config.enabled = true;
+            db.update_proxy_config_for_app(config)
+                .await
+                .expect("写入旧代理状态");
+            db.save_live_backup(app_type, &format!(r#"{{"app":"{app_type}"}}"#))
+                .await
+                .expect("写入旧代理备份");
+        }
+
+        service
+            .retire_legacy_codex_takeover(true)
+            .await
+            .expect("退役旧 Codex 接管");
+
+        assert_eq!(
+            std::fs::read(&config_path).expect("重读 Profile Home"),
+            home_before
+        );
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await
+                .expect("读取 Codex 状态")
+                .enabled
+        );
+        assert!(db
+            .get_live_backup("codex")
+            .await
+            .expect("读取 Codex 备份")
+            .is_none());
+        for app_type in ["claude", "gemini"] {
+            assert!(
+                db.get_proxy_config_for_app(app_type)
+                    .await
+                    .expect("读取其它应用状态")
+                    .enabled
+            );
+            assert_eq!(
+                db.get_live_backup(app_type)
+                    .await
+                    .expect("读取其它应用备份")
+                    .expect("其它应用备份应保留")
+                    .original_config,
+                format!(r#"{{"app":"{app_type}"}}"#)
+            );
+        }
+    }
+
+    /// 没有 Profile 路由时，退役旧 Codex 接管必须先恢复原始 Home，并且可重复执行。
+    #[tokio::test]
+    #[serial]
+    async fn legacy_codex_takeover_retirement_restores_home_without_profile_route() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("初始化测试数据库"));
+        let service = ProxyService::new(db.clone());
+        let original_live = json!({
+            "auth": {"OPENAI_API_KEY": "original-key"},
+            "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"original-key\"\n"
+        });
+        let legacy_live = json!({
+            "auth": {"OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER},
+            "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"http://127.0.0.1:15721/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n"
+        });
+        service
+            .write_codex_live(&legacy_live)
+            .expect("写入旧接管 Home");
+        db.save_live_backup(
+            "codex",
+            &serde_json::to_string(&original_live).expect("编码原始 Home"),
+        )
+        .await
+        .expect("写入 Codex 备份");
+        let mut config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("读取 Codex 状态");
+        config.enabled = true;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("写入 Codex 状态");
+
+        service
+            .retire_legacy_codex_takeover(false)
+            .await
+            .expect("恢复并退役旧 Codex 接管");
+        service
+            .retire_legacy_codex_takeover(false)
+            .await
+            .expect("重复退役应为幂等操作");
+
+        assert_eq!(
+            service.read_codex_live().expect("读取已恢复 Home"),
+            original_live
+        );
+        assert!(
+            !db.get_proxy_config_for_app("codex")
+                .await
+                .expect("读取 Codex 状态")
+                .enabled
+        );
+        assert!(db
+            .get_live_backup("codex")
+            .await
+            .expect("读取 Codex 备份")
+            .is_none());
+    }
+
+    /// 旧全局代理的异常恢复只能处理 Claude/Gemini，不得改写 Profile 管理的 Codex Home。
+    #[tokio::test]
+    #[serial]
+    async fn global_proxy_crash_recovery_excludes_codex_profile_home() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().expect("初始化测试数据库"));
+        let service = ProxyService::new(db.clone());
+        let codex_live = json!({
+            "auth": {"OPENAI_API_KEY": "subscription-token"},
+            "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n"
+        });
+        service
+            .write_codex_live(&codex_live)
+            .expect("写入 Profile Home");
+        let codex_path = crate::codex_config::get_codex_config_path();
+        let codex_before = std::fs::read(&codex_path).expect("读取 Profile Home");
+        let claude_original = json!({"env": {"ANTHROPIC_AUTH_TOKEN": "original-key"}});
+        let claude_legacy = json!({"env": {"ANTHROPIC_AUTH_TOKEN": PROXY_TOKEN_PLACEHOLDER}});
+        service
+            .write_claude_live(&claude_legacy)
+            .expect("写入 Claude 旧接管配置");
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&claude_original).expect("编码 Claude 原配置"),
+        )
+        .await
+        .expect("写入 Claude 备份");
+
+        assert!(service
+            .has_global_proxy_crash_residue()
+            .await
+            .expect("检测旧代理残留"));
+        service
+            .recover_global_proxy_apps_from_crash()
+            .await
+            .expect("恢复旧全局代理应用");
+
+        assert_eq!(
+            std::fs::read(&codex_path).expect("重读 Profile Home"),
+            codex_before
+        );
+        assert_eq!(
+            service.read_claude_live().expect("读取已恢复 Claude"),
+            claude_original
+        );
+        assert!(db
+            .get_live_backup("claude")
+            .await
+            .expect("读取 Claude 备份")
+            .is_none());
     }
 
     fn seed_codex_model_template() {

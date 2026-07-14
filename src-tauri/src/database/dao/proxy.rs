@@ -313,6 +313,33 @@ impl Database {
         Ok(())
     }
 
+    /// 原子清理旧全局 Codex 接管标志与备份，不改动其它应用配置。
+    pub async fn retire_legacy_codex_proxy_state(&self) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let transaction = conn
+            .transaction()
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        transaction
+            .execute(
+                "UPDATE proxy_config
+                 SET enabled = 0,
+                     live_takeover_active = 0,
+                     updated_at = datetime('now')
+                 WHERE app_type = ?1",
+                [crate::app_config::AppType::Codex.as_str()],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM proxy_live_backup WHERE app_type = ?1",
+                [crate::app_config::AppType::Codex.as_str()],
+            )
+            .map_err(|error| AppError::Database(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| AppError::Database(error.to_string()))
+    }
+
     /// 确保指定 app_type 的 proxy_config 行存在（同步版本，用于 set_* 函数）
     ///
     /// 使用与 schema.rs seed 相同的 per-app 默认值
