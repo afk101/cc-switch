@@ -3,6 +3,8 @@ import type {
   CodexProfile,
   CodexProfileRef,
   CodexProfileState,
+  CreateCodexProfileInput,
+  UpdateCodexProfileInput,
 } from "@/types/codexProfile";
 
 /** Codex Profile 专用 Tauri 命令封装。 */
@@ -10,8 +12,19 @@ export const codexProfilesApi = {
   /** 获取全部可选 CODEX_HOME。 */
   list: (): Promise<CodexProfile[]> => invoke("list_codex_profiles"),
   /** 创建新的自定义 CODEX_HOME Profile。 */
-  create: (name: string, homePath: string): Promise<CodexProfile> =>
-    invoke("create_codex_profile", { name, homePath }),
+  create: (input: CreateCodexProfileInput): Promise<CodexProfile> =>
+    invoke("create_codex_profile", {
+      ...input,
+      listenPort: input.listenPort ?? null,
+    }),
+  /** 原子修改 Profile 的显示名称、CODEX_HOME 与监听端口。 */
+  update: (input: UpdateCodexProfileInput): Promise<CodexProfile> =>
+    invoke("update_codex_profile", {
+      profileId: input.profileId,
+      name: input.name,
+      homePath: input.homePath,
+      listenPort: input.listenPort,
+    }),
   /** 修改 Profile 显示名称。 */
   rename: (profileId: string, name: string): Promise<CodexProfile> =>
     invoke("rename_codex_profile", { profileId, name }),

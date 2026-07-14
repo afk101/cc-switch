@@ -1139,7 +1139,7 @@ function App() {
                           const homePath = window.prompt("CODEX_HOME 路径");
                           if (!name || !homePath) return;
                           void codexProfilesApi
-                            .create(name, homePath)
+                            .create({ name, homePath })
                             .then((profile) => {
                               selectCodexProfile(profile.id);
                               void refetchCodexProfiles();

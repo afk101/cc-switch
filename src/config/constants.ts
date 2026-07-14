@@ -16,3 +16,10 @@ export const TEMPLATE_TYPES = {
 } as const;
 
 export type TemplateType = (typeof TEMPLATE_TYPES)[keyof typeof TEMPLATE_TYPES];
+
+// 默认 Codex Profile 的稳定标识
+export const CODEX_DEFAULT_PROFILE_ID = "codex-default";
+
+// Codex Profile 可使用的监听端口范围
+export const CODEX_PROFILE_MIN_PORT = 1;
+export const CODEX_PROFILE_MAX_PORT = 65_535;
