@@ -306,6 +306,12 @@ impl ProxyServer {
     }
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
+        self.stop_with_timeout(std::time::Duration::from_secs(5))
+            .await
+    }
+
+    /// 请求停止并等待同一个服务器任务；超时不会丢弃 join handle。
+    async fn stop_with_timeout(&self, timeout: std::time::Duration) -> Result<(), ProxyError> {
         // 1. 首次停止发送关闭信号；之后必须继续等待同一个 join handle。
         if matches!(
             *self.profile_listener_state.read().await,
@@ -323,7 +329,7 @@ impl ProxyServer {
         // 2. 等待服务器任务结束（带 5 秒超时保护）
         let mut handle_guard = self.server_handle.write().await;
         if let Some(handle) = handle_guard.as_mut() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+            match tokio::time::timeout(timeout, handle).await {
                 Ok(Ok(())) => {
                     handle_guard.take();
                     *self.profile_listener_state.write().await = ProfileListenerState::Stopped;
@@ -701,6 +707,42 @@ mod tests {
             !server
                 .wait_for_profile_drain(std::time::Duration::from_millis(10))
                 .await
+        );
+    }
+
+    /// 停止超时后必须保留同一 join handle，第二次停止可完成。
+    #[tokio::test]
+    async fn profile_stop_timeout_keeps_join_handle_for_retry() {
+        let server = ProxyServer::new(
+            ProxyConfig::default(),
+            Arc::new(Database::memory().expect("内存数据库")),
+            None,
+        );
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let task_release = release.clone();
+        *server.shutdown_tx.write().await = Some(shutdown_tx);
+        *server.server_handle.write().await = Some(tokio::spawn(async move {
+            task_release.notified().await;
+        }));
+        *server.profile_listener_state.write().await = ProfileListenerState::Running;
+
+        assert!(matches!(
+            server.stop_with_timeout(std::time::Duration::ZERO).await,
+            Err(ProxyError::StopTimeout)
+        ));
+        assert_eq!(
+            server.profile_listener_state().await,
+            ProfileListenerState::StopRequested
+        );
+        release.notify_waiters();
+        assert!(server
+            .stop_with_timeout(std::time::Duration::from_secs(1))
+            .await
+            .is_ok());
+        assert_eq!(
+            server.profile_listener_state().await,
+            ProfileListenerState::Stopped
         );
     }
 
