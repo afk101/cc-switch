@@ -138,6 +138,7 @@
 - 最终 `pnpm run dev:dump` 进程上，Home token 与 listener token 再次确认均为 43 字节且哈希相同，使用 Home token 调用 `/v1/models` 返回 200 和 `{"models":[]}`。自定义 Home 配置 SHA-256/mtime 仍为 `98b84532...8350`/`1784028774`，默认 Home 配置 SHA-256 仍为 `15afa106...a764`；数据库仍是默认关闭、自定义开启且均无 error/recovery，旧 backup 为 0，实际监听仅有 Vite 13000 与 Profile 15722。
 - 保持最终 dev 服务运行时重新执行完成前全量测试：Rust library 共 1846 项，1844 通过、0 失败、2 忽略；前端使用单 worker 稳定调度，共 70 个测试文件、434 个测试全部通过。测试输出中的 MSW/React/Tauri stderr 均来自现有错误分支或测试环境告警，命令最终退出码均为 0。
 - 完成审计的 TypeScript 类型检查、Rustfmt、三份设计文档及受影响前端文件的 Prettier、`git diff --check` 均以退出码 0 通过。最终服务进程仍是 `pnpm run dev:dump`，监听保持为 13000/15722，没有 15721/15723 或临时 debug bundle 进程残留。
+- 第一次提交后综合审计把多个“应监听/不应监听”端口合并给一个 `lsof`，业务值全部正确但命令因未监听端口返回 1；改为逐端口正反断言后，最终审计以退出码 0 通过：工作区干净、计划无未完成步骤、15722 正在监听、15721/15723 未监听、当前选择为 `codex-api`、token 哈希一致、`/v1/models` 为 200，数据库组合状态精确为 `默认关闭|自定义开启|0 错误恢复|0 旧 backup|0 验收请求残留`。
 
 ## 资源
 
