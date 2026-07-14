@@ -16,14 +16,18 @@
 - Create: `src-tauri/src/codex_profile/route_manager.rs`
 - Modify: `src-tauri/src/store.rs`
 - Modify: `src-tauri/src/services/proxy.rs`
+- Modify: `src-tauri/src/proxy/server.rs`
+- Modify: `src-tauri/src/codex_profile/route_runtime.rs`
+- Modify: `src-tauri/src/database/schema.rs`
+- Modify: `src-tauri/src/database/dao/codex_profiles.rs`
 - Test: `src-tauri/src/codex_profile/route_manager.rs`
 
 - [ ] **Step 1: 写入失败的 lifecycle 测试**
 
 ```rust
 #[tokio::test]
-async fn switching_profile_a_does_not_change_profile_b_snapshot() {
-    // 使用两个 fake runtime；切换 A 后断言 B 的 provider 与 port 不变。
+async fn stop_timeout_keeps_the_same_listener_retriable() {
+    // fake listener 第一次 stop 返回 timeout；第二次 stop 必须等待同一 join handle 并变为 Stopped。
 }
 ```
 
@@ -33,13 +37,22 @@ Run: `cargo test codex_route_manager --lib`
 
 Expected: FAIL，因为 `CodexRouteManager` 尚不存在。
 
-- [ ] **Step 3: 实现按 `profile_id` 锁定的 manager**
+- [ ] **Step 3: 定义可恢复的 route 补偿记录与迁移**
 
-实现 `enable`、`switch_provider`、`disable`、`delete_custom_profile` 和 `restore_enabled_profiles`；每个操作调用既有 `RouteRuntime`、Home config service 与 secret store，失败按反向顺序回滚。
+为 route 增加补偿记录字段，内容只包含旧/新 provider、failover、阶段和无敏感错误摘要；新增兼容迁移与 DAO 读写。禁止存 token、Home 配置正文或 auth 内容。
 
-- [ ] **Step 4: 验证并提交**
+- [ ] **Step 4: 实现幂等 listener stop 和无丢通知 drain**
 
-Run: `cargo test codex_route_manager --lib && cargo test services::proxy --lib`
+`ProxyServer::stop` 在 timeout 后保留 shutdown sender 与 join handle，后续调用继续等待；只有 join handle 完成后才清空。Profile drain 在 waiter 注册后重新检查 in-flight，使用 deadline 循环等待归零或 timeout。
+
+- [ ] **Step 5: 实现同锁生命周期与补偿恢复**
+
+实现 `enable`、`switch_provider`、`disable`、`delete_custom_profile`、`restore_enabled_profiles`。所有入口先取得同一 `profile_id` 锁；若存在未完成补偿，先恢复再执行新请求。switch 将 runtime 和 DB 状态按补偿记录收敛；delete 在同一锁内 disable、删除 token、删除 DB，任一步失败不推进后续步骤。
+
+
+- [ ] **Step 6: 验证并提交**
+
+Run: `cargo test codex_route_manager --lib && cargo test profile_drain --lib && cargo test services::proxy --lib && cargo test database --lib`
 
 Commit: `feat(codex): manage profile route lifecycle`
 

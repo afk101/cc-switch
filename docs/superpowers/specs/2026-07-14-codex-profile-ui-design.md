@@ -36,6 +36,14 @@ Codex 页面加载 Profile 列表后，从 `selected_codex_profile_id` 恢复选
 
 此 UI 依赖独立 `RouteRuntime` 和 `CodexRouteManager` 完成启动、切换、停用、删除的事务与回滚；若运行时尚未可用，UI 显示明确错误，不得静默回退旧全局代理接口。
 
+### 路由生命周期一致性
+
+每个 Profile 只有一把生命周期锁，startup restore、enable、switch、disable 和 delete 都必须在该锁内执行。`ProxyServer` 对 Profile listener 暴露可观察状态：`Running`、`StopRequested`、`Stopped`、`StopFailed`。发送 shutdown 后若等待超时，必须保留 join handle 和停止请求；后续 `stop()` 继续等待同一 handle，而不是返回不可重试的 `NotRunning`。
+
+route 持久化增加仅供恢复的补偿记录：保存“原 route/failover 快照、目标 route/failover 快照、当前阶段、无敏感信息的错误摘要”。switch 在 runtime 切至目标快照后才推进持久化阶段；任何阶段失败都按该记录恢复。若本次无法恢复，保留补偿记录和 `last_error`，下一次对该 Profile 的生命周期操作先完成补偿，再拒绝新 mutation。UI 将此状态显示为错误，绝不把旧 Profile 的状态带给新选择的 Home。
+
+drain 必须先拒绝新请求，再以条件循环等待 Profile in-flight 归零。等待器注册后立即重新读取计数；达到 timeout 时保留可观察停止状态并返回超时错误，不丢弃后续可重试句柄。
+
 ## 验收标准
 
 - `pnpm run dev:dump` 的 Codex 页可见 Home 上下文栏和“管理 Home”入口。
@@ -44,3 +52,4 @@ Codex 页面加载 Profile 列表后，从 `selected_codex_profile_id` 恢复选
 - 自定义 Profile 删除确认不承诺也不执行文件删除。
 - 同一供应商可被 A、B 路由引用；切换 A 的供应商不改变 B。
 - 前端测试覆盖查询键隔离、切换时无陈旧状态、管理规则和确认文案；Rust 命令测试覆盖每个 mutation 的 `profileId` 作用域。
+- Rust 生命周期测试覆盖 stop timeout 后重试、route 写入失败后补偿恢复、启动恢复与 delete 并发、以及 drain 最后请求完成恰好发生在 waiter 注册前的竞态。
