@@ -179,9 +179,15 @@ describe("App integration with MSW", () => {
         "codex-1",
       ),
     );
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-1",
+      ),
+    );
 
     fireEvent.click(screen.getByText("usage"));
     expect(screen.getByTestId("usage-modal")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-provider")).toHaveTextContent("codex-1");
     fireEvent.click(screen.getByText("save-script"));
     fireEvent.click(screen.getByText("close-usage"));
 
@@ -204,6 +210,9 @@ describe("App integration with MSW", () => {
     );
 
     fireEvent.click(screen.getByText("switch"));
+    await waitFor(() =>
+      expect(screen.getByText(/路由已启用/)).toBeInTheDocument(),
+    );
     fireEvent.click(screen.getByText("duplicate"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toMatch(/copy/),

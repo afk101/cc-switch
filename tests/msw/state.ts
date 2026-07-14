@@ -1,4 +1,5 @@
 import type { AppId } from "@/lib/api/types";
+import { CODEX_DEFAULT_PROFILE_ID } from "@/config/constants";
 import type {
   McpServer,
   Provider,
@@ -6,11 +7,13 @@ import type {
   SessionMeta,
   Settings,
 } from "@/types";
+import type { CodexProfile, CodexProfileState } from "@/types/codexProfile";
 import { deepClone } from "@/utils/deepClone";
 
 type ProvidersByApp = Record<AppId, Record<string, Provider>>;
 type CurrentProviderState = Record<AppId, string>;
 type McpConfigState = Record<AppId, Record<string, McpServer>>;
+type CodexProfileStateById = Record<string, CodexProfileState>;
 type LiveProviderIdsByApp = Record<
   "opencode" | "openclaw" | "hermes",
   string[]
@@ -84,6 +87,34 @@ const createDefaultCurrent = (): CurrentProviderState => ({
   hermes: "",
 });
 
+/** 创建 App 集成测试使用的默认 Codex Profile 状态。 */
+const createDefaultCodexProfileStates = (): CodexProfileStateById => {
+  const now = Date.now();
+  const profile: CodexProfile = {
+    id: CODEX_DEFAULT_PROFILE_ID,
+    name: "默认 Codex",
+    canonicalHomePath: "/default/codex",
+    listenPort: 15_721,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  return {
+    [CODEX_DEFAULT_PROFILE_ID]: {
+      profile,
+      route: {
+        profileId: CODEX_DEFAULT_PROFILE_ID,
+        currentProviderId: "codex-1",
+        enabled: false,
+        lastError: null,
+        recoveryJson: null,
+        updatedAt: now,
+      },
+      runtimeStatus: "stopped",
+    },
+  };
+};
+
 let providers = createDefaultProviders();
 let current = createDefaultCurrent();
 let liveProviderIds: LiveProviderIdsByApp = {
@@ -97,6 +128,7 @@ let settingsState: Settings = {
   enableClaudePluginIntegration: false,
   claudeConfigDir: "/default/claude",
   codexConfigDir: "/default/codex",
+  selectedCodexProfileId: CODEX_DEFAULT_PROFILE_ID,
   language: "zh",
 };
 let appConfigDirOverride: string | null = null;
@@ -150,6 +182,7 @@ const createDefaultSessionMessages = (): Record<string, SessionMessage[]> => ({
 
 let sessionsState = createDefaultSessions();
 let sessionMessagesState = createDefaultSessionMessages();
+let codexProfileStates = createDefaultCodexProfileStates();
 let mcpConfigs: McpConfigState = {
   claude: {
     sample: {
@@ -209,12 +242,14 @@ export const resetProviderState = () => {
   };
   sessionsState = createDefaultSessions();
   sessionMessagesState = createDefaultSessionMessages();
+  codexProfileStates = createDefaultCodexProfileStates();
   settingsState = {
     showInTray: true,
     minimizeToTrayOnClose: true,
     enableClaudePluginIntegration: false,
     claudeConfigDir: "/default/claude",
     codexConfigDir: "/default/codex",
+    selectedCodexProfileId: CODEX_DEFAULT_PROFILE_ID,
     language: "zh",
   };
   appConfigDirOverride = null;
@@ -263,6 +298,32 @@ export const resetProviderState = () => {
     openclaw: {},
     hermes: {},
   };
+};
+
+/** 返回全部 Codex Profile 的隔离副本。 */
+export const getCodexProfiles = (): CodexProfile[] =>
+  Object.values(deepClone(codexProfileStates)).map(({ profile }) => profile);
+
+/** 返回指定 Codex Profile 的隔离状态副本。 */
+export const getCodexProfileState = (
+  profileId: string,
+): CodexProfileState | null => {
+  const state = codexProfileStates[profileId];
+  return state ? deepClone(state) : null;
+};
+
+/** 更新指定 Codex Profile 的路由供应商与启用状态。 */
+export const setCodexProfileRoute = (
+  profileId: string,
+  providerId: string,
+  enabled: boolean,
+): boolean => {
+  const state = codexProfileStates[profileId];
+  if (!state?.route) return false;
+  state.route.currentProviderId = providerId;
+  state.route.enabled = enabled;
+  state.route.updatedAt = Date.now();
+  return true;
 };
 
 export const getProviders = (appType: AppId) =>

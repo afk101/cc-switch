@@ -5,6 +5,8 @@ import {
   addProvider,
   deleteProvider,
   deleteSession,
+  getCodexProfiles,
+  getCodexProfileState,
   getCurrentProviderId,
   getLiveProviderIds,
   getSessionMessages,
@@ -13,6 +15,7 @@ import {
   listSessions,
   resetProviderState,
   setCurrentProviderId,
+  setCodexProfileRoute,
   updateProvider,
   updateSortOrder,
   getSettings,
@@ -39,6 +42,19 @@ const withJson = async <T>(request: Request): Promise<T> => {
 
 const success = <T>(payload: T) => HttpResponse.json(payload as any);
 
+/** 校验请求并更新 Codex Profile 的路由测试状态。 */
+const handleCodexProfileRouteUpdate = async (request: Request) => {
+  const { profileId, providerId } = await withJson<{
+    profileId: string;
+    providerId: string;
+  }>(request);
+  const providerExists = Boolean(getProviders("codex")[providerId]);
+  if (!providerExists || !setCodexProfileRoute(profileId, providerId, true)) {
+    return HttpResponse.json(false, { status: 404 });
+  }
+  return success(true);
+};
+
 export const handlers = [
   http.post(`${TAURI_ENDPOINT}/get_migration_result`, () => success(false)),
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
@@ -53,6 +69,27 @@ export const handlers = [
     const { app } = await withJson<{ app: AppId }>(request);
     return success(getCurrentProviderId(app));
   }),
+
+  http.post(`${TAURI_ENDPOINT}/list_codex_profiles`, () =>
+    success(getCodexProfiles()),
+  ),
+
+  http.post(
+    `${TAURI_ENDPOINT}/get_codex_profile_state`,
+    async ({ request }) => {
+      const { profileId } = await withJson<{ profileId: string }>(request);
+      const state = getCodexProfileState(profileId);
+      return state ? success(state) : HttpResponse.json(false, { status: 404 });
+    },
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/enable_codex_profile_route`, ({ request }) =>
+    handleCodexProfileRouteUpdate(request),
+  ),
+
+  http.post(`${TAURI_ENDPOINT}/switch_codex_profile_provider`, ({ request }) =>
+    handleCodexProfileRouteUpdate(request),
+  ),
 
   http.post(
     `${TAURI_ENDPOINT}/update_providers_sort_order`,
