@@ -651,9 +651,9 @@ impl CodexRouteManager {
     fn safe_error_summary(error: &str) -> String {
         let lower = error.to_ascii_lowercase();
         if lower.contains("token") || lower.contains("auth") || error.contains('/') || error.contains('\\') {
-            "Codex Profile 生命周期步骤失败（敏感细节已省略）".to_string()
+            "CODEX_PROFILE_OPERATION_SENSITIVE_FAILURE".to_string()
         } else {
-            error.chars().take(160).collect()
+            "CODEX_PROFILE_OPERATION_FAILURE".to_string()
         }
     }
 
@@ -708,6 +708,9 @@ impl CodexRouteManager {
         };
         let recovery: RouteRecoveryRecord = serde_json::from_str(&recovery_json).map_err(|_| {
             AppError::InvalidInput("Codex Profile 路由补偿记录无效，拒绝继续变更".to_string())
+        })?;
+        self.validate_recovery_record(&recovery).map_err(|_| {
+            AppError::InvalidInput("Codex Profile 路由补偿记录非法，拒绝继续变更".to_string())
         })?;
         if recovery.operation == "enable" {
             return Err(AppError::InvalidInput(
@@ -769,6 +772,27 @@ impl CodexRouteManager {
         restored.last_error = None;
         restored.updated_at = Utc::now().timestamp_millis();
         self.persistence.save_route(&restored)
+    }
+
+    /// 校验恢复操作及阶段的合法组合；未知组合绝不允许执行副作用。
+    fn validate_recovery_record(&self, recovery: &RouteRecoveryRecord) -> Result<(), AppError> {
+        let valid = matches!(
+            (recovery.operation.as_str(), recovery.phase.as_str()),
+            ("enable", CODEX_ROUTE_RECOVERY_PHASE_PREPARED)
+                | ("enable", CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED)
+                | ("enable", CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED)
+                | ("enable", CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED)
+                | ("disable", CODEX_ROUTE_RECOVERY_PHASE_PREPARED)
+                | ("disable", CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED)
+                | ("disable", CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED)
+                | ("delete", CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING)
+                | ("delete", CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED)
+                | ("switch", CODEX_ROUTE_RECOVERY_PHASE_PREPARED)
+                | ("switch", CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED)
+                | ("switch", CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED)
+                | ("switch", CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED)
+        );
+        if valid { Ok(()) } else { Err(AppError::InvalidInput("非法恢复操作".to_string())) }
     }
 
     /// 将失败切换收敛回旧的运行时和持久化快照；无法收敛时保留补偿记录。
@@ -1461,7 +1485,7 @@ mod codex_route_manager {
         ).expect("操作 JSON");
         assert_eq!(recovery["operation"], "enable");
         assert_eq!(recovery["phase"], CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED);
-        assert!(recovery["last_error"].as_str().is_some_and(|error| error.contains("停止失败")));
+        assert_eq!(recovery["last_error"], "CODEX_PROFILE_OPERATION_FAILURE");
         assert!(manager.switch_provider("profile-a", "provider-a", vec![]).await.is_err());
         Ok(())
     }
@@ -1512,7 +1536,7 @@ mod codex_route_manager {
         ).expect("操作 JSON");
         assert_eq!(recovery["operation"], "enable");
         assert_eq!(recovery["phase"], CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED);
-        assert!(recovery["last_error"].as_str().is_some_and(|error| error.contains("停止失败")));
+        assert_eq!(recovery["last_error"], "CODEX_PROFILE_OPERATION_FAILURE");
         assert!(manager.disable("profile-a").await.is_err());
         Ok(())
     }
