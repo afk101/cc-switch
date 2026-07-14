@@ -127,3 +127,45 @@
 - 过程根因：实施计划与组件测试只覆盖默认 Profile 的端口/删除/重绑规则，没有覆盖“点击新建 → 显示名称/Home/端口表单 → 提交创建”的完整用户行为，因此不完整实现仍能通过全部既有测试。
 - 排除项：按钮点击事件正常；后端创建命令和数据库尚未被调用；Browserslist 过期提示与 macOS 输入法告警不是本问题原因。
 - 清理结果：临时诊断测试已移除；当前工作区除本 findings 文件外没有新增未提交代码，`git diff --check` 通过。
+
+## 实施后全量测试回归调查（2026-07-14）
+
+- 实施计划 Task 5 的全量前端验证使用 `pnpm exec vitest run --reporter=dot` 稳定复现 1 个失败：`tests/integration/App.test.tsx:184` 点击 `usage` 后找不到 `usage-modal`；同次运行其余 422 个测试通过。
+- 失败发生在切换到 Codex 之后的既有供应商用量弹窗链路，断言前没有异步等待；失败页面仍显示 Codex 供应商列表与 Profile 上下文栏，说明 App 没有整体崩溃。
+- 最近影响 App 的提交 `25bd994d` 只将 Profile 管理回调替换为 `useCodexProfileManagement` 的 `createProfile/updateProfile/deleteProfile/loadProfileState`，没有直接修改用量弹窗组件或 `onConfigureUsage` 回调。
+- 当前待验证假设：新增 Profile 状态加载改变了 Codex 页面异步渲染时序，使集成测试在 ProviderList 已更新但相关 Provider 数据尚未稳定时同步点击；也可能是 ProviderList mock 通过 `providers[currentProviderId]` 取值，而 Codex Profile 选择引入了不同的当前供应商标识。下一步将从 `onConfigureUsage` 的入参和 App 用量弹窗状态反向追踪，先确认断点再讨论修复。
+- 单文件复现同样稳定失败，并额外暴露 MSW 未处理的 `POST http://tauri.local/list_codex_profiles`；测试夹具没有为 App 新增的 Profile 查询提供响应。
+- App 在 Codex 页面传给 `ProviderList.currentProviderId` 的值来自 `codexProfileState?.route?.currentProviderId ?? ""`，而集成测试的 ProviderList mock 再用该值执行 `providers[currentProviderId]`。Profile 查询无响应时该标识为空，点击 `usage` 实际调用 `setUsageProvider(undefined)`，因此 `effectiveUsageProvider` 仍为空，`UsageScriptModal` 按设计不会渲染。
+- 由此排除“用量弹窗状态本身失效”和“点击事件未触发”；断点位于旧集成测试夹具没有跟随 Codex Profile 上下文数据源迁移，而非本次 Profile 管理 Dialog 回调接线直接破坏用量功能。下一步检查 MSW Tauri handlers 与引入 Profile 上下文的历史提交，确认应补夹具还是产品代码存在兼容缺口。
+- `tests/msw/handlers.ts` 覆盖供应商、设置、MCP 等 Tauri 命令，但没有 `list_codex_profiles` 或 `get_codex_profile_state` handler；这与复现时唯一新增的 MSW 未处理请求完全对应。
+- Git 历史确认 Codex Profile 上下文和 `currentProviderId` 数据源切换来自更早的提交 `0e2fd337 feat(codex): add home profile context UI`；本次 Profile 管理修复提交 `25bd994d` 没有改动 ProviderList 的 `currentProviderId` 或用量弹窗状态链路。
+- 可工作的对照模式是 MSW 为 App 启动时每个必需 Tauri 查询提供确定响应，并由 `resetProviderState()` 在每个测试前恢复状态。Codex Profile 查询是该模式中唯一缺失的新数据源。
+- 历史提交 `0e2fd337` 同时引入 Profile 查询和 Codex `currentProviderId` 数据源切换，却没有修改 `tests/integration/App.test.tsx` 或 `tests/msw/handlers.ts`；提交前后的集成测试片段完全相同。
+- 根本原因已确认：该历史提交造成测试夹具与产品数据模型不同步。测试仍假设 Codex 当前供应商来自全局 `get_current_provider`，实际产品已改为来自选中 Profile 的 `get_codex_profile_state.route.currentProviderId`。缺少 Profile handlers 导致 mock 把空 ID 映射成 `undefined`，用量弹窗断言因此失败。
+- 影响边界：这是既有全量测试债务，不是本次 Dialog 实现的产品运行时回归；真实 Tauri 验收中 Profile 状态由后端正常返回。修复应让 App 集成夹具提供默认 Profile 及其路由状态，并验证请求使用选中 Profile 的供应商，不应在产品代码中回退到全局供应商，否则会破坏多 Home 路由隔离语义。
+- 等待根因确认期间完成了不依赖修复方案的后端全量验证：`cargo test --lib` 结果为 1827 通过、0 失败、2 忽略。
+- 对实施计划全部显式验收项的审计显示，Task 1–4、Task 5 的目标测试、类型/格式/编译检查、无 prompt 守卫和 10 项真实 macOS 验收均已有证据；当前剩余项是修复并重新通过前端全量集成测试、重新取得最终工作区干净证据以及完成最终提交审计。
+
+## 集成夹具修复 Brainstorming
+
+- 用户已确认根本原因，并授权后续方案、设计和执行均采用推荐方案，不再逐项询问。
+- 方案一（推荐）：在 `tests/msw/state.ts` 建立可重置的默认 Codex Profile/路由快照，在 `tests/msw/handlers.ts` 补齐列表、状态、启用路由和切换供应商命令；App 集成测试等待 Profile 当前供应商为 `codex-1` 后再操作。优点是忠实覆盖生产数据源与路由切换；新增状态仅用于测试，边界清晰。
+- 方案二：只在 `tests/integration/App.test.tsx` 使用 `server.use` 临时注册两个查询 handler。改动更少，但其他 App 集成用例仍产生未处理请求，且无法覆盖后续 `enable_codex_profile_route`，测试模型会继续不完整。
+- 方案三：产品代码在 Profile 状态为空时回退 `get_current_provider`。表面可让旧测试通过，但会把全局供应商状态重新混入 Profile 作用域，违反多 `CODEX_HOME` 独立路由与请求不串流的核心约束，因此明确否决。
+
+| 技术决策                             | 理由                                                                                                                   |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| 采用共享 MSW Profile 状态模型        | App 集成测试的共享启动夹具应覆盖所有必需 Tauri 查询，并能在每个测试前恢复确定状态                                      |
+| 默认 Profile ID 使用 `codex-default` | 与 Rust 和前端常量一致，避免再次产生测试专用伪 ID                                                                      |
+| Profile 路由初始供应商设为 `codex-1` | 保持既有供应商夹具语义，同时验证 App 读取 Profile 路由而非全局 current provider                                        |
+| Profile 路由命令更新测试状态         | 集成测试后续点击供应商会调用 `enable_codex_profile_route` 或 `switch_codex_profile_provider`，夹具必须覆盖完整用户链路 |
+| 测试先等待 `current-provider` 稳定   | Provider 列表加载与 Profile 状态加载是两个独立异步查询，断言应等待真正的交互前置条件                                   |
+
+### 设计摘要
+
+- 数据边界：`tests/msw/state.ts` 只负责创建、克隆、读取和更新 Codex Profile 测试状态；`handlers.ts` 只负责把 Tauri 命令映射到这些状态函数；`App.test.tsx` 只表达用户路径和可见结果。
+- 错误语义：未知 Profile 或未知供应商返回 404，防止夹具把错误输入静默当成功；成功启用/切换后返回 `true` 并更新目标 Profile 的路由快照。
+- 回归范围：先让现有 App 集成用例稳定复现 RED，再实现夹具；验证单文件、前端全量、类型、格式、Rust 全量，以及最终 `pnpm run dev:dump` + Computer Use 真实路径。
+- 规范自审确认 `CodexHomeContextBar` 的真实可见文案正是“路由已启用/路由未启用”，因此计划中的 UI 断言可直接验证 Profile 状态刷新，不依赖测试专用标识。
+- 自审发现 focused Plan 的最后提交步骤重复暂存应在 brainstorming 阶段先提交的文档，并可能要求空提交；已调整为文档先独立提交、实现提交后只检查剩余差异，存在未提交的本任务变更时才创建补充提交。
+- 自审发现状态函数示例只在文字中要求 JSDoc、代码块未展示注释；已在 Plan 示例中补齐中文 JSDoc，保证零背景实施者也能遵守项目规则。
