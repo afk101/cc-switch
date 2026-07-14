@@ -149,10 +149,12 @@ impl CodexRouteManager {
             .get_route(profile_id)?
             .unwrap_or_else(|| Self::empty_route(&profile.id));
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
+        let token = self.secret_store.ensure_token(profile_id)?;
         let plan = self.home_config.build_profile_route_plan(
             std::path::Path::new(&profile.canonical_home_path),
             profile.listen_port,
             self.persistence.get_provider(provider_id)?.as_ref(),
+            &token,
         )?;
         let target_snapshot = RouteRecoverySnapshot {
             current_provider_id: Some(provider_id.to_string()),
@@ -170,7 +172,6 @@ impl CodexRouteManager {
             CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
             None,
         )?;
-        let token = self.secret_store.ensure_token(profile_id)?;
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
                 profile_id: profile.id.clone(),
@@ -1366,6 +1367,69 @@ mod codex_route_manager {
             self.deleted.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// 启用 Profile 路由时，Home 与监听器必须使用同一份本地凭证，关闭后恢复原配置。
+    #[tokio::test]
+    async fn enabling_projects_profile_listener_token_and_disable_restores_home(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let original_config = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://example.com/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        fs::write(codex_config_path_for_home(home.path()), original_config).expect("写入原始配置");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-a", vec![]).await?;
+
+        let routed_config =
+            fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取路由配置");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&routed_config).as_deref(),
+            Some("test-local-token")
+        );
+
+        manager.disable("profile-a").await?;
+        assert_eq!(
+            fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取恢复配置"),
+            original_config
+        );
+        Ok(())
     }
 
     /// 停止失败的运行时替身，用于验证关闭补偿记录。

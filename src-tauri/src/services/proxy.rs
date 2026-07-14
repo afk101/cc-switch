@@ -2307,7 +2307,12 @@ impl ProxyService {
             .next()
             .and_then(|value| value.trim_end_matches("/v1").parse::<u16>().ok())
             .unwrap_or(15_721);
-        crate::codex_profile::build_codex_profile_route_toml(toml_str, port, provider)
+        crate::codex_profile::build_codex_profile_route_toml(
+            toml_str,
+            port,
+            provider,
+            crate::codex_profile::LEGACY_PROXY_MANAGED_TOKEN,
+        )
     }
 
     fn attach_codex_model_catalog_from_provider(

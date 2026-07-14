@@ -117,6 +117,7 @@ impl CodexHomeConfigService {
         home: &Path,
         listen_port: u16,
         provider: Option<&Provider>,
+        listener_token: &str,
     ) -> Result<CodexRouteConfigPlan, AppError> {
         let current = self.inspect(home)?;
         let current_toml = current
@@ -128,7 +129,7 @@ impl CodexHomeConfigService {
             .unwrap_or("");
         self.build_route_plan(
             home,
-            &build_codex_profile_route_toml(current_toml, listen_port, provider),
+            &build_codex_profile_route_toml(current_toml, listen_port, provider, listener_token),
         )
     }
 
@@ -184,6 +185,7 @@ pub fn build_codex_profile_route_toml(
     toml_str: &str,
     listen_port: u16,
     provider: Option<&Provider>,
+    listener_token: &str,
 ) -> String {
     let proxy_url = format!("http://127.0.0.1:{listen_port}/v1");
     let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", &proxy_url)
@@ -198,7 +200,8 @@ pub fn build_codex_profile_route_toml(
         updated = crate::codex_config::update_codex_toml_field(&updated, "model", &upstream_model)
             .unwrap_or(updated);
     }
-    updated
+    crate::codex_config::set_codex_experimental_bearer_token(&updated, listener_token)
+        .unwrap_or(updated)
 }
 
 /// 从计划的 Home 重派生配置路径，并拒绝任何不一致的内部数据。
@@ -269,6 +272,71 @@ mod codex_home_config {
         fn remove_file(&self, _path: &Path) -> Result<(), AppError> {
             Ok(())
         }
+    }
+
+    /// Profile 路由配置必须用 listener token 替换旧全局占位符。
+    #[test]
+    fn profile_route_config_replaces_proxy_managed_with_listener_token() {
+        let input = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+
+        let updated = build_codex_profile_route_toml(input, 15_722, None, "profile-listener-token");
+
+        assert_eq!(
+            crate::codex_config::extract_codex_experimental_bearer_token(&updated).as_deref(),
+            Some("profile-listener-token")
+        );
+        assert!(!updated.contains("PROXY_MANAGED"));
+        assert!(updated.contains("http://127.0.0.1:15722/v1"));
+    }
+
+    /// 应用 Profile token 时只能改写显式 Home 的 config.toml。
+    #[test]
+    fn profile_route_plan_writes_token_only_to_explicit_home() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let home_a = temp_dir.path().join("home-a");
+        let home_b = temp_dir.path().join("home-b");
+        fs::create_dir_all(&home_a).expect("创建 A Home");
+        fs::create_dir_all(&home_b).expect("创建 B Home");
+        let config = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n";
+        fs::write(codex_config_path_for_home(&home_a), config).expect("写入 A 配置");
+        fs::write(codex_config_path_for_home(&home_b), config).expect("写入 B 配置");
+        fs::write(codex_auth_path_for_home(&home_a), b"{\"token\":\"a\"}").expect("写入 A 认证");
+        fs::write(codex_auth_path_for_home(&home_b), b"{\"token\":\"b\"}").expect("写入 B 认证");
+        let config_b_before = fs::read(codex_config_path_for_home(&home_b)).expect("读取 B 配置");
+        let auth_a_before = fs::read(codex_auth_path_for_home(&home_a)).expect("读取 A 认证");
+        let auth_b_before = fs::read(codex_auth_path_for_home(&home_b)).expect("读取 B 认证");
+        let service = CodexHomeConfigService::system();
+
+        let plan =
+            service.build_profile_route_plan(&home_a, 15_722, None, "profile-listener-token")?;
+        service.apply_route_plan(&plan)?;
+
+        let config_a =
+            fs::read_to_string(codex_config_path_for_home(&home_a)).expect("读取 A 配置");
+        assert_eq!(
+            crate::codex_config::extract_codex_experimental_bearer_token(&config_a).as_deref(),
+            Some("profile-listener-token")
+        );
+        assert_eq!(
+            fs::read(codex_config_path_for_home(&home_b)).expect("重读 B 配置"),
+            config_b_before
+        );
+        assert_eq!(
+            fs::read(codex_auth_path_for_home(&home_a)).expect("重读 A 认证"),
+            auth_a_before
+        );
+        assert_eq!(
+            fs::read(codex_auth_path_for_home(&home_b)).expect("重读 B 认证"),
+            auth_b_before
+        );
+        Ok(())
     }
 
     /// 路由配置只能写入显式指定的 Home，且不得触碰任何认证文件。

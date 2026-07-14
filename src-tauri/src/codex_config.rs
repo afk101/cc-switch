@@ -1212,7 +1212,10 @@ pub fn extract_codex_experimental_bearer_token(config_text: &str) -> Option<Stri
         .map(str::to_string)
 }
 
-fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result<String, AppError> {
+pub(crate) fn set_codex_experimental_bearer_token(
+    config_text: &str,
+    token: &str,
+) -> Result<String, AppError> {
     if config_text.trim().is_empty() {
         return Err(AppError::localized(
             "provider.codex.config.missing",
