@@ -65,6 +65,20 @@ pub fn delete_provider(
     id: String,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if app_type == AppType::Codex {
+        let refs = state
+            .db
+            .list_codex_provider_profile_refs(&id)
+            .map_err(|error| error.to_string())?;
+        if !refs.is_empty() {
+            let profiles = refs
+                .into_iter()
+                .map(|profile| format!("{} ({})", profile.name, profile.id))
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(format!("Codex 供应商仍被以下 Profile 引用: {profiles}"));
+        }
+    }
     ProviderService::delete(state.inner(), app_type, &id)
         .map(|_| true)
         .map_err(|e| e.to_string())
@@ -87,6 +101,11 @@ fn switch_provider_internal(
     app_type: AppType,
     id: &str,
 ) -> Result<SwitchResult, AppError> {
+    if app_type == AppType::Codex {
+        return Err(AppError::InvalidInput(
+            "Codex 供应商切换必须指定 Codex Profile".to_string(),
+        ));
+    }
     ProviderService::switch(state, app_type, id)
 }
 
