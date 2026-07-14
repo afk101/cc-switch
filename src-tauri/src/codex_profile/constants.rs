@@ -41,3 +41,9 @@ pub const CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED: &str = "delete_data
 pub const CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED: &str = "disable_stopped";
 /// 删除本地凭证前的持久化阶段。
 pub const CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING: &str = "delete_token_pending";
+/// 切换运行时快照已替换，尚未写入目标路由。
+pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED: &str = "switch_runtime_swapped";
+/// 切换目标路由已保存，尚未替换故障转移列表。
+pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED: &str = "switch_route_saved";
+/// 切换故障转移列表已替换，尚未清除操作记录。
+pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED: &str = "switch_failovers_saved";

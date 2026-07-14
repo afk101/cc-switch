@@ -11,6 +11,9 @@ use crate::codex_profile::{
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
     CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
     CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+    CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED,
+    CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED,
+    CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED,
 };
 use crate::database::Database;
 use crate::error::AppError;
@@ -139,7 +142,6 @@ impl CodexRouteManager {
         self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_route_operation()?;
-        let _ = self.persistence.get_route(profile_id)?;
         let previous = self
             .persistence
             .get_route(profile_id)?
@@ -278,20 +280,36 @@ impl CodexRouteManager {
         let prepared = self.route_with_recovery(route.clone(), &recovery)?;
         self.persistence.save_route(&prepared)?;
         runtime.swap_provider_snapshot(snapshot).await;
-        let changing = self.route_with_recovery(changed.clone(), &recovery)?;
-        if let Err(error) = self.persistence.save_route(&changing) {
+        if let Err(error) = self.advance_operation(
+            profile_id,
+            CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED,
+            None,
+        ) {
             self.restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot, &recovery)
                 .await;
             return Err(error);
         }
+        let changing = CodexProfileRoute {
+            recovery_json: self.operation_json_from_route(profile_id)?,
+            ..changed.clone()
+        };
+        if let Err(error) = self.persistence.save_route(&changing) {
+            let _ = self.persist_operation_error(profile_id, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED, &error.to_string());
+            self.restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot, &recovery)
+                .await;
+            return Err(error);
+        }
+        self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED, None)?;
         if let Err(error) = self
             .persistence
             .replace_failovers(profile_id, &failover_ids)
         {
+            let _ = self.persist_operation_error(profile_id, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED, &error.to_string());
             self.restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot, &recovery)
                 .await;
             return Err(error);
         }
+        self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED, None)?;
         self.clear_operation(&changed)?;
         Ok(())
     }
@@ -437,6 +455,8 @@ impl CodexRouteManager {
                 let lock = self.profile_lock(&profile.id)?;
                 let _guard = lock.lock().await;
                 self.recover_pending_locked(&profile.id).await?;
+                let profile = self.persistence.get_profile(&profile.id)?;
+                profile.validate_route_operation()?;
                 let Some(route) = self.persistence.get_route(&profile.id)? else {
                     return Ok(());
                 };
@@ -617,7 +637,17 @@ impl CodexRouteManager {
         phase: &str,
         error: &str,
     ) -> Result<(), AppError> {
-        self.advance_operation(profile_id, phase, Some(error.to_string()))
+        self.advance_operation(profile_id, phase, Some(Self::safe_error_summary(error)))
+    }
+
+    /// 将错误归纳为不可逆操作可安全持久化的摘要，禁止写入凭证、认证字段或本地路径。
+    fn safe_error_summary(error: &str) -> String {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("token") || lower.contains("auth") || error.contains('/') || error.contains('\\') {
+            "Codex Profile 生命周期步骤失败（敏感细节已省略）".to_string()
+        } else {
+            error.chars().take(160).collect()
+        }
     }
 
     /// 读取当前唯一操作记录，以便最终路由状态保留同一记录直至清理。
