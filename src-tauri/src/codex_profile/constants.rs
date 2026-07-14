@@ -52,6 +52,12 @@ pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED: &str = "switch_runt
 pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED: &str = "switch_route_saved";
 /// 切换故障转移列表已替换，尚未清除操作记录。
 pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED: &str = "switch_failovers_saved";
+/// 启动对账的补偿操作名称。
+pub const CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE: &str = "reconcile";
+/// 启动对账已记录旧、新目标指纹，尚未改写 Home。
+pub const CODEX_ROUTE_RECOVERY_PHASE_RECONCILE_PREPARED: &str = "reconcile_prepared";
+/// 启动对账已改写 Home，尚未重定位备份目标指纹。
+pub const CODEX_ROUTE_RECOVERY_PHASE_RECONCILE_HOME_APPLIED: &str = "reconcile_home_applied";
 /// 生命周期补偿尚未收敛时返回给调用方的安全错误前缀。
 pub const CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR: &str =
     "Codex Profile 路由变更失败，补偿未收敛";

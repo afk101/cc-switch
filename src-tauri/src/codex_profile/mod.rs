@@ -15,7 +15,8 @@ pub use constants::*;
 pub(crate) use home_config::build_codex_route_toml_base;
 pub use home_config::{
     build_codex_profile_route_toml, CodexHomeConfigService, CodexHomeFileOps,
-    CodexLiveConfigSnapshot, CodexRouteConfigPlan, SystemCodexHomeFileOps,
+    CodexHomeReconcileOwnership, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
+    SystemCodexHomeFileOps,
 };
 pub use migration::{
     CodexProfileMigrationResult, CodexProfileMigrationService, LegacyCodexProfileSnapshot,

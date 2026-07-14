@@ -26,6 +26,29 @@ pub struct CodexRouteConfigPlan {
     model_changes: Vec<String>,
 }
 
+impl CodexRouteConfigPlan {
+    /// 返回计划写入后的目标指纹，不暴露目标配置正文。
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
+    }
+
+    /// 返回计划构造时看到的 Home 指纹，不暴露当前配置正文。
+    pub fn previous_fingerprint(&self) -> &str {
+        &self.previous.fingerprint
+    }
+}
+
+/// 启动修复时对当前 Home 的安全所有权分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHomeReconcileOwnership {
+    /// Home 已经是当前 token 对应的目标配置。
+    Current,
+    /// Home 与路由备份记录的旧 target 完全匹配。
+    RouteOwned,
+    /// Home 是端口匹配的旧 `PROXY_MANAGED` 配置。
+    LegacyManaged,
+}
+
 /// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
 #[derive(Serialize, Deserialize)]
 struct CodexRouteBackup {
@@ -165,8 +188,7 @@ impl CodexHomeConfigService {
 
     /// 仅当 Home 仍是该 Profile 接管版本时恢复其备份配置。
     pub fn restore_backup(&self, home: &Path, backup_json: &str) -> Result<(), AppError> {
-        let backup: CodexRouteBackup = serde_json::from_str(backup_json)
-            .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))?;
+        let backup = Self::decode_route_backup(backup_json)?;
         let current = self.inspect(home)?;
         if current.fingerprint == backup.previous_fingerprint {
             return Ok(());
@@ -177,6 +199,66 @@ impl CodexHomeConfigService {
             Some(content) => self.file_ops.write_atomic(&config_path, &content),
             None => self.file_ops.remove_file(&config_path),
         }
+    }
+
+    /// 判断当前 Home 是否可由已启用 Profile 安全修复，外部编辑一律返回冲突。
+    pub fn classify_profile_reconcile(
+        &self,
+        plan: &CodexRouteConfigPlan,
+        backup_json: &str,
+        listen_port: u16,
+    ) -> Result<CodexHomeReconcileOwnership, AppError> {
+        if plan.previous.fingerprint == plan.target_fingerprint {
+            return Ok(CodexHomeReconcileOwnership::Current);
+        }
+        let backup = Self::decode_route_backup(backup_json)?;
+        if plan.previous.fingerprint == backup.target_fingerprint {
+            return Ok(CodexHomeReconcileOwnership::RouteOwned);
+        }
+        if Self::is_legacy_managed_home(plan.previous.content.as_deref(), listen_port) {
+            return Ok(CodexHomeReconcileOwnership::LegacyManaged);
+        }
+        Err(AppError::CodexLiveConfigConflict {
+            expected_fingerprint: backup.target_fingerprint,
+            actual_fingerprint: plan.previous.fingerprint.clone(),
+        })
+    }
+
+    /// 保留最初 Home 快照，只把路由备份的 target 指纹重定位到新配置。
+    pub fn rebase_route_backup(
+        &self,
+        backup_json: &str,
+        target_fingerprint: &str,
+    ) -> Result<String, AppError> {
+        let mut backup = Self::decode_route_backup(backup_json)?;
+        backup.target_fingerprint = target_fingerprint.to_string();
+        serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
+    }
+
+    /// 读取显式 Home 的当前指纹，供崩溃恢复只比较所有权而不持久化正文。
+    pub fn current_fingerprint(&self, home: &Path) -> Result<String, AppError> {
+        Ok(self.inspect(home)?.fingerprint)
+    }
+
+    /// 解码路由备份，统一拒绝损坏的备份元数据。
+    fn decode_route_backup(backup_json: &str) -> Result<CodexRouteBackup, AppError> {
+        serde_json::from_str(backup_json)
+            .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))
+    }
+
+    /// 仅识别 token 与 Profile 端口都匹配的旧全局占位配置。
+    fn is_legacy_managed_home(content: Option<&[u8]>, listen_port: u16) -> bool {
+        let Some(content) = content.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
+            return false;
+        };
+        let expected_base_url = format!(
+            "http://{}:{listen_port}/v1",
+            crate::codex_profile::CODEX_ROUTE_LISTEN_HOST
+        );
+        crate::codex_config::extract_codex_experimental_bearer_token(content).as_deref()
+            == Some(crate::codex_profile::LEGACY_PROXY_MANAGED_TOKEN)
+            && crate::codex_config::extract_codex_base_url(content).as_deref()
+                == Some(expected_base_url.as_str())
     }
 }
 
@@ -345,6 +427,90 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert_eq!(
             fs::read(codex_auth_path_for_home(&home_b)).expect("重读 B 认证"),
             auth_b_before
+        );
+        Ok(())
+    }
+
+    /// 启动修复重定位备份时只能更新 target 指纹，不能丢失最初的 Home 快照。
+    #[test]
+    fn restoring_enabled_profile_home_rebases_backup_without_serializing_new_token(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"upstream-token\"\n",
+        )
+        .expect("写入原始配置");
+        let service = CodexHomeConfigService::system();
+        let old_plan =
+            service.build_profile_route_plan(home.path(), 15_722, None, "old-listener-token")?;
+        let old_backup = service.serialize_backup(&old_plan)?;
+        service.apply_route_plan(&old_plan)?;
+        let desired_plan =
+            service.build_profile_route_plan(home.path(), 15_722, None, "new-listener-token")?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired_plan, &old_backup, 15_722)?,
+            CodexHomeReconcileOwnership::RouteOwned
+        );
+        let rebased =
+            service.rebase_route_backup(&old_backup, desired_plan.target_fingerprint())?;
+        let old_json: serde_json::Value = serde_json::from_str(&old_backup).expect("解析旧备份");
+        let rebased_json: serde_json::Value = serde_json::from_str(&rebased).expect("解析新备份");
+
+        assert_eq!(
+            rebased_json["previous_content"],
+            old_json["previous_content"]
+        );
+        assert_eq!(
+            rebased_json["previous_fingerprint"],
+            old_json["previous_fingerprint"]
+        );
+        assert_eq!(
+            rebased_json["target_fingerprint"],
+            desired_plan.target_fingerprint()
+        );
+        assert!(!rebased.contains("new-listener-token"));
+        Ok(())
+    }
+
+    /// 只有匹配当前 Profile 端口的旧占位配置可自愈，外部编辑必须被拒绝。
+    #[test]
+    fn restoring_enabled_profile_home_accepts_legacy_placeholder_and_rejects_external_edit(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original = "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"upstream-token\"\n";
+        fs::write(&config_path, original).expect("写入原始配置");
+        let service = CodexHomeConfigService::system();
+        let old_plan = service.build_profile_route_plan(home.path(), 15_722, None, "old-token")?;
+        let backup = service.serialize_backup(&old_plan)?;
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n",
+        )
+        .expect("写入旧占位配置");
+        let legacy_plan =
+            service.build_profile_route_plan(home.path(), 15_722, None, "new-token")?;
+        assert_eq!(
+            service.classify_profile_reconcile(&legacy_plan, &backup, 15_722)?,
+            CodexHomeReconcileOwnership::LegacyManaged
+        );
+
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"external-token\"\n",
+        )
+        .expect("写入外部编辑");
+        let external_plan =
+            service.build_profile_route_plan(home.path(), 15_722, None, "new-token")?;
+        assert!(service
+            .classify_profile_reconcile(&external_plan, &backup, 15_722)
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("重读外部配置"),
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Custom\"\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"external-token\"\n"
         );
         Ok(())
     }
