@@ -3,7 +3,7 @@
 //! 通过环境变量 `CC_SWITCH_DUMP_BODY=1` 打开；不开启时 [`BodyDumper::try_new`]
 //! 返回 `None`，调用方保持零开销。
 //!
-//! 每个请求写入一个独立文件：`<app_config_dir>/logs/proxy-bodies/<ts>-<request_id>.log`，
+//! 每个请求写入一个独立文件：`<app_config_dir>/logs/proxy-bodies/<profile-id>/<ts>-<request_id>.log`，
 //! 追加写入以下内容：
 //! 1. 客户端 → CC Switch 的方法、URL、脱敏后的 header、请求 body 原文；
 //! 2. CC Switch → 上游的 URL、脱敏后的 header、发送前定稿的 body；
@@ -91,12 +91,32 @@ impl BodyDumper {
         if !is_enabled() {
             return None;
         }
-        Self::try_new_inner(request_id, endpoint).ok().map(Arc::new)
+        Self::try_new_inner(request_id, endpoint, None)
+            .ok()
+            .map(Arc::new)
+    }
+
+    /// 为指定 Codex Profile 创建诊断器，Profile 标识会成为隔离后的日志目录名。
+    pub fn try_new_for_profile(
+        profile_id: &str,
+        request_id: &str,
+        endpoint: &str,
+    ) -> Option<Arc<Self>> {
+        if !is_enabled() {
+            return None;
+        }
+        Self::try_new_inner(request_id, endpoint, Some(profile_id))
+            .ok()
+            .map(Arc::new)
     }
 
     /// 内部构造：单独抽出便于错误处理，避免调用点被 IO 错误污染。
-    fn try_new_inner(request_id: &str, endpoint: &str) -> std::io::Result<Self> {
-        let dir = dump_dir()?;
+    fn try_new_inner(
+        request_id: &str,
+        endpoint: &str,
+        profile_id: Option<&str>,
+    ) -> std::io::Result<Self> {
+        let dir = dump_dir(profile_id)?;
         let now = chrono::Local::now();
         let today_key = now.format("%Y%m%d").to_string();
         cleanup_old_dump_files(&dir, &today_key);
@@ -248,11 +268,35 @@ impl BodyDumper {
     }
 }
 
-/// 计算 dump 文件所在目录 `<app_config_dir>/logs/proxy-bodies`，必要时创建。
-fn dump_dir() -> std::io::Result<PathBuf> {
+/// 计算 dump 文件所在目录，Profile 路由使用隔离后的子目录。
+fn dump_dir(profile_id: Option<&str>) -> std::io::Result<PathBuf> {
     let base = crate::panic_hook::get_log_dir().join("proxy-bodies");
-    std::fs::create_dir_all(&base)?;
-    Ok(base)
+    let dir = profile_id
+        .map(sanitize_profile_id)
+        .map(|profile_id| base.join(profile_id))
+        .unwrap_or(base);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// 将 Profile 标识净化为安全、稳定的单层目录名。
+fn sanitize_profile_id(profile_id: &str) -> String {
+    let sanitized: String = profile_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "unknown-profile".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// 清理早于今天的 body dump 日志；失败只记录警告，不影响代理主流程。
@@ -464,6 +508,12 @@ mod tests {
     fn dump_file_date_key_ignores_malformed_log_names() {
         let path = std::path::Path::new("body-dump.log");
         assert_eq!(dump_file_date_key(path), None);
+    }
+
+    /// Profile 标识必须被净化为单个稳定目录名，不能逃逸到日志根目录外。
+    #[test]
+    fn sanitize_profile_id_blocks_path_separator_and_control_chars() {
+        assert_eq!(sanitize_profile_id("work/profile\\a\n"), "work_profile_a_");
     }
 
     /// 清理策略删除早于今天的 dump log，保留今天和未来日期的 dump log。

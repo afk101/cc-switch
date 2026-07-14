@@ -161,14 +161,10 @@ impl CodexProfileRepository {
         excluded_profile_id: Option<&str>,
     ) -> Result<(), AppError> {
         let canonical_home = canonical_home.to_string_lossy();
-        let existing_profile = self
-            .db
-            .list_codex_profiles()?
-            .into_iter()
-            .find(|profile| {
-                profile.canonical_home_path == canonical_home
-                    && Some(profile.id.as_str()) != excluded_profile_id
-            });
+        let existing_profile = self.db.list_codex_profiles()?.into_iter().find(|profile| {
+            profile.canonical_home_path == canonical_home
+                && Some(profile.id.as_str()) != excluded_profile_id
+        });
 
         match existing_profile {
             Some(profile) => Err(AppError::DuplicateCodexHome {
@@ -187,7 +183,6 @@ impl CodexProfileRepository {
             .map(|profile| profile.listen_port)
             .collect())
     }
-
 }
 
 /// 校验并规范化用户输入的 Profile 显示名称。
@@ -316,7 +311,11 @@ mod tests {
         let profile = repository.create_profile("工作", &old_home)?;
 
         assert!(matches!(
-            repository.rebind_profile(&profile.id, Path::new(&new_home), super::CodexRuntimeStatus::Running),
+            repository.rebind_profile(
+                &profile.id,
+                Path::new(&new_home),
+                super::CodexRuntimeStatus::Running
+            ),
             Err(AppError::InvalidInput(_))
         ));
         Ok(())
@@ -380,7 +379,9 @@ mod tests {
             .conn
             .lock()
             .expect("获取数据库锁")
-            .query_row("SELECT COUNT(*) FROM codex_profile_routes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM codex_profile_routes", [], |row| {
+                row.get(0)
+            })
             .expect("读取路由数量");
         assert_eq!(route_count, 0, "Route 写入也不能残留");
         Ok(())

@@ -710,13 +710,8 @@ pub async fn handle_responses(
 
     // 诊断 body dump：仅在 CC_SWITCH_DUMP_BODY 打开时生效。挂到 ctx 后，
     // forwarder 会写入出站请求、response processor 会写入上游响应体或 SSE 采样。
-    if let Some(dumper) = BodyDumper::try_new(&ctx.session_id, "/responses") {
-        dumper.dump_client_request(
-            "POST",
-            &uri.to_string(),
-            &headers,
-            body_bytes.as_ref(),
-        );
+    if let Some(dumper) = create_codex_body_dumper(&state, &ctx.session_id, "/responses") {
+        dumper.dump_client_request("POST", &uri.to_string(), &headers, body_bytes.as_ref());
         ctx.body_dumper = Some(dumper);
     }
 
@@ -800,13 +795,8 @@ pub async fn handle_responses_compact(
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     // 诊断 body dump：与 handle_responses 保持一致，仅在 CC_SWITCH_DUMP_BODY 打开时生效。
-    if let Some(dumper) = BodyDumper::try_new(&ctx.session_id, "/responses/compact") {
-        dumper.dump_client_request(
-            "POST",
-            &uri.to_string(),
-            &headers,
-            body_bytes.as_ref(),
-        );
+    if let Some(dumper) = create_codex_body_dumper(&state, &ctx.session_id, "/responses/compact") {
+        dumper.dump_client_request("POST", &uri.to_string(), &headers, body_bytes.as_ref());
         ctx.body_dumper = Some(dumper);
     }
 
@@ -864,6 +854,18 @@ pub async fn handle_responses_compact(
         connection_guard,
     )
     .await
+}
+
+/// 按请求所属 Profile 创建 body dump，未绑定 Profile 时保持原有全局日志路径。
+fn create_codex_body_dumper(
+    state: &ProxyState,
+    session_id: &str,
+    endpoint: &str,
+) -> Option<std::sync::Arc<BodyDumper>> {
+    match state.codex_profile_scope.as_ref() {
+        Some(scope) => BodyDumper::try_new_for_profile(&scope.profile_id, session_id, endpoint),
+        None => BodyDumper::try_new(session_id, endpoint),
+    }
 }
 
 async fn handle_codex_chat_to_responses_transform(

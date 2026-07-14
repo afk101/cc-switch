@@ -246,7 +246,11 @@ pub async fn handle_non_streaming(
     // 诊断 body dump：仅 Codex /responses 链路在开关打开时挂了 dumper。
     // 这里读的是已解压 body，避免用户还得手工解 gzip / zstd。
     if let Some(dumper) = ctx.body_dumper.as_ref() {
-        dumper.dump_upstream_response_non_streaming(status.as_u16(), &response_headers, &body_bytes);
+        dumper.dump_upstream_response_non_streaming(
+            status.as_u16(),
+            &response_headers,
+            &body_bytes,
+        );
     }
 
     log::debug!(
@@ -1009,6 +1013,9 @@ mod tests {
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            codex_profile_scope: None,
+            local_codex_token: None,
+            route_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

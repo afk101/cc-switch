@@ -7,6 +7,7 @@ mod home_config;
 mod migration;
 mod model;
 mod repository;
+mod route_runtime;
 mod secret_store;
 
 pub use constants::*;
@@ -26,4 +27,5 @@ pub use repository::{
     CodexProfileRepository, HomePathCanonicalizer, PortAvailability, SystemHomePathCanonicalizer,
     SystemPortAvailability,
 };
+pub use route_runtime::{CodexRouteProviderSnapshot, RouteRuntime};
 pub use secret_store::CodexProfileSecretStore;

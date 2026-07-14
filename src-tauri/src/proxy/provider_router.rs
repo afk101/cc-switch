@@ -18,6 +18,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// Profile 路由专用的 Codex 供应商快照；存在时仅影响该路由器自身的 Codex 请求。
+    codex_profile_providers: Option<Arc<RwLock<Vec<Provider>>>>,
 }
 
 impl ProviderRouter {
@@ -26,6 +28,27 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            codex_profile_providers: None,
+        }
+    }
+
+    /// 创建仅为一个 Codex Profile 服务的路由器。
+    ///
+    /// 每个调用者都会得到独立的熔断器集合；供应商快照也不会读取或修改全局 Codex 当前供应商。
+    pub fn new_for_codex_profile(db: Arc<Database>, providers: Vec<Provider>) -> Self {
+        Self {
+            db,
+            circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            codex_profile_providers: Some(Arc::new(RwLock::new(providers))),
+        }
+    }
+
+    /// 原子替换一个 Profile 路由器的候选供应商快照。
+    ///
+    /// 已经开始的请求持有 `select_providers` 返回的独立 Vec，不会受本次替换影响。
+    pub async fn replace_codex_profile_providers(&self, providers: Vec<Provider>) {
+        if let Some(snapshot) = self.codex_profile_providers.as_ref() {
+            *snapshot.write().await = providers;
         }
     }
 
@@ -35,6 +58,12 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        if app_type == "codex" {
+            if let Some(providers) = self.snapshot_codex_profile_providers().await {
+                return self.select_codex_profile_providers(providers).await;
+            }
+        }
+
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
@@ -103,6 +132,42 @@ impl ProviderRouter {
                 log::warn!("[{app_type}] [FO-005] 未配置供应商");
                 return Err(AppError::NoProvidersConfigured);
             }
+        }
+
+        Ok(result)
+    }
+
+    /// 在一次请求开始时克隆 Profile 供应商快照，并按本路由器的熔断器状态过滤。
+    async fn snapshot_codex_profile_providers(&self) -> Option<Vec<Provider>> {
+        let providers = self.codex_profile_providers.as_ref()?;
+        Some(providers.read().await.clone())
+    }
+
+    /// 选择 Profile 路由器独占的 Codex 候选供应商。
+    async fn select_codex_profile_providers(
+        &self,
+        providers: Vec<Provider>,
+    ) -> Result<Vec<Provider>, AppError> {
+        let total_providers = providers.len();
+        let mut result = Vec::with_capacity(total_providers);
+        let mut circuit_open_count = 0usize;
+
+        for provider in providers {
+            let circuit_key = format!("codex:{}", provider.id);
+            let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+            if breaker.is_available().await {
+                result.push(provider);
+            } else {
+                circuit_open_count += 1;
+            }
+        }
+
+        if result.is_empty() {
+            return if total_providers > 0 && circuit_open_count == total_providers {
+                Err(AppError::AllProvidersCircuitOpen)
+            } else {
+                Err(AppError::NoProvidersConfigured)
+            };
         }
 
         Ok(result)

@@ -3596,15 +3596,23 @@ mod tests {
         // codex_app namespace 的工具不应出现
         let tool_names: Vec<&str> = chat_tools
             .iter()
-            .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
             .collect();
 
-        assert!(!tool_names.contains(&"codex_app__automation_update"),
-            "codex_app namespace 工具应被过滤");
+        assert!(
+            !tool_names.contains(&"codex_app__automation_update"),
+            "codex_app namespace 工具应被过滤"
+        );
 
         // 其他工具应正常保留
-        assert!(tool_names.contains(&"get_weather"),
-            "非 codex_app namespace 工具应保留");
+        assert!(
+            tool_names.contains(&"get_weather"),
+            "非 codex_app namespace 工具应保留"
+        );
     }
 
     #[test]
@@ -3642,16 +3650,23 @@ mod tests {
         });
 
         let context = build_codex_tool_context_from_request(&body);
-        let tool_names: Vec<&str> = context.chat_tools()
+        let tool_names: Vec<&str> = context
+            .chat_tools()
             .iter()
-            .filter_map(|t| t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str()))
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })
             .collect();
 
-        assert!(!tool_names.iter().any(|n| n.starts_with("codex_app__")),
-            "tool_search_output 中的 codex_app namespace 工具应被过滤");
-        assert!(tool_names.contains(&"mcp__some_plugin__do_thing"),
-            "tool_search_output 中其他 namespace 工具应保留");
+        assert!(
+            !tool_names.iter().any(|n| n.starts_with("codex_app__")),
+            "tool_search_output 中的 codex_app namespace 工具应被过滤"
+        );
+        assert!(
+            tool_names.contains(&"mcp__some_plugin__do_thing"),
+            "tool_search_output 中其他 namespace 工具应保留"
+        );
     }
 }
