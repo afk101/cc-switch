@@ -30,7 +30,11 @@ export const codexProfilesApi = {
     providerId: string,
     failoverIds: string[],
   ): Promise<boolean> =>
-    invoke("enable_codex_profile_route", { profileId, providerId, failoverIds }),
+    invoke("enable_codex_profile_route", {
+      profileId,
+      providerId,
+      failoverIds,
+    }),
   /** 切换指定 Profile 的供应商。 */
   switchProvider: (
     profileId: string,
