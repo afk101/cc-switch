@@ -693,6 +693,28 @@ mod tests {
         );
     }
 
+    /// 最后一个请求在 waiter 注册前完成时，排空检查不得等待超时通知。
+    #[tokio::test]
+    async fn profile_drain_succeeds_when_last_request_finishes_before_waiter_registration() {
+        let server = ProxyServer::new(
+            ProxyConfig::default(),
+            Arc::new(Database::memory().expect("内存数据库")),
+            None,
+        );
+        server.state.profile_in_flight.store(1, Ordering::Release);
+        server
+            .state
+            .profile_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+        server.state.profile_drain_notify.notify_waiters();
+
+        assert!(
+            server
+                .wait_for_profile_drain(std::time::Duration::ZERO)
+                .await
+        );
+    }
+
     /// 排空超时后必须返回 false，调用方据此继续停止监听器。
     #[tokio::test]
     async fn profile_drain_returns_false_after_timeout() {
