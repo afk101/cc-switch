@@ -45,17 +45,26 @@ pub struct UsageLogger<'a> {
 impl<'a> UsageLogger<'a> {
     /// 创建不绑定 Profile 的全局代理日志记录器。
     pub fn new(db: &'a Database) -> Self {
-        Self::new_scoped(db, None)
+        Self {
+            db,
+            profile_id: None,
+        }
     }
 
     /// 创建绑定到单个 Codex Profile 的日志记录器。
     pub fn new_for_profile(db: &'a Database, profile_id: &'a str) -> Self {
-        Self::new_scoped(db, Some(profile_id))
+        Self {
+            db,
+            profile_id: Some(profile_id),
+        }
     }
 
     /// 根据可选 Profile 作用域创建统一日志记录器。
     pub fn new_scoped(db: &'a Database, profile_id: Option<&'a str>) -> Self {
-        Self { db, profile_id }
+        match profile_id {
+            Some(profile_id) => Self::new_for_profile(db, profile_id),
+            None => Self::new(db),
+        }
     }
 
     /// 记录成功的请求
