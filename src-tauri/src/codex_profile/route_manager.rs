@@ -773,7 +773,16 @@ impl CodexRouteManager {
         old_snapshot: CodexRouteProviderSnapshot,
         recovery: &RouteRecoveryRecord,
     ) {
-        let mut recovery = recovery.clone();
+        let persisted_recovery = self
+            .persistence
+            .get_route(profile_id)
+            .ok()
+            .flatten()
+            .and_then(|current| current.recovery_json);
+        let mut recovery = persisted_recovery
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| recovery.clone());
         recovery.last_error = Some("切换失败，正在恢复原路由".to_string());
         let mut restoring = self
             .route_with_recovery(route.clone(), &recovery)
@@ -883,6 +892,7 @@ mod codex_route_manager {
         db: Arc<Database>,
         save_count: AtomicUsize,
         fail_on_save: usize,
+        fail_replace: bool,
     }
 
     impl CodexProfileRoutePersistence for SaveFailingPersistence {
@@ -909,6 +919,9 @@ mod codex_route_manager {
             profile_id: &str,
             provider_ids: &[String],
         ) -> Result<(), AppError> {
+            if self.fail_replace {
+                return Err(AppError::Message("模拟故障转移保存失败".to_string()));
+            }
             self.db
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
@@ -1272,9 +1285,9 @@ mod codex_route_manager {
         Ok(())
     }
 
-    /// 保存切换中的目标路由失败时，运行时与数据库都必须恢复为原始快照。
+    /// 故障转移列表保存失败时，运行时回滚且数据库保留可拒绝的切换操作记录。
     #[tokio::test]
-    async fn switching_route_save_failure_restores_runtime_and_database_snapshot(
+    async fn switching_failover_save_failure_keeps_recovery_and_rejects_next_mutation(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         for id in ["provider-old", "provider-new", "provider-failover"] {
@@ -1304,7 +1317,8 @@ mod codex_route_manager {
         let persistence = Arc::new(SaveFailingPersistence {
             db: db.clone(),
             save_count: AtomicUsize::new(0),
-            fail_on_save: 2,
+            fail_on_save: 0,
+            fail_replace: true,
         });
         let manager = CodexRouteManager::new(
             persistence,
@@ -1332,12 +1346,13 @@ mod codex_route_manager {
         let route = db
             .get_codex_profile_route("profile-a")?
             .expect("路由仍存在");
-        assert_eq!(route.current_provider_id.as_deref(), Some("provider-old"));
-        assert!(route.recovery_json.is_none());
-        assert_eq!(
-            db.list_codex_profile_failovers("profile-a")?,
-            vec!["provider-failover"]
-        );
+        let recovery: serde_json::Value = serde_json::from_str(
+            &route.recovery_json.expect("切换操作记录"),
+        ).expect("操作 JSON");
+        assert_eq!(recovery["operation"], "switch");
+        assert_eq!(recovery["phase"], CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED);
+        assert!(recovery["last_error"].is_string());
+        assert!(manager.switch_provider("profile-a", "provider-new", vec![]).await.is_err());
         Ok(())
     }
 
@@ -1369,6 +1384,7 @@ mod codex_route_manager {
                 db: db.clone(),
                 save_count: AtomicUsize::new(0),
                 fail_on_save: 4,
+                fail_replace: false,
             }),
             Arc::new(CodexHomeConfigService::system()),
             Arc::new(CodexProfileSecretStore::with_root(
@@ -1822,7 +1838,7 @@ mod codex_route_manager {
             live_backup_json: None, last_error: None, recovery_json: None, updated_at: 1,
         })?;
         let manager = CodexRouteManager::new(
-            Arc::new(SaveFailingPersistence { db: db.clone(), save_count: AtomicUsize::new(0), fail_on_save: 3 }),
+            Arc::new(SaveFailingPersistence { db: db.clone(), save_count: AtomicUsize::new(0), fail_on_save: 3, fail_replace: false }),
             Arc::new(CodexHomeConfigService::system()),
             Arc::new(TrackingTokenStore { ensured: AtomicUsize::new(0), deleted: AtomicUsize::new(0) }),
             Arc::new(FakeFactory),
