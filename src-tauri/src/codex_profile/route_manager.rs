@@ -1548,7 +1548,7 @@ mod codex_route_manager {
             recovery_json: None,
             updated_at: 1,
         })?;
-        let (outer_read_tx, _outer_read_rx) = channel();
+        let (outer_read_tx, outer_read_rx) = channel();
         let (resume_tx, resume_rx) = channel();
         let persistence = Arc::new(RestoreBlockingPersistence {
             db: db.clone(),
@@ -1574,12 +1574,15 @@ mod codex_route_manager {
             .expect("运行时锁")
             .insert("profile-a".to_string(), existing_runtime);
 
-        resume_tx.send(()).expect("允许恢复继续");
         let restoring_manager = manager.clone();
         let restore_task =
             tokio::spawn(async move { restoring_manager.restore_enabled_profiles().await });
+        outer_read_rx.recv().expect("恢复已在锁内读取路由");
+        let disabling_manager = manager.clone();
+        let disable_task = tokio::spawn(async move { disabling_manager.disable("profile-a").await });
+        resume_tx.send(()).expect("允许恢复继续");
         restore_task.await.expect("恢复任务未 panic")?;
-        manager.disable("profile-a").await?;
+        disable_task.await.expect("关闭任务未 panic")?;
 
         assert!(
             !db.get_codex_profile_route("profile-a")?
