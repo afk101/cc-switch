@@ -182,7 +182,21 @@ impl CodexRouteManager {
             self.persist_operation_error(profile_id, CODEX_ROUTE_RECOVERY_PHASE_PREPARED, &error)?;
             return Err(AppError::Message(error));
         }
-        self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED, None)?;
+        if let Err(error) = self.advance_operation(
+            profile_id,
+            CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
+            None,
+        ) {
+            let stop_error = runtime.stop().await.err();
+            if let Some(stop_error) = stop_error {
+                let _ = self.persist_operation_error(
+                    profile_id,
+                    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
+                    &stop_error,
+                );
+            }
+            return Err(error);
+        }
         if !runtime.health_check().await {
             let error = "Codex Profile 路由健康检查失败";
             let stop_error = runtime.stop().await.err();
@@ -204,7 +218,25 @@ impl CodexRouteManager {
             )?;
             return Err(error);
         }
-        self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED, None)?;
+        if let Err(error) = self.advance_operation(
+            profile_id,
+            CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
+            None,
+        ) {
+            let restore_error = self.home_config.restore(&plan).err();
+            let stop_error = runtime.stop().await.err();
+            let compensation_error = restore_error
+                .map(|error| error.to_string())
+                .or(stop_error);
+            if let Some(compensation_error) = compensation_error {
+                let _ = self.persist_operation_error(
+                    profile_id,
+                    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
+                    &compensation_error,
+                );
+            }
+            return Err(error);
+        }
         let backup = self.home_config.serialize_backup(&plan)?;
         let route = crate::codex_profile::CodexProfileRoute {
             profile_id: profile.id.clone(),
