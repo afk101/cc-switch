@@ -1,0 +1,6 @@
+# macOS 开发环境可能存在同名的 Node `cc` 命令，显式使用系统链接器避免生成空构建产物。
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"
+
+[target.x86_64-apple-darwin]
+linker = "/usr/bin/cc"
