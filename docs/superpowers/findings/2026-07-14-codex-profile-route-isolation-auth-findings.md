@@ -118,6 +118,27 @@
 - `pnpm run typecheck`、`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`：通过。
 - 首次误用 `pnpm test -- --run` 被 shell 解析为系统 `test`，未执行任何测试；随后读取 `package.json` 后改用项目实际脚本 `pnpm run test:unit`，没有重复失败命令。
 
+### 完成审计续验
+
+- 2026-07-14 续验时，工作区起点干净，实施计划没有未勾选步骤；当前 `pnpm run dev:dump` 进程仍在运行，Vite 监听 `[::1]:13000`，仅 `codex-api` Profile listener 监听 `127.0.0.1:15722`，默认 Profile 的 15721 没有监听。
+- 当前实现入口仍明确按 Profile 分区：`App.tsx` 向 `CodexProfileRouteToggle` 传入 `selectedCodexProfileId`，启停 API 强制携带 Profile ID；后端启动顺序先调用旧 Codex 接管退役，再恢复并对账已启用 Profile，listener runtime、请求日志和 body dump 均持有 `codex_profile_scope`。
+- Computer Use 直接按 “CC Switch” 连接当前 `tauri dev` 裸 Mach-O 进程仍会超时；应用枚举能看到两个 `com.ccswitch.desktop` 注册项，但都标记为未运行。该结果复现了此前已确认的 macOS 辅助功能注册边界，不是 UI 运行失败；续验改用现有 debug App bundle 承载当前 debug 二进制，同时保持 `pnpm run dev:dump` 后端作为权威运行态，不重复超时调用。
+- 将当前 debug 二进制复制到现有忽略的 debug App bundle 后直接 `open`，单实例机制仍把启动转发给裸 `tauri dev` 进程；按 bundle ID 连接还会因为 `/Applications/CC Switch.app` 与 debug bundle 同 ID 而歧义，改用 debug bundle 绝对路径仍超时。因此 UI 续验必须先正常停止裸进程，再由同一 debug bundle 启动当前二进制；验收后重新恢复 `pnpm run dev:dump`，不能把 Computer Use 的附着限制误判为产品缺陷。
+- 停止裸进程后，由同一当前 debug 二进制和 Vite renderer 启动 debug App bundle，Computer Use 成功附着。初始 `codex-api` 页面显示“切换 codex-api 路由”为开启、Home `/Users/qihoo/.codex-api`、端口 15722、路由已启用且 `claude-openai-chat` 使用中；切换到默认 Profile 后，开关立即变为“切换 默认 Codex 路由”且关闭，Home `/Users/qihoo/.codex`、端口 15721、路由未启用且 OpenAI Official 使用中。两个页面的状态和供应商引用没有串用。
+- 从默认 Profile 再切回 `codex-api` 后，页面恢复该 Profile 自己的开启状态、15722 端口和 `claude-openai-chat` 使用中状态；没有短暂或持久继承默认 Profile 的关闭状态和官方供应商引用。
+- 续验记录关闭前安全快照：默认 Home 配置 SHA-256 为 `15afa106...a764`，自定义 Home 配置 SHA-256 为 `98b84532...8350`，数据库为默认关闭、自定义开启且两者均无 error/recovery。通过 `codex-api` 专用开关关闭后，UI 只把该 Profile 改为“路由未启用”，仍保留端口 15722 和自己的供应商引用，没有出现旧的全局官方供应商告警。
+- 关闭后的后端证据与 UI 一致：两个 Profile route 均为关闭且无 error/recovery，15721/15722 均无 listener；默认 Home 配置 SHA-256 仍是 `15afa106...a764`，证明操作没有改动默认订阅配置。随后再次点击 `codex-api` 专用开关，UI 仅将该 Profile 恢复为开启和端口 15722，供应商仍为 `claude-openai-chat`，全程未出现旧全局告警。
+- 重新开启后的 Home token 与 listener token 均为 43 字节，SHA-256 同为 `e66ed8cd...535b`；数据库为默认关闭、自定义开启且无 error/recovery，只有 15722 listener 存在。默认 Home 配置 SHA-256 第三次核对仍为 `15afa106...a764`，证明自定义 Profile 完成“关 → 开”生命周期后默认订阅配置字节级未变。
+- `codex-api` 完成“关 → 开”后再次切到默认 Profile，Computer Use 仍显示“切换 默认 Codex 路由”为关闭、端口 15721、路由未启用且 OpenAI Official 使用中；这给出了同一次真实 UI 生命周期内“自定义路由切换不改变默认 Profile”的直接证据。
+- UI 续验结束前已把当前选择恢复为 `codex-api`，页面最终状态是专用开关开启、端口 15722、路由已启用、`claude-openai-chat` 使用中。真实请求前的基线为：自定义 Home 配置 SHA-256 `98b84532...8350`、mtime `1784028774`、该 Profile 请求日志 0 条、Profile body dump 目录已有 2 个历史文件。
+- 当前 debug 二进制的 body dump 是编译期开关，且该二进制由本轮 `CC_SWITCH_DUMP_BODY=1 pnpm tauri dev` 构建，因此由 debug bundle 运行时仍保持 dump 开启。第一次真实请求测试脚本因 Node 22 同时检测到 CommonJS `require()` 和顶层 `await`，以 `ERR_AMBIGUOUS_MODULE_SYNTAX` 在客户端本地解析阶段退出，请求没有发出；后续改为 CommonJS `async` IIFE，不重复原脚本，也不修改产品实现。
+- 修正后的真实 `POST http://127.0.0.1:15722/v1/responses` 返回 200，响应对象为 `response`、模型为 `Auto`、输出为精确的 `OK`，本地认证不再出现 401。数据库新增请求 `53c2bdb6-9c2d-4d3d-958f-56e11977dccf`，`profile_id` 精确归属 `b341359e-437d-452c-a7ee-1019d99ae939`、供应商为该 Profile 的 `4847cf65-...`、状态 200；Profile body dump 文件数从 2 增至 3，最新文件位于同一 Profile ID 目录。
+- 请求前后自定义 Home 配置 SHA-256 均为 `98b84532...8350`、mtime 均为 `1784028774`；默认 Home 配置 SHA-256 仍为 `15afa106...a764`，旧 Codex 全局 backup 数量仍为 0。真实请求既没有重写自定义 Home，也没有触碰默认订阅配置或重新激活旧全局接管。
+- 真实验收产生的唯一请求行和唯一新增 body dump 已按精确 ID/路径清理，Profile 请求日志恢复 0 条、body dump 目录恢复原有 2 个文件，未删除其他历史数据。临时 debug bundle/renderer 随后正常停止，最终再次运行 `pnpm run dev:dump`；当前二进制 1.45 秒完成构建并启动，日志明确显示只恢复 `codex-api` Profile listener 到 `127.0.0.1:15722`，主窗口按用户原设置静默隐藏。
+- 最终 `pnpm run dev:dump` 进程上，Home token 与 listener token 再次确认均为 43 字节且哈希相同，使用 Home token 调用 `/v1/models` 返回 200 和 `{"models":[]}`。自定义 Home 配置 SHA-256/mtime 仍为 `98b84532...8350`/`1784028774`，默认 Home 配置 SHA-256 仍为 `15afa106...a764`；数据库仍是默认关闭、自定义开启且均无 error/recovery，旧 backup 为 0，实际监听仅有 Vite 13000 与 Profile 15722。
+- 保持最终 dev 服务运行时重新执行完成前全量测试：Rust library 共 1846 项，1844 通过、0 失败、2 忽略；前端使用单 worker 稳定调度，共 70 个测试文件、434 个测试全部通过。测试输出中的 MSW/React/Tauri stderr 均来自现有错误分支或测试环境告警，命令最终退出码均为 0。
+- 完成审计的 TypeScript 类型检查、Rustfmt、三份设计文档及受影响前端文件的 Prettier、`git diff --check` 均以退出码 0 通过。最终服务进程仍是 `pnpm run dev:dump`，监听保持为 13000/15722，没有 15721/15723 或临时 debug bundle 进程残留。
+
 ## 资源
 
 - 截图 1：`/Users/qihoo/.codex/attachments/4a07bc73-22f0-4615-bdc5-8a8120affecb/image-1.png`
