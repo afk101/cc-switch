@@ -1525,6 +1525,25 @@ mod codex_route_manager {
         assert!(serde_json::from_str::<RouteRecoveryRecord>("{").is_err());
     }
 
+    /// manager 入口遇到非法恢复 JSON 时不得启动运行时、创建 token 或改写原记录。
+    #[tokio::test]
+    async fn switching_with_invalid_recovery_keeps_json_and_has_no_side_effects() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        db.save_provider(AppType::Codex.as_str(), &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None))?;
+        db.insert_codex_profile(&CodexProfile { id: "profile-a".to_string(), name: "A".to_string(), canonical_home_path: "/tmp/a".to_string(), listen_port: 16001, created_at: 1, updated_at: 1 })?;
+        let tokens = Arc::new(TrackingTokenStore { ensured: AtomicUsize::new(0), deleted: AtomicUsize::new(0) });
+        for json in ["{", r#"{"operation":"unknown","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#, r#"{"operation":"switch","phase":"delete_token_pending","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#] {
+            db.save_codex_profile_route(&CodexProfileRoute { profile_id: "profile-a".to_string(), current_provider_id: Some("provider-a".to_string()), enabled: true, live_backup_json: None, last_error: None, recovery_json: Some(json.to_string()), updated_at: 1 })?;
+            let manager = CodexRouteManager::new(db.clone(), Arc::new(CodexHomeConfigService::system()), tokens.clone(), Arc::new(FakeFactory));
+            assert!(manager.switch_provider("profile-a", "provider-a", vec![]).await.is_err());
+            assert_eq!(db.get_codex_profile_route("profile-a")?.expect("路由").recovery_json.as_deref(), Some(json));
+            assert!(manager.status("profile-a").await.is_err());
+        }
+        assert_eq!(tokens.ensured.load(Ordering::SeqCst), 0);
+        assert_eq!(tokens.deleted.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     /// Home 写入失败且停止失败时，操作记录必须保留并阻断后续变更。
     #[tokio::test]
     async fn enabling_home_apply_failure_with_stop_failure_keeps_operation_and_rejects_mutation(
