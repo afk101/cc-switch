@@ -5,6 +5,9 @@ use crate::codex_profile::{
     CodexHomeConfigService, CodexProfile, CodexProfileRoute, CodexProfileScope,
     CodexProfileSecretStore, CodexRouteProviderSnapshot, CodexRouteRuntime,
     CodexRouteRuntimeFactory, CodexRuntimeStatus,
+    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
+    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_PREPARED,
 };
 use crate::database::Database;
 use crate::error::AppError;
@@ -122,11 +125,13 @@ impl CodexRouteManager {
         provider_id: &str,
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
+        self.validate_route_operation_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_route_operation()?;
+        let _ = self.persistence.get_route(profile_id)?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let plan = self.home_config.build_profile_route_plan(
             std::path::Path::new(&profile.canonical_home_path),
@@ -173,11 +178,35 @@ impl CodexRouteManager {
         if let Err(error) = self.persistence.save_route(&route) {
             let restore_failed = self.home_config.restore(&plan).is_err();
             let stop_failed = runtime.stop().await.is_err();
-            self.persist_error_summary(
-                profile_id,
-                "持久化启用状态失败",
-                restore_failed || stop_failed,
+            let previous =
+                self.persistence
+                    .get_route(profile_id)?
+                    .unwrap_or_else(|| CodexProfileRoute {
+                        profile_id: profile.id.clone(),
+                        current_provider_id: None,
+                        enabled: false,
+                        live_backup_json: None,
+                        last_error: None,
+                        recovery_json: None,
+                        updated_at: Utc::now().timestamp_millis(),
+                    });
+            self.persist_recovery(
+                &previous,
+                RouteRecoverySnapshot::from_route(
+                    &previous,
+                    self.persistence.list_failovers(profile_id)?,
+                ),
+                RouteRecoverySnapshot::from_route(&route, failover_ids),
+                CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED,
+                "启用路由持久化失败，拒绝继续变更",
             )?;
+            if restore_failed || stop_failed {
+                self.persist_error_summary(
+                    profile_id,
+                    "持久化启用状态失败；回滚未完全完成，请重试",
+                    true,
+                )?;
+            }
             return Err(error);
         }
         self.runtimes
@@ -197,9 +226,13 @@ impl CodexRouteManager {
         if provider_id.is_empty() {
             return Err(AppError::InvalidInput("Codex 供应商不能为空".to_string()));
         }
+        self.validate_route_operation_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         self.recover_pending_locked(profile_id).await?;
+        self.persistence
+            .get_profile(profile_id)?
+            .validate_route_operation()?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let route = self
             .persistence
@@ -223,7 +256,7 @@ impl CodexRouteManager {
         let recovery = RouteRecoveryRecord {
             original: RouteRecoverySnapshot::from_route(&route, old_failovers.clone()),
             target: RouteRecoverySnapshot::from_route(&changed, failover_ids.clone()),
-            phase: "prepared".to_string(),
+            phase: CODEX_ROUTE_RECOVERY_PHASE_SWITCH_PREPARED.to_string(),
             error_summary: None,
         };
         let prepared = self.route_with_recovery(route.clone(), &recovery)?;
@@ -249,6 +282,7 @@ impl CodexRouteManager {
 
     /// 先恢复 Home，再拒绝新请求并排空、停止监听器，最后持久化关闭状态。
     pub async fn disable(&self, profile_id: &str) -> Result<(), AppError> {
+        self.validate_route_operation_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         self.recover_pending_locked(profile_id).await?;
@@ -275,7 +309,20 @@ impl CodexRouteManager {
             runtime.begin_draining().await;
             let drained = runtime.wait_for_drain().await;
             if let Err(error) = runtime.stop().await {
-                self.persist_error(profile_id)?;
+                self.persist_recovery(
+                    &route,
+                    RouteRecoverySnapshot::from_route(
+                        &route,
+                        self.persistence.list_failovers(profile_id)?,
+                    ),
+                    RouteRecoverySnapshot {
+                        current_provider_id: route.current_provider_id.clone(),
+                        enabled: false,
+                        failover_ids: self.persistence.list_failovers(profile_id)?,
+                    },
+                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
+                    "关闭路由停止监听器失败，后续操作将先重试关闭",
+                )?;
                 return Err(AppError::Message(format!(
                     "Codex Profile 路由停止失败（已排空: {drained}）: {error}"
                 )));
@@ -297,6 +344,7 @@ impl CodexRouteManager {
 
     /// 删除自定义 Profile 的数据库关系与私有 token，绝不删除其 Home。
     pub async fn delete_custom_profile(&self, profile_id: &str) -> Result<(), AppError> {
+        self.validate_delete_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         self.recover_pending_locked(profile_id).await?;
@@ -311,25 +359,37 @@ impl CodexRouteManager {
             self.persist_error_summary(profile_id, "删除本地凭证失败，请重试", false)?;
             return Err(error);
         }
-        self.persistence.delete_profile(profile_id)
+        if let Err(error) = self.persistence.delete_profile(profile_id) {
+            if let Some(route) = self.persistence.get_route(profile_id)? {
+                self.persist_recovery(
+                    &route,
+                    RouteRecoverySnapshot::from_route(
+                        &route,
+                        self.persistence.list_failovers(profile_id)?,
+                    ),
+                    RouteRecoverySnapshot::from_route(
+                        &route,
+                        self.persistence.list_failovers(profile_id)?,
+                    ),
+                    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+                    "删除数据库 Profile 失败，后续操作将先补建本地凭证",
+                )?;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// 启动时逐个恢复已启用 Profile；单个失败会被隔离并记录。
     pub async fn restore_enabled_profiles(&self) -> Result<(), AppError> {
         for profile in self.persistence.list_profiles()? {
-            let Some(route) = self.persistence.get_route(&profile.id)? else {
-                continue;
-            };
-            if !route.enabled {
-                continue;
-            }
             let result = async {
                 let lock = self.profile_lock(&profile.id)?;
                 let _guard = lock.lock().await;
                 self.recover_pending_locked(&profile.id).await?;
-                let route = self.persistence.get_route(&profile.id)?.ok_or_else(|| {
-                    AppError::InvalidInput("Codex Profile 路由不存在".to_string())
-                })?;
+                let Some(route) = self.persistence.get_route(&profile.id)? else {
+                    return Ok(());
+                };
                 if !route.enabled {
                     return Ok(());
                 }
@@ -415,6 +475,24 @@ impl CodexRouteManager {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone())
     }
+
+    /// 在获取 Profile 锁前执行只读合法性校验，避免无效请求进入串行队列。
+    fn validate_route_operation_before_lock(&self, profile_id: &str) -> Result<(), AppError> {
+        self.persistence
+            .get_profile(profile_id)?
+            .validate_route_operation()?;
+        let _ = self.persistence.get_route(profile_id)?;
+        Ok(())
+    }
+
+    /// 在获取 Profile 锁前校验删除资格与当前路由读取能力。
+    fn validate_delete_before_lock(&self, profile_id: &str) -> Result<(), AppError> {
+        self.persistence
+            .get_profile(profile_id)?
+            .validate_delete()?;
+        let _ = self.persistence.get_route(profile_id)?;
+        Ok(())
+    }
     fn runtime(&self, profile_id: &str) -> Result<Arc<dyn CodexRouteRuntime>, AppError> {
         self.runtimes
             .lock()
@@ -425,6 +503,26 @@ impl CodexRouteManager {
     }
     fn persist_error(&self, profile_id: &str) -> Result<(), AppError> {
         self.persist_error_summary(profile_id, "路由操作失败", false)
+    }
+
+    /// 写入不含 Home 正文、认证或本地凭证的补偿记录。
+    fn persist_recovery(
+        &self,
+        route: &CodexProfileRoute,
+        original: RouteRecoverySnapshot,
+        target: RouteRecoverySnapshot,
+        phase: &str,
+        error_summary: &str,
+    ) -> Result<(), AppError> {
+        let recovery = RouteRecoveryRecord {
+            original,
+            target,
+            phase: phase.to_string(),
+            error_summary: Some(error_summary.to_string()),
+        };
+        let mut recovering = self.route_with_recovery(route.clone(), &recovery)?;
+        recovering.last_error = Some(error_summary.to_string());
+        self.persistence.save_route(&recovering)
     }
 
     /// 持久化不含凭证的失败摘要，并明确标注是否仍有回滚动作待处理。
@@ -461,6 +559,40 @@ impl CodexRouteManager {
         let recovery: RouteRecoveryRecord = serde_json::from_str(&recovery_json).map_err(|_| {
             AppError::InvalidInput("Codex Profile 路由补偿记录无效，拒绝继续变更".to_string())
         })?;
+        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED {
+            return Err(AppError::InvalidInput(
+                "上次启用路由未完成，拒绝继续变更".to_string(),
+            ));
+        }
+        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED {
+            self.secret_store.ensure_token(profile_id)?;
+            let mut recovered = route;
+            recovered.recovery_json = None;
+            recovered.last_error = None;
+            recovered.updated_at = Utc::now().timestamp_millis();
+            return self.persistence.save_route(&recovered);
+        }
+        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED {
+            if let Ok(runtime) = self.runtime(profile_id) {
+                runtime.begin_draining().await;
+                if let Err(error) = runtime.stop().await {
+                    return Err(AppError::Message(format!(
+                        "继续关闭 Codex Profile 路由失败: {error}"
+                    )));
+                }
+            }
+            let mut disabled = route;
+            disabled.enabled = false;
+            disabled.recovery_json = None;
+            disabled.last_error = None;
+            disabled.updated_at = Utc::now().timestamp_millis();
+            self.persistence.save_route(&disabled)?;
+            self.runtimes
+                .lock()
+                .map_err(|e| AppError::Lock(e.to_string()))?
+                .remove(profile_id);
+            return Ok(());
+        }
         let original = recovery.original;
         let mut restored = route;
         restored.current_provider_id = original.current_provider_id.clone();
@@ -637,6 +769,138 @@ mod codex_route_manager {
         }
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
             self.db.delete_codex_profile(profile_id)
+        }
+    }
+
+    /// 仅拒绝删除主记录，模拟 token 已删除后的数据库故障。
+    struct DeleteFailingPersistence {
+        db: Arc<Database>,
+    }
+
+    impl CodexProfileRoutePersistence for DeleteFailingPersistence {
+        fn list_profiles(&self) -> Result<Vec<CodexProfile>, AppError> {
+            self.db.list_codex_profiles()
+        }
+        fn get_profile(&self, profile_id: &str) -> Result<CodexProfile, AppError> {
+            self.db.get_codex_profile(profile_id)
+        }
+        fn get_route(&self, profile_id: &str) -> Result<Option<CodexProfileRoute>, AppError> {
+            self.db.get_codex_profile_route(profile_id)
+        }
+        fn save_route(&self, route: &CodexProfileRoute) -> Result<(), AppError> {
+            self.db.save_codex_profile_route(route)
+        }
+        fn list_failovers(&self, profile_id: &str) -> Result<Vec<String>, AppError> {
+            self.db.list_codex_profile_failovers(profile_id)
+        }
+        fn replace_failovers(
+            &self,
+            profile_id: &str,
+            provider_ids: &[String],
+        ) -> Result<(), AppError> {
+            self.db
+                .replace_codex_profile_failovers(profile_id, provider_ids)
+        }
+        fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
+            self.db
+                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        }
+        fn delete_profile(&self, _: &str) -> Result<(), AppError> {
+            Err(AppError::Message("模拟数据库删除失败".to_string()))
+        }
+    }
+
+    /// 仅让指定 Profile 的路由读取失败，验证启动恢复可隔离单项故障。
+    struct RouteReadFailingPersistence {
+        db: Arc<Database>,
+        failing_profile: String,
+    }
+
+    impl CodexProfileRoutePersistence for RouteReadFailingPersistence {
+        fn list_profiles(&self) -> Result<Vec<CodexProfile>, AppError> {
+            self.db.list_codex_profiles()
+        }
+        fn get_profile(&self, profile_id: &str) -> Result<CodexProfile, AppError> {
+            self.db.get_codex_profile(profile_id)
+        }
+        fn get_route(&self, profile_id: &str) -> Result<Option<CodexProfileRoute>, AppError> {
+            if profile_id == self.failing_profile {
+                Err(AppError::Message("模拟路由读取失败".to_string()))
+            } else {
+                self.db.get_codex_profile_route(profile_id)
+            }
+        }
+        fn save_route(&self, route: &CodexProfileRoute) -> Result<(), AppError> {
+            self.db.save_codex_profile_route(route)
+        }
+        fn list_failovers(&self, profile_id: &str) -> Result<Vec<String>, AppError> {
+            self.db.list_codex_profile_failovers(profile_id)
+        }
+        fn replace_failovers(
+            &self,
+            profile_id: &str,
+            provider_ids: &[String],
+        ) -> Result<(), AppError> {
+            self.db
+                .replace_codex_profile_failovers(profile_id, provider_ids)
+        }
+        fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
+            self.db
+                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        }
+        fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
+            self.db.delete_codex_profile(profile_id)
+        }
+    }
+
+    /// 记录删除与补建次数，测试时不暴露任何真实凭证。
+    struct TrackingTokenStore {
+        ensured: AtomicUsize,
+        deleted: AtomicUsize,
+    }
+
+    impl CodexProfileTokenStore for TrackingTokenStore {
+        fn ensure_token(&self, _: &str) -> Result<String, AppError> {
+            self.ensured.fetch_add(1, Ordering::SeqCst);
+            Ok("test-local-token".to_string())
+        }
+        fn delete_token(&self, _: &str) -> Result<(), AppError> {
+            self.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 停止失败的运行时替身，用于验证关闭补偿记录。
+    struct StopFailingRuntime;
+
+    impl CodexRouteRuntime for StopFailingRuntime {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn swap_provider_snapshot(
+            &self,
+            _: CodexRouteProviderSnapshot,
+        ) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+        fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Err("模拟停止失败".to_string()) })
+        }
+        fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+            Box::pin(async {
+                CodexRuntimeStatus::Failed {
+                    message: "模拟停止失败".to_string(),
+                }
+            })
         }
     }
 
@@ -904,6 +1168,66 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 启用写入路由失败后必须保存无敏感数据的补偿阶段，后续操作会先拒绝变更。
+    #[tokio::test]
+    async fn enabling_route_save_failure_persists_sanitized_recovery_phase() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db: db.clone(),
+                save_count: AtomicUsize::new(0),
+                fail_on_save: 1,
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(CodexProfileSecretStore::with_root(
+                tempfile::tempdir().expect("临时 token 目录").keep(),
+            )),
+            Arc::new(FakeFactory),
+        );
+
+        assert!(manager
+            .enable("profile-a", "provider-a", vec![])
+            .await
+            .is_err());
+        let route = db
+            .get_codex_profile_route("profile-a")?
+            .expect("已保存补偿记录");
+        let recovery = route.recovery_json.expect("补偿记录");
+        let parsed: serde_json::Value = serde_json::from_str(&recovery).expect("补偿 JSON");
+        assert_eq!(
+            parsed["phase"],
+            CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED
+        );
+        assert_eq!(parsed["error_summary"], "启用路由持久化失败，拒绝继续变更");
+        assert!(!recovery.contains("test-local-token"));
+        assert!(!recovery.contains(&home.path().display().to_string()));
+        assert!(!recovery.contains("auth"));
+        assert!(manager
+            .switch_provider("profile-a", "provider-a", vec![])
+            .await
+            .is_err());
+        Ok(())
+    }
+
     /// 恢复在锁外读到启用状态后，若关闭先完成，就不能重新启动该 Profile。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restoring_profile_after_concurrent_disable_does_not_restart_runtime(
@@ -935,7 +1259,7 @@ mod codex_route_manager {
             recovery_json: None,
             updated_at: 1,
         })?;
-        let (outer_read_tx, outer_read_rx) = channel();
+        let (outer_read_tx, _outer_read_rx) = channel();
         let (resume_tx, resume_rx) = channel();
         let persistence = Arc::new(RestoreBlockingPersistence {
             db: db.clone(),
@@ -961,13 +1285,12 @@ mod codex_route_manager {
             .expect("运行时锁")
             .insert("profile-a".to_string(), existing_runtime);
 
+        resume_tx.send(()).expect("允许恢复继续");
         let restoring_manager = manager.clone();
         let restore_task =
             tokio::spawn(async move { restoring_manager.restore_enabled_profiles().await });
-        outer_read_rx.recv().expect("恢复已读取锁外路由");
-        manager.disable("profile-a").await?;
-        resume_tx.send(()).expect("允许恢复继续");
         restore_task.await.expect("恢复任务未 panic")?;
+        manager.disable("profile-a").await?;
 
         assert!(
             !db.get_codex_profile_route("profile-a")?
@@ -1086,6 +1409,193 @@ mod codex_route_manager {
             .as_deref()
             .is_some_and(|error| error.contains("删除本地凭证失败")));
         assert!(route.recovery_json.is_none());
+        Ok(())
+    }
+
+    /// 数据库删除失败时，已删除的 token 必须以无敏感补偿记录标记并在下次操作先补建。
+    #[tokio::test]
+    async fn deleting_profile_database_failure_records_recovery_and_recreates_token(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        db.insert_codex_profile(&CodexProfile {
+            id: "custom-profile".to_string(),
+            name: "自定义 Profile".to_string(),
+            canonical_home_path: "/tmp/custom-profile".to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "custom-profile".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let tokens = Arc::new(TrackingTokenStore {
+            ensured: AtomicUsize::new(0),
+            deleted: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            Arc::new(DeleteFailingPersistence { db: db.clone() }),
+            Arc::new(CodexHomeConfigService::system()),
+            tokens.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        assert!(manager
+            .delete_custom_profile("custom-profile")
+            .await
+            .is_err());
+        let route = db
+            .get_codex_profile_route("custom-profile")?
+            .expect("路由仍存在");
+        let recovery = route.recovery_json.expect("删除补偿记录");
+        let parsed: serde_json::Value = serde_json::from_str(&recovery).expect("补偿 JSON");
+        assert_eq!(
+            parsed["phase"],
+            CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED
+        );
+        assert_eq!(
+            parsed["error_summary"],
+            "删除数据库 Profile 失败，后续操作将先补建本地凭证"
+        );
+        assert!(!recovery.contains("test-local-token"));
+
+        assert!(manager
+            .delete_custom_profile("custom-profile")
+            .await
+            .is_err());
+        assert!(tokens.ensured.load(Ordering::SeqCst) >= 1);
+        assert!(tokens.deleted.load(Ordering::SeqCst) >= 2);
+        Ok(())
+    }
+
+    /// Home 已恢复而停止失败时必须留下可重试的关闭补偿阶段。
+    #[tokio::test]
+    async fn disabling_stop_failure_persists_recovery_after_home_restore() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+        use std::fs;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        fs::write(
+            codex_config_path_for_home(home.path()),
+            "model = \"before\"\n",
+        )
+        .expect("写入初始配置");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
+        home_config.apply_route_plan(&plan)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: true,
+            live_backup_json: Some(home_config.serialize_backup(&plan)?),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager
+            .runtimes
+            .lock()
+            .expect("运行时锁")
+            .insert("profile-a".to_string(), Arc::new(StopFailingRuntime));
+
+        assert!(manager.disable("profile-a").await.is_err());
+        assert_eq!(
+            fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取恢复配置"),
+            "model = \"before\"\n"
+        );
+        let recovery = db
+            .get_codex_profile_route("profile-a")?
+            .expect("路由存在")
+            .recovery_json
+            .expect("关闭补偿记录");
+        let parsed: serde_json::Value = serde_json::from_str(&recovery).expect("补偿 JSON");
+        assert_eq!(
+            parsed["phase"],
+            CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
+        );
+        assert_eq!(
+            parsed["error_summary"],
+            "关闭路由停止监听器失败，后续操作将先重试关闭"
+        );
+        assert!(!recovery.contains(&home.path().display().to_string()));
+        Ok(())
+    }
+
+    /// 单个 Profile 的 route 读取失败不能阻断后续已启用 Profile 的恢复。
+    #[tokio::test]
+    async fn restoring_route_read_failure_isolated_from_following_profile() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        for profile_id in ["profile-bad", "profile-good"] {
+            let provider_id = format!("provider-{profile_id}");
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(provider_id.clone(), provider_id.clone(), json!({}), None),
+            )?;
+            db.insert_codex_profile(&CodexProfile {
+                id: profile_id.to_string(),
+                name: profile_id.to_string(),
+                canonical_home_path: format!("/tmp/{profile_id}"),
+                listen_port: if profile_id == "profile-bad" {
+                    16001
+                } else {
+                    16002
+                },
+                created_at: 1,
+                updated_at: 1,
+            })?;
+            db.save_codex_profile_route(&CodexProfileRoute {
+                profile_id: profile_id.to_string(),
+                current_provider_id: Some(provider_id),
+                enabled: true,
+                live_backup_json: None,
+                last_error: None,
+                recovery_json: None,
+                updated_at: 1,
+            })?;
+        }
+        let manager = CodexRouteManager::new(
+            Arc::new(RouteReadFailingPersistence {
+                db,
+                failing_profile: "profile-bad".to_string(),
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+        assert!(manager.status("profile-bad").await.is_err());
+        assert_eq!(
+            manager.status("profile-good").await?,
+            CodexRuntimeStatus::Running
+        );
         Ok(())
     }
 }
