@@ -11,6 +11,7 @@ import {
   codexProfileKeys,
   useCreateCodexProfile,
   useDeleteCodexProfile,
+  useSetCodexProfileRouteEnabled,
   useUpdateCodexProfile,
 } from "./codexProfiles";
 
@@ -100,6 +101,64 @@ describe("codexProfileKeys", () => {
 });
 
 describe("Codex Profile mutations", () => {
+  it("开启路由时只传递目标 Profile 和它的供应商", async () => {
+    const queryClient = createQueryClient();
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const enableRoute = vi
+      .spyOn(codexProfilesApi, "enableRoute")
+      .mockResolvedValue(true);
+    const disableRoute = vi.spyOn(codexProfilesApi, "disableRoute");
+    const { result } = renderHook(() => useSetCodexProfileRouteEnabled(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        profileId: "profile-a",
+        providerId: "provider-a",
+        enabled: true,
+      });
+    });
+
+    expect(enableRoute).toHaveBeenCalledWith("profile-a", "provider-a", []);
+    expect(disableRoute).not.toHaveBeenCalled();
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: codexProfileKeys.state("profile-a"),
+    });
+    expect(invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: codexProfileKeys.state("profile-b"),
+    });
+  });
+
+  it("关闭路由时只传递目标 Profile", async () => {
+    const queryClient = createQueryClient();
+    const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");
+    const enableRoute = vi.spyOn(codexProfilesApi, "enableRoute");
+    const disableRoute = vi
+      .spyOn(codexProfilesApi, "disableRoute")
+      .mockResolvedValue(true);
+    const { result } = renderHook(() => useSetCodexProfileRouteEnabled(), {
+      wrapper: createQueryWrapper(queryClient),
+    });
+
+    await act(async () => {
+      await result.current.mutateAsync({
+        profileId: "profile-b",
+        providerId: "provider-b",
+        enabled: false,
+      });
+    });
+
+    expect(disableRoute).toHaveBeenCalledWith("profile-b");
+    expect(enableRoute).not.toHaveBeenCalled();
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: codexProfileKeys.state("profile-b"),
+    });
+    expect(invalidateQueries).not.toHaveBeenCalledWith({
+      queryKey: codexProfileKeys.state("profile-a"),
+    });
+  });
+
   it("创建成功后刷新 Profile 列表", async () => {
     const queryClient = createQueryClient();
     const invalidateQueries = vi.spyOn(queryClient, "invalidateQueries");

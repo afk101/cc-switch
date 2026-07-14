@@ -102,6 +102,7 @@ import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
 import HermesMemoryPanel from "@/components/hermes/HermesMemoryPanel";
 import { CodexHomeContextBar } from "@/components/codex/CodexHomeContextBar";
 import { CodexProfileManagerDialog } from "@/components/codex/CodexProfileManagerDialog";
+import { CodexProfileRouteToggle } from "@/components/codex/CodexProfileRouteToggle";
 import { codexProfilesApi } from "@/lib/api/codexProfiles";
 
 type View =
@@ -323,15 +324,27 @@ function App() {
     status: proxyStatus,
   } = useProxyStatus();
   const isCurrentAppTakeoverActive = takeoverStatus?.[activeApp] || false;
+  const isCodexProfileRouteRunning =
+    codexProfileState?.runtimeStatus === "running";
+  const isCodexProfileRouteEnabled = codexProfileState?.route?.enabled === true;
+  const isEffectiveProxyRunning =
+    activeApp === "codex" ? isCodexProfileRouteRunning : isProxyRunning;
+  const isEffectiveTakeoverActive =
+    activeApp === "codex"
+      ? isCodexProfileRouteEnabled
+      : isCurrentAppTakeoverActive;
   const activeProviderId = useMemo(() => {
+    if (activeApp === "codex") {
+      return codexProfileState?.route?.currentProviderId ?? undefined;
+    }
     const target = proxyStatus?.active_targets?.find(
       (t) => t.app_type === activeApp,
     );
     return target?.provider_id;
-  }, [proxyStatus?.active_targets, activeApp]);
+  }, [activeApp, codexProfileState?.route?.currentProviderId, proxyStatus]);
 
   const { data, isLoading, refetch } = useProvidersQuery(activeApp, {
-    isProxyRunning,
+    isProxyRunning: isEffectiveProxyRunning,
   });
   const providers = useMemo(() => data?.providers ?? {}, [data]);
   const currentProviderId = data?.currentProviderId ?? "";
@@ -363,8 +376,8 @@ function App() {
     setAsDefaultModel,
   } = useProviderActions(
     activeApp,
-    isProxyRunning,
-    isProxyRunning && isCurrentAppTakeoverActive,
+    isEffectiveProxyRunning,
+    isEffectiveProxyRunning && isEffectiveTakeoverActive,
   );
 
   const handleSwitchProvider = (provider: Provider) => {
@@ -1059,9 +1072,9 @@ function App() {
                       }
                       appId={activeApp}
                       isLoading={isLoading}
-                      isProxyRunning={isProxyRunning}
+                      isProxyRunning={isEffectiveProxyRunning}
                       isProxyTakeover={
-                        isProxyRunning && isCurrentAppTakeoverActive
+                        isEffectiveProxyRunning && isEffectiveTakeoverActive
                       }
                       activeProviderId={activeProviderId}
                       onSwitch={handleSwitchProvider}
@@ -1343,12 +1356,21 @@ function App() {
                 >
                   {activeApp === "claude-desktop" ? (
                     <ClaudeDesktopRouteToggle />
+                  ) : activeApp === "codex" ? (
+                    settingsData?.enableLocalProxy && (
+                      <CodexProfileRouteToggle
+                        profileId={selectedCodexProfileId}
+                        state={codexProfileState}
+                        isStateLoading={isCodexProfileStateLoading}
+                      />
+                    )
                   ) : (
                     settingsData?.enableLocalProxy && (
                       <ProxyToggle activeApp={activeApp} />
                     )
                   )}
                   {activeApp !== "claude-desktop" &&
+                    activeApp !== "codex" &&
                     settingsData?.enableFailoverToggle && (
                       <FailoverToggle activeApp={activeApp} />
                     )}

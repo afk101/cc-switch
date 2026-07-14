@@ -6,6 +6,13 @@ import type {
   UpdateCodexProfileInput,
 } from "@/types/codexProfile";
 
+/** 修改单个 Codex Profile 路由开关所需的完整作用域。 */
+export interface SetCodexProfileRouteEnabledInput {
+  profileId: string;
+  providerId: string | null;
+  enabled: boolean;
+}
+
 /** Codex Profile 查询键；状态键必须携带 Profile ID 以防跨 Home 串数据。 */
 export const codexProfileKeys = {
   all: ["codexProfiles"] as const,
@@ -19,6 +26,21 @@ export const codexProfileKeys = {
 /** 将 TanStack mutation 的变量适配为单参数路由停止调用。 */
 function disableCodexProfileRoute(profileId: string): Promise<boolean> {
   return codexProfilesApi.disableRoute(profileId);
+}
+
+/** 根据目标状态调用单个 Profile 的启用或关闭命令。 */
+function setCodexProfileRouteEnabled({
+  profileId,
+  providerId,
+  enabled,
+}: SetCodexProfileRouteEnabledInput): Promise<boolean> {
+  if (!enabled) {
+    return codexProfilesApi.disableRoute(profileId);
+  }
+  if (!providerId) {
+    return Promise.reject(new Error("当前 CODEX_HOME 未选择可路由供应商"));
+  }
+  return codexProfilesApi.enableRoute(profileId, providerId, []);
 }
 
 /** 获取全部 Codex Profile。 */
@@ -75,6 +97,19 @@ export function useDisableCodexProfileRoute() {
     onSuccess: async (_, profileId) => {
       await queryClient.invalidateQueries({
         queryKey: codexProfileKeys.state(profileId),
+      });
+    },
+  });
+}
+
+/** 切换指定 Profile 路由，并只刷新该 Profile 的状态缓存。 */
+export function useSetCodexProfileRouteEnabled() {
+  const queryClient = useQueryClient();
+  return useMutation<boolean, Error, SetCodexProfileRouteEnabledInput>({
+    mutationFn: setCodexProfileRouteEnabled,
+    onSuccess: async (_, input) => {
+      await queryClient.invalidateQueries({
+        queryKey: codexProfileKeys.state(input.profileId),
       });
     },
   });

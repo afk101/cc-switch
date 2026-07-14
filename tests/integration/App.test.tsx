@@ -8,6 +8,7 @@ import {
   setCurrentProviderId,
   setLiveProviderIds,
   setProviders,
+  setSettings,
 } from "../msw/state";
 import { emitTauriEvent } from "../msw/tauriMocks";
 
@@ -161,6 +162,28 @@ describe("App integration with MSW", () => {
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+  });
+
+  it("在 Codex 页面只渲染当前 Profile 的路由开关", async () => {
+    setSettings({
+      enableLocalProxy: true,
+      enableFailoverToggle: true,
+    });
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    fireEvent.click(screen.getByText("switch-codex"));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("switch", {
+          name: "切换 默认 Codex 路由",
+          hidden: true,
+        }),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getAllByRole("switch", { hidden: true })).toHaveLength(1);
+    expect(screen.queryByTitle(/接管 Codex/)).not.toBeInTheDocument();
   });
 
   it("covers basic provider flows via real hooks", async () => {
