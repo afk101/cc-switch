@@ -25,11 +25,19 @@ pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 /// 已迁移旧路由等待创建兼容本地凭证时使用的数据库设置键。
 pub const CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING: &str =
     "codex_legacy_token_pending_profile_id";
-/// 路由切换已持久化准备快照，后续阶段可据此回滚。
-pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_PREPARED: &str = "switch_prepared";
+/// 生命周期操作已经持久化，尚未执行运行时副作用。
+pub const CODEX_ROUTE_RECOVERY_PHASE_PREPARED: &str = "prepared";
+/// 启用运行时已启动，尚未完成路由持久化。
+pub const CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED: &str = "enable_started";
+/// 启用 Home 已写入，尚未完成路由持久化。
+pub const CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED: &str = "enable_home_applied";
 /// 启用已改动 Home 或运行时但路由持久化失败，必须先人工或自动收敛。
 pub const CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED: &str = "enable_persist_failed";
 /// 关闭已恢复 Home 但监听器停止失败，后续操作必须先完成关闭。
 pub const CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED: &str = "disable_stop_failed";
 /// 删除已移除本地凭证但数据库删除失败，后续操作必须先补建凭证。
 pub const CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED: &str = "delete_database_failed";
+/// 关闭运行时已停止，尚未将关闭状态保存到数据库。
+pub const CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED: &str = "disable_stopped";
+/// 删除本地凭证前的持久化阶段。
+pub const CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING: &str = "delete_token_pending";
