@@ -35,6 +35,9 @@ pub const CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED: &str = "enable_home_ap
 pub const CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED: &str = "enable_persist_failed";
 /// 关闭已恢复 Home 但监听器停止失败，后续操作必须先完成关闭。
 pub const CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED: &str = "disable_stop_failed";
+/// 关闭时 Home 恢复失败，后续操作必须先重试恢复 Home 再停止监听器。
+pub const CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED: &str =
+    "disable_home_restore_failed";
 /// 删除已移除本地凭证但数据库删除失败，后续操作必须先补建凭证。
 pub const CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED: &str = "delete_database_failed";
 /// 关闭运行时已停止，尚未将关闭状态保存到数据库。

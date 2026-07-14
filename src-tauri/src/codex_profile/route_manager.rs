@@ -6,8 +6,10 @@ use crate::codex_profile::{
     CodexProfileSecretStore, CodexRouteProviderSnapshot, CodexRouteRuntime,
     CodexRouteRuntimeFactory, CodexRuntimeStatus, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
-    CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED,
-    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
+    CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
+    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
+    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
     CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
     CODEX_ROUTE_RECOVERY_PHASE_PREPARED, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED,
     CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED,
@@ -188,6 +190,7 @@ impl CodexRouteManager {
         {
             let stop_error = runtime.stop().await.err();
             if let Some(stop_error) = stop_error {
+                self.track_runtime(profile.id.clone(), runtime.clone())?;
                 let _ = self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
@@ -199,6 +202,9 @@ impl CodexRouteManager {
         if !runtime.health_check().await {
             let error = "Codex Profile 路由健康检查失败";
             let stop_error = runtime.stop().await.err();
+            if stop_error.is_some() {
+                self.track_runtime(profile.id.clone(), runtime.clone())?;
+            }
             self.persist_operation_error(
                 profile_id,
                 CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
@@ -434,23 +440,21 @@ impl CodexRouteManager {
             {
                 self.persist_operation_error(
                     profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
                     &error.to_string(),
                 )?;
                 return Err(error);
             }
         }
         if let Ok(runtime) = self.runtime(profile_id) {
-            runtime.begin_draining().await;
-            let drained = runtime.wait_for_drain().await;
-            if let Err(error) = runtime.stop().await {
+            if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
                 self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
                     &error,
                 )?;
                 return Err(AppError::Message(format!(
-                    "Codex Profile 路由停止失败（已排空: {drained}）: {error}"
+                    "Codex Profile 路由停止失败: {error}"
                 )));
             }
         }
@@ -672,6 +676,16 @@ impl CodexRouteManager {
         Ok(())
     }
 
+    /// 停止监听器前先拒绝新请求并等待在途请求排空，超时状态会写入停止错误以便观测。
+    async fn drain_and_stop_runtime(runtime: Arc<dyn CodexRouteRuntime>) -> Result<(), String> {
+        runtime.begin_draining().await;
+        let drained = runtime.wait_for_drain().await;
+        runtime
+            .stop()
+            .await
+            .map_err(|error| format!("{error}（已排空: {drained}）"))
+    }
+
     /// 返回原始失败及补偿失败，避免调用方将未收敛状态误判为普通业务失败。
     fn compensation_failure_error(
         operation_error: &AppError,
@@ -863,12 +877,33 @@ impl CodexRouteManager {
             recovered.updated_at = Utc::now().timestamp_millis();
             return self.persistence.save_route(&recovered);
         }
-        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
+        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED {
+            if let Some(backup) = route.live_backup_json.as_deref() {
+                let profile = self.persistence.get_profile(profile_id)?;
+                if let Err(error) = self
+                    .home_config
+                    .restore_backup(std::path::Path::new(&profile.canonical_home_path), backup)
+                {
+                    self.persist_operation_error(
+                        profile_id,
+                        CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                        &error.to_string(),
+                    )?;
+                    return Err(Self::recovery_unconverged_error(error));
+                }
+            }
+        }
+        if recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED
+            || recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
             || recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED
         {
             if let Ok(runtime) = self.runtime(profile_id) {
-                runtime.begin_draining().await;
-                if let Err(error) = runtime.stop().await {
+                if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
+                    self.persist_operation_error(
+                        profile_id,
+                        CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
+                        &error,
+                    )?;
                     return Err(AppError::Message(format!(
                         "继续关闭 Codex Profile 路由失败: {error}"
                     )));
@@ -941,8 +976,7 @@ impl CodexRouteManager {
             }
         }
         if let Ok(runtime) = self.runtime(profile_id) {
-            runtime.begin_draining().await;
-            if let Err(error) = runtime.stop().await {
+            if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
                 self.persist_enable_recovery_error(
                     profile_id,
                     &recovery.phase,
@@ -995,6 +1029,10 @@ impl CodexRouteManager {
                 | ("enable", CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED)
                 | ("enable", CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED)
                 | ("disable", CODEX_ROUTE_RECOVERY_PHASE_PREPARED)
+                | (
+                    "disable",
+                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED
+                )
                 | ("disable", CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED)
                 | ("disable", CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED)
                 | ("delete", CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING)
@@ -1372,6 +1410,39 @@ mod codex_route_manager {
         }
     }
 
+    /// 可在测试中切换 Home 恢复失败状态，模拟修复外部文件问题后的重试。
+    struct ToggleRestoreHomeFileOps {
+        fail_writes: AtomicBool,
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for ToggleRestoreHomeFileOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                Err(AppError::Message("模拟 Home 恢复失败".to_string()))
+            } else {
+                crate::config::atomic_write(path, content)
+            }
+        }
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                Err(AppError::Message("模拟 Home 恢复删除失败".to_string()))
+            } else if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     impl CodexRouteRuntime for StopFailingRuntime {
         fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async { Ok(()) })
@@ -1515,6 +1586,66 @@ mod codex_route_manager {
                 .get(&scope.profile_id)
                 .expect("已配置 Profile 运行时")
                 .clone()
+        }
+    }
+
+    /// 可切换停止结果并记录排空过程的运行时替身。
+    struct RecoveryRuntime {
+        healthy: bool,
+        stop_fails: AtomicBool,
+        drain_waits: AtomicUsize,
+        drain_result: bool,
+    }
+
+    impl CodexRouteRuntime for RecoveryRuntime {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async move { self.healthy })
+        }
+        fn swap_provider_snapshot(
+            &self,
+            _: CodexRouteProviderSnapshot,
+        ) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async move {
+                self.drain_waits.fetch_add(1, Ordering::SeqCst);
+                self.drain_result
+            })
+        }
+        fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                if self.stop_fails.load(Ordering::SeqCst) {
+                    Err("模拟停止失败".to_string())
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+            Box::pin(async { CodexRuntimeStatus::Running })
+        }
+    }
+
+    /// 复用同一可恢复运行时的工厂，方便验证失败后的后续收敛。
+    struct RecoveryRuntimeFactory {
+        runtime: Arc<RecoveryRuntime>,
+    }
+
+    impl CodexRouteRuntimeFactory for RecoveryRuntimeFactory {
+        fn create(
+            &self,
+            _: CodexProfileScope,
+            _: String,
+            _: CodexRouteProviderSnapshot,
+        ) -> Arc<dyn CodexRouteRuntime> {
+            self.runtime.clone()
         }
     }
 
@@ -2340,6 +2471,187 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 启动阶段记录写入失败且停止失败后，恢复必须排空并移除被托管的运行时。
+    #[tokio::test]
+    async fn enabling_started_persistence_failure_tracks_runtime_until_recovery_stops_it(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(true),
+            drain_waits: AtomicUsize::new(0),
+            drain_result: true,
+        });
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db: db.clone(),
+                save_count: AtomicUsize::new(0),
+                fail_on_save: 2,
+                fail_replace: false,
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(RecoveryRuntimeFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+
+        assert!(manager
+            .enable("profile-a", "provider-a", vec![])
+            .await
+            .is_err());
+        assert_eq!(
+            manager.status("profile-a").await?,
+            CodexRuntimeStatus::Running
+        );
+        runtime.stop_fails.store(false, Ordering::SeqCst);
+
+        manager.recover_pending_locked("profile-a").await?;
+
+        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert!(manager.status("profile-a").await.is_err());
+        Ok(())
+    }
+
+    /// 健康检查失败且停止失败后，恢复必须继续托管运行时并采用完整排空关闭流程。
+    #[tokio::test]
+    async fn enabling_health_failure_tracks_runtime_until_recovery_drains_and_stops(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: false,
+            stop_fails: AtomicBool::new(true),
+            drain_waits: AtomicUsize::new(0),
+            drain_result: true,
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(RecoveryRuntimeFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+
+        assert!(manager
+            .enable("profile-a", "provider-a", vec![])
+            .await
+            .is_err());
+        assert_eq!(
+            manager.status("profile-a").await?,
+            CodexRuntimeStatus::Running
+        );
+        runtime.stop_fails.store(false, Ordering::SeqCst);
+
+        manager.recover_pending_locked("profile-a").await?;
+
+        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert!(manager.status("profile-a").await.is_err());
+        Ok(())
+    }
+
+    /// 恢复关闭即使排空超时也必须调用等待，并在停止失败时返回可观测的排空状态。
+    #[tokio::test]
+    async fn recovering_enable_residue_reports_drain_timeout_when_stop_still_fails(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery = RouteRecoveryRecord {
+            operation: "enable".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: None,
+                enabled: false,
+                failover_ids: vec![],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-a".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED.to_string(),
+            last_error: None,
+        };
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: Some(serde_json::to_string(&recovery).expect("编码恢复记录")),
+            updated_at: 1,
+        })?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(true),
+            drain_waits: AtomicUsize::new(0),
+            drain_result: false,
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-a".to_string(), runtime.clone())?;
+
+        let error = manager
+            .recover_pending_locked("profile-a")
+            .await
+            .expect_err("停止失败时恢复记录不得被清除");
+
+        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("已排空: false"));
+        assert!(db
+            .get_codex_profile_route("profile-a")?
+            .expect("路由记录")
+            .recovery_json
+            .is_some());
+        Ok(())
+    }
+
     /// 操作错误摘要不能把 token、认证字段或 Home 路径写入恢复记录。
     #[test]
     fn operation_error_summary_redacts_token_auth_and_home_path() {
@@ -2886,6 +3198,82 @@ mod codex_route_manager {
         assert_eq!(parsed["operation"], "disable");
         assert!(parsed["last_error"].is_string());
         assert!(!recovery.contains(&home.path().display().to_string()));
+        Ok(())
+    }
+
+    /// 关闭时 Home 恢复失败必须进入专用阶段，修复后恢复会重试 Home 并完成排空关闭。
+    #[tokio::test]
+    async fn disabling_home_restore_failure_retries_home_before_recovery_shutdown(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, "model = \"before\"\n").expect("写入初始配置");
+        let file_ops = Arc::new(ToggleRestoreHomeFileOps {
+            fail_writes: AtomicBool::new(false),
+        });
+        let home_config = Arc::new(CodexHomeConfigService::new(file_ops.clone()));
+        let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
+        home_config.apply_route_plan(&plan)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: true,
+            live_backup_json: Some(home_config.serialize_backup(&plan)?),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(false),
+            drain_waits: AtomicUsize::new(0),
+            drain_result: true,
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-a".to_string(), runtime.clone())?;
+        file_ops.fail_writes.store(true, Ordering::SeqCst);
+
+        assert!(manager.disable("profile-a").await.is_err());
+        let recovery: serde_json::Value = serde_json::from_str(
+            &db.get_codex_profile_route("profile-a")?
+                .expect("路由记录")
+                .recovery_json
+                .expect("关闭补偿记录"),
+        )
+        .expect("解析关闭补偿记录");
+        assert_eq!(recovery["phase"], "disable_home_restore_failed");
+
+        file_ops.fail_writes.store(false, Ordering::SeqCst);
+        manager.recover_pending_locked("profile-a").await?;
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取恢复配置"),
+            "model = \"before\"\n"
+        );
+        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert!(manager.status("profile-a").await.is_err());
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
         Ok(())
     }
 
