@@ -1,4 +1,6 @@
-use crate::codex_profile::constants::{CODEX_ROUTE_LISTEN_HOST, FIRST_CUSTOM_CODEX_ROUTE_PORT};
+use crate::codex_profile::constants::{
+    CODEX_ROUTE_LISTEN_HOST, FIRST_CUSTOM_CODEX_ROUTE_PORT, MIN_CODEX_ROUTE_PORT,
+};
 use crate::codex_profile::{CodexProfile, CodexRuntimeStatus};
 use crate::database::Database;
 use crate::error::AppError;
@@ -73,16 +75,22 @@ impl CodexProfileRepository {
         Ok(canonical_path)
     }
 
-    /// 创建新的 Profile、初始空路由记录与固定监听端口。
-    pub fn create_profile(&self, name: &str, home_path: &Path) -> Result<CodexProfile, AppError> {
+    /// 创建新的 Profile、初始空路由记录与指定或自动分配的监听端口。
+    pub fn create_profile(
+        &self,
+        name: &str,
+        home_path: &Path,
+        requested_port: Option<u16>,
+    ) -> Result<CodexProfile, AppError> {
         let profile_name = validate_profile_name(name)?;
         let canonical_home = self.validate_new_home(home_path)?;
+        let listen_port = self.resolve_create_port(requested_port)?;
         let now = Utc::now().timestamp();
         let profile = CodexProfile {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile_name,
             canonical_home_path: canonical_home.to_string_lossy().into_owned(),
-            listen_port: self.allocate_port()?,
+            listen_port,
             created_at: now,
             updated_at: now,
         };
@@ -112,6 +120,46 @@ impl CodexProfileRepository {
         profile.updated_at = Utc::now().timestamp();
         self.db.update_codex_profile(&profile)?;
         Ok(profile)
+    }
+
+    /// 原子更新 Profile 的名称、CODEX_HOME 与监听端口。
+    pub fn update_profile(
+        &self,
+        profile_id: &str,
+        name: &str,
+        home_path: &Path,
+        listen_port: u16,
+        runtime_status: CodexRuntimeStatus,
+    ) -> Result<CodexProfile, AppError> {
+        let original = self.db.get_codex_profile(profile_id)?;
+        let profile_name = validate_profile_name(name)?;
+        let canonical_home = self.canonicalizer.canonicalize(home_path)?;
+        let canonical_home_path = canonical_home.to_string_lossy().into_owned();
+        let home_changed = canonical_home_path != original.canonical_home_path;
+        let port_changed = listen_port != original.listen_port;
+
+        if home_changed {
+            original.validate_rebind()?;
+        }
+        if runtime_status.is_active() && (home_changed || port_changed) {
+            return Err(AppError::InvalidInput(
+                "运行中的 Codex Profile 只能修改名称".to_string(),
+            ));
+        }
+        if home_changed {
+            self.ensure_home_is_available(&canonical_home, Some(profile_id))?;
+        }
+        if port_changed {
+            self.ensure_port_is_available(listen_port, Some(profile_id))?;
+        }
+
+        let mut updated = original;
+        updated.name = profile_name;
+        updated.canonical_home_path = canonical_home_path;
+        updated.listen_port = listen_port;
+        updated.updated_at = Utc::now().timestamp();
+        self.db.update_codex_profile(&updated)?;
+        Ok(updated)
     }
 
     /// 在非默认且未运行时重新绑定 Profile 的 CODEX_HOME。
@@ -144,14 +192,50 @@ impl CodexProfileRepository {
             if reserved_ports.contains(&port) {
                 continue;
             }
-            if self
-                .port_availability
-                .is_available(CODEX_ROUTE_LISTEN_HOST, port)?
-            {
+            if self.is_system_port_available(port)? {
                 return Ok(port);
             }
         }
         Err(AppError::Config("没有可分配的 Codex 路由端口".to_string()))
+    }
+
+    /// 解析新建 Profile 的监听端口，未指定时使用自动分配。
+    fn resolve_create_port(&self, requested_port: Option<u16>) -> Result<u16, AppError> {
+        match requested_port {
+            Some(port) => {
+                self.ensure_port_is_available(port, None)?;
+                Ok(port)
+            }
+            None => self.allocate_port(),
+        }
+    }
+
+    /// 校验监听端口未被其他 Profile 或操作系统占用。
+    fn ensure_port_is_available(
+        &self,
+        port: u16,
+        excluded_profile_id: Option<&str>,
+    ) -> Result<(), AppError> {
+        if port < MIN_CODEX_ROUTE_PORT {
+            return Err(AppError::InvalidInput(
+                "Codex Profile 监听端口必须大于 0".to_string(),
+            ));
+        }
+        let port_is_reserved = self.db.list_codex_profiles()?.into_iter().any(|profile| {
+            profile.listen_port == port && Some(profile.id.as_str()) != excluded_profile_id
+        });
+        if port_is_reserved || !self.is_system_port_available(port)? {
+            return Err(AppError::InvalidInput(format!(
+                "Codex Profile 监听端口已被占用: {port}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 检查监听端口是否可由当前进程绑定。
+    fn is_system_port_available(&self, port: u16) -> Result<bool, AppError> {
+        self.port_availability
+            .is_available(CODEX_ROUTE_LISTEN_HOST, port)
     }
 
     /// 校验给定规范化路径未被除可选自身外的 Profile 占用。
@@ -210,12 +294,219 @@ fn test_profile(id: &str, listen_port: u16) -> CodexProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexProfileRepository, SystemHomePathCanonicalizer, SystemPortAvailability};
+    use super::{
+        CodexProfileRepository, PortAvailability, SystemHomePathCanonicalizer,
+        SystemPortAvailability,
+    };
     use crate::database::Database;
     use crate::error::AppError;
+    use std::collections::HashSet;
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Arc;
+
+    /// 通过固定集合模拟操作系统端口占用状态。
+    struct FakePortAvailability {
+        unavailable_ports: HashSet<u16>,
+    }
+
+    impl PortAvailability for FakePortAvailability {
+        fn is_available(&self, _host: &str, port: u16) -> Result<bool, AppError> {
+            Ok(!self.unavailable_ports.contains(&port))
+        }
+    }
+
+    #[test]
+    fn create_profile_uses_requested_available_port() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let home = temp_dir.path().join("home");
+        std::fs::create_dir(&home).expect("创建 Home");
+        let repository = CodexProfileRepository::new(
+            Arc::new(Database::memory()?),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: HashSet::new(),
+            }),
+        );
+
+        let profile = repository.create_profile("工作", &home, Some(15_730))?;
+
+        assert_eq!(profile.listen_port, 15_730);
+        Ok(())
+    }
+
+    #[test]
+    fn create_profile_rejects_reserved_or_bound_requested_port() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let reserved_home = temp_dir.path().join("reserved");
+        let bound_home = temp_dir.path().join("bound");
+        std::fs::create_dir(&reserved_home).expect("创建保留端口 Home");
+        std::fs::create_dir(&bound_home).expect("创建监听端口 Home");
+        let db = Arc::new(Database::memory()?);
+        db.insert_codex_profile(&super::test_profile("reserved", 15_730))?;
+        let repository = CodexProfileRepository::new(
+            db,
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: [15_731].into_iter().collect(),
+            }),
+        );
+
+        assert!(repository
+            .create_profile("数据库冲突", &reserved_home, Some(15_730))
+            .is_err());
+        assert!(repository
+            .create_profile("系统冲突", &bound_home, Some(15_731))
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn update_profile_keeps_all_fields_when_requested_port_is_unavailable() -> Result<(), AppError>
+    {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let old_home = temp_dir.path().join("old-home");
+        let new_home = temp_dir.path().join("new-home");
+        std::fs::create_dir(&old_home).expect("创建旧 Home");
+        std::fs::create_dir(&new_home).expect("创建新 Home");
+        let db = Arc::new(Database::memory()?);
+        let repository = CodexProfileRepository::new(
+            db.clone(),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: [15_740].into_iter().collect(),
+            }),
+        );
+        let original = repository.create_profile("旧名称", &old_home, Some(15_730))?;
+
+        assert!(repository
+            .update_profile(
+                &original.id,
+                "新名称",
+                &new_home,
+                15_740,
+                super::CodexRuntimeStatus::Stopped,
+            )
+            .is_err());
+
+        let persisted = db.get_codex_profile(&original.id)?;
+        assert_eq!(persisted.name, original.name);
+        assert_eq!(persisted.canonical_home_path, original.canonical_home_path);
+        assert_eq!(persisted.listen_port, original.listen_port);
+        Ok(())
+    }
+
+    #[test]
+    fn update_running_profile_allows_name_only() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let home = temp_dir.path().join("home");
+        std::fs::create_dir(&home).expect("创建 Home");
+        let repository = CodexProfileRepository::new(
+            Arc::new(Database::memory()?),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: HashSet::new(),
+            }),
+        );
+        let original = repository.create_profile("旧名称", &home, Some(15_730))?;
+
+        let updated = repository.update_profile(
+            &original.id,
+            "新名称",
+            &home,
+            original.listen_port,
+            super::CodexRuntimeStatus::Running,
+        )?;
+
+        assert_eq!(updated.name, "新名称");
+        assert_eq!(updated.canonical_home_path, original.canonical_home_path);
+        assert_eq!(updated.listen_port, original.listen_port);
+        Ok(())
+    }
+
+    #[test]
+    fn update_running_profile_rejects_home_or_port_changes() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let old_home = temp_dir.path().join("old-home");
+        let new_home = temp_dir.path().join("new-home");
+        std::fs::create_dir(&old_home).expect("创建旧 Home");
+        std::fs::create_dir(&new_home).expect("创建新 Home");
+        let db = Arc::new(Database::memory()?);
+        let repository = CodexProfileRepository::new(
+            db.clone(),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: HashSet::new(),
+            }),
+        );
+        let original = repository.create_profile("旧名称", &old_home, Some(15_730))?;
+
+        assert!(repository
+            .update_profile(
+                &original.id,
+                "新名称",
+                &new_home,
+                original.listen_port,
+                super::CodexRuntimeStatus::Running,
+            )
+            .is_err());
+        assert!(repository
+            .update_profile(
+                &original.id,
+                "新名称",
+                &old_home,
+                15_731,
+                super::CodexRuntimeStatus::Running,
+            )
+            .is_err());
+
+        let persisted = db.get_codex_profile(&original.id)?;
+        assert_eq!(persisted.name, original.name);
+        assert_eq!(persisted.canonical_home_path, original.canonical_home_path);
+        assert_eq!(persisted.listen_port, original.listen_port);
+        Ok(())
+    }
+
+    #[test]
+    fn update_default_profile_rejects_home_change_but_allows_stopped_name_and_port(
+    ) -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建临时目录");
+        let default_home = temp_dir.path().join("default-home");
+        let new_home = temp_dir.path().join("new-home");
+        std::fs::create_dir(&default_home).expect("创建默认 Home");
+        std::fs::create_dir(&new_home).expect("创建新 Home");
+        let repository = CodexProfileRepository::new(
+            Arc::new(Database::memory()?),
+            Arc::new(SystemHomePathCanonicalizer),
+            Arc::new(FakePortAvailability {
+                unavailable_ports: HashSet::new(),
+            }),
+        );
+        let original = repository.create_default_profile(&default_home)?;
+
+        assert!(matches!(
+            repository.update_profile(
+                &original.id,
+                "新名称",
+                &new_home,
+                15_730,
+                super::CodexRuntimeStatus::Stopped,
+            ),
+            Err(AppError::DefaultCodexProfileImmutable)
+        ));
+
+        let updated = repository.update_profile(
+            &original.id,
+            "新名称",
+            &default_home,
+            15_730,
+            super::CodexRuntimeStatus::Stopped,
+        )?;
+        assert_eq!(updated.name, "新名称");
+        assert_eq!(updated.canonical_home_path, original.canonical_home_path);
+        assert_eq!(updated.listen_port, 15_730);
+        Ok(())
+    }
 
     #[cfg(unix)]
     #[test]
@@ -232,7 +523,7 @@ mod tests {
             Arc::new(SystemHomePathCanonicalizer),
             Arc::new(SystemPortAvailability),
         );
-        repository.create_profile("工作", &real_home)?;
+        repository.create_profile("工作", &real_home, None)?;
 
         assert!(matches!(
             repository.validate_new_home(&symlink_home),
@@ -308,7 +599,7 @@ mod tests {
             Arc::new(SystemHomePathCanonicalizer),
             Arc::new(SystemPortAvailability),
         );
-        let profile = repository.create_profile("工作", &old_home)?;
+        let profile = repository.create_profile("工作", &old_home, None)?;
 
         assert!(matches!(
             repository.rebind_profile(
@@ -333,7 +624,7 @@ mod tests {
             Arc::new(SystemHomePathCanonicalizer),
             Arc::new(SystemPortAvailability),
         );
-        let profile = repository.create_profile(" 工作 ", &old_home)?;
+        let profile = repository.create_profile(" 工作 ", &old_home, None)?;
 
         let renamed = repository.rename_profile(&profile.id, "新名称")?;
         let rebound = repository.rebind_profile(
@@ -373,7 +664,7 @@ mod tests {
             Arc::new(SystemPortAvailability),
         );
 
-        assert!(repository.create_profile("工作", &home).is_err());
+        assert!(repository.create_profile("工作", &home, None).is_err());
         assert!(db.list_codex_profiles()?.is_empty(), "Profile 写入必须回滚");
         let route_count: i64 = db
             .conn

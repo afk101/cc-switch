@@ -62,9 +62,10 @@ pub fn create_codex_profile(
     state: State<'_, AppState>,
     name: String,
     #[allow(non_snake_case)] homePath: String,
+    #[allow(non_snake_case)] listenPort: Option<u16>,
 ) -> Result<CodexProfile, String> {
     profile_repository(&state)
-        .create_profile(&name, Path::new(&homePath))
+        .create_profile(&name, Path::new(&homePath), listenPort)
         .map_err(|error| error.to_string())
 }
 
@@ -77,6 +78,31 @@ pub fn rename_codex_profile(
 ) -> Result<CodexProfile, String> {
     profile_repository(&state)
         .rename_profile(&profileId, &name)
+        .map_err(|error| error.to_string())
+}
+
+/// 原子修改指定 Profile 的名称、CODEX_HOME 与监听端口。
+#[tauri::command]
+pub async fn update_codex_profile(
+    state: State<'_, AppState>,
+    #[allow(non_snake_case)] profileId: String,
+    name: String,
+    #[allow(non_snake_case)] homePath: String,
+    #[allow(non_snake_case)] listenPort: u16,
+) -> Result<CodexProfile, String> {
+    let runtime_status = state
+        .codex_route_manager
+        .status(&profileId)
+        .await
+        .unwrap_or(CodexRuntimeStatus::Stopped);
+    profile_repository(&state)
+        .update_profile(
+            &profileId,
+            &name,
+            Path::new(&homePath),
+            listenPort,
+            runtime_status,
+        )
         .map_err(|error| error.to_string())
 }
 

@@ -8,6 +8,8 @@ pub const DEFAULT_CODEX_PROFILE_NAME: &str = "默认 Codex";
 pub const LEGACY_CODEX_ROUTE_PORT: u16 = 15_721;
 /// 新建 Codex Profile 自动分配端口的起始值。
 pub const FIRST_CUSTOM_CODEX_ROUTE_PORT: u16 = 15_722;
+/// Codex Profile 可使用的最小监听端口。
+pub const MIN_CODEX_ROUTE_PORT: u16 = 1;
 /// Codex 本地路由仅允许监听 loopback 地址。
 pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
 /// Profile 排空已进入请求的最长等待时间，超时后仍停止监听器。

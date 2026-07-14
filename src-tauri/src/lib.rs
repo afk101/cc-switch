@@ -1286,6 +1286,7 @@ pub fn run() {
             commands::list_codex_profiles,
             commands::create_codex_profile,
             commands::rename_codex_profile,
+            commands::update_codex_profile,
             commands::rebind_codex_profile,
             commands::update_codex_profile_port,
             commands::get_codex_profile_state,
