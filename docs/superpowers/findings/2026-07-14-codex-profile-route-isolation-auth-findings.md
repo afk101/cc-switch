@@ -114,7 +114,7 @@
 ### 最终自动化验证
 
 - `cargo test --manifest-path src-tauri/Cargo.toml --lib --quiet`：1844 通过、0 失败、2 忽略。
-- `pnpm run test:unit`：70 个测试文件、434 个测试全部通过。
+- `pnpm run test:unit` 首次全量验证：70 个测试文件、434 个测试全部通过；提交后并发复跑出现一次 1 文件/1 用例失败，但封装脚本只保留汇总，不能确认具体失败项。按失败协议改用 `pnpm exec vitest run --minWorkers=1 --maxWorkers=1 --no-file-parallelism` 后，70 个测试文件、434 个测试全部通过；未为验证修改产品代码、测试时限或 Vitest 配置。
 - `pnpm run typecheck`、`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`：通过。
 - 首次误用 `pnpm test -- --run` 被 shell 解析为系统 `test`，未执行任何测试；随后读取 `package.json` 后改用项目实际脚本 `pnpm run test:unit`，没有重复失败命令。
 
