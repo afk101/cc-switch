@@ -310,7 +310,14 @@ impl CodexRouteManager {
             return Err(error);
         }
         self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED, None)?;
-        self.clear_operation(&changed)?;
+        if let Err(error) = self.clear_operation(&changed) {
+            self.persist_operation_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED,
+                &error.to_string(),
+            )?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -1213,20 +1220,9 @@ mod codex_route_manager {
         }
     }
 
-    fn manager(db: Arc<Database>) -> CodexRouteManager {
-        CodexRouteManager::new(
-            db,
-            Arc::new(CodexHomeConfigService::system()),
-            Arc::new(CodexProfileSecretStore::with_root(
-                tempfile::tempdir().expect("临时目录").keep(),
-            )),
-            Arc::new(FakeFactory),
-        )
-    }
-
-    /// 切换 A 只能替换 A 的新请求快照，B 的供应商与端口保持不变。
+    /// 最终清理操作记录保存失败时，不能把切换伪装成完全成功。
     #[tokio::test]
-    async fn switching_profile_a_does_not_change_profile_b_snapshot() -> Result<(), AppError> {
+    async fn switching_clear_operation_save_failure_keeps_pending_phase() -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         for id in ["provider-a", "provider-a-next", "provider-b"] {
             db.save_provider(
@@ -1257,7 +1253,14 @@ mod codex_route_manager {
                 updated_at: 1,
             })?;
         }
-        let manager = manager(db);
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db: db.clone(), save_count: AtomicUsize::new(0), fail_on_save: 6, fail_replace: false,
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(CodexProfileSecretStore::with_root(tempfile::tempdir().expect("临时 token 目录").keep())),
+            Arc::new(FakeFactory),
+        );
         let runtime_a = Arc::new(FakeRuntime {
             provider: AsyncMutex::new("provider-a".to_string()),
             port: 16001,
@@ -1276,12 +1279,20 @@ mod codex_route_manager {
             .lock()
             .expect("运行时锁")
             .insert("profile-b".to_string(), runtime_b.clone());
-        manager
+        assert!(manager
             .switch_provider("profile-a", "provider-a-next", vec![])
-            .await?;
+            .await
+            .is_err());
         assert_eq!(*runtime_a.provider.lock().await, "provider-a-next");
         assert_eq!(*runtime_b.provider.lock().await, "provider-b");
         assert_eq!(runtime_b.port, 16002);
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        let recovery: serde_json::Value = serde_json::from_str(
+            &route.recovery_json.expect("未清理的操作记录"),
+        ).expect("操作 JSON");
+        assert_eq!(recovery["phase"], CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED);
+        assert!(recovery["last_error"].is_string());
+        assert!(manager.switch_provider("profile-a", "provider-a-next", vec![]).await.is_ok());
         Ok(())
     }
 
