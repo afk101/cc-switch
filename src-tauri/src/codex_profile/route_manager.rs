@@ -1506,6 +1506,25 @@ mod codex_route_manager {
         }
     }
 
+    /// 非法恢复记录必须在任何运行时或凭证副作用之前被拒绝并原样保留。
+    #[test]
+    fn recovery_record_validation_rejects_malformed_unknown_and_mismatched_states() {
+        let manager = CodexRouteManager::new(
+            Arc::new(Database::memory().expect("内存数据库")),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore { ensured: AtomicUsize::new(0), deleted: AtomicUsize::new(0) }),
+            Arc::new(FakeFactory),
+        );
+        let snapshot = RouteRecoverySnapshot { current_provider_id: None, enabled: false, failover_ids: vec![] };
+        for record in [
+            RouteRecoveryRecord { operation: "unknown".to_string(), before: snapshot.clone(), target: snapshot.clone(), phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(), last_error: None },
+            RouteRecoveryRecord { operation: "switch".to_string(), before: snapshot.clone(), target: snapshot.clone(), phase: CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING.to_string(), last_error: None },
+        ] {
+            assert!(manager.validate_recovery_record(&record).is_err());
+        }
+        assert!(serde_json::from_str::<RouteRecoveryRecord>("{").is_err());
+    }
+
     /// Home 写入失败且停止失败时，操作记录必须保留并阻断后续变更。
     #[tokio::test]
     async fn enabling_home_apply_failure_with_stop_failure_keeps_operation_and_rejects_mutation(
