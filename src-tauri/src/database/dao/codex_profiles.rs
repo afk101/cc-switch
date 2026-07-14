@@ -28,7 +28,8 @@ fn map_codex_profile_route(row: &Row<'_>) -> rusqlite::Result<CodexProfileRoute>
         enabled: row.get(2)?,
         live_backup_json: row.get(3)?,
         last_error: row.get(4)?,
-        updated_at: row.get(5)?,
+        recovery_json: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
@@ -188,7 +189,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
         ensure_codex_profile_exists(&conn, profile_id)?;
         match conn.query_row(
-            "SELECT profile_id, current_provider_id, enabled, live_backup_json, last_error, updated_at
+            "SELECT profile_id, current_provider_id, enabled, live_backup_json, last_error, recovery_json, updated_at
              FROM codex_profile_routes WHERE profile_id = ?1",
             [profile_id],
             map_codex_profile_route,
@@ -205,14 +206,15 @@ impl Database {
         ensure_codex_profile_exists(&conn, &route.profile_id)?;
         conn.execute(
             "INSERT INTO codex_profile_routes
-             (profile_id, current_provider_id, provider_app_type, enabled, live_backup_json, last_error, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             (profile_id, current_provider_id, provider_app_type, enabled, live_backup_json, last_error, recovery_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(profile_id) DO UPDATE SET
                  current_provider_id = excluded.current_provider_id,
                  provider_app_type = excluded.provider_app_type,
                  enabled = excluded.enabled,
                  live_backup_json = excluded.live_backup_json,
                  last_error = excluded.last_error,
+                 recovery_json = excluded.recovery_json,
                  updated_at = excluded.updated_at",
             params![
                 route.profile_id,
@@ -221,6 +223,7 @@ impl Database {
                 route.enabled,
                 route.live_backup_json,
                 route.last_error,
+                route.recovery_json,
                 route.updated_at,
             ],
         )

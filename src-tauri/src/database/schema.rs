@@ -464,6 +464,11 @@ impl Database {
                         Self::migrate_v13_to_v14(conn)?;
                         Self::set_user_version(conn, 14)?;
                     }
+                    14 => {
+                        log::info!("迁移数据库从 v14 到 v15（Codex Profile 路由补偿记录）");
+                        Self::migrate_v14_to_v15(conn)?;
+                        Self::set_user_version(conn, 15)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1309,6 +1314,7 @@ impl Database {
                 enabled BOOLEAN NOT NULL DEFAULT 0,
                 live_backup_json TEXT,
                 last_error TEXT,
+                recovery_json TEXT,
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
                 FOREIGN KEY (current_provider_id, provider_app_type)
@@ -1465,6 +1471,14 @@ impl Database {
     fn migrate_v13_to_v14(conn: &Connection) -> Result<(), AppError> {
         if Self::table_exists(conn, "codex_profile_routes")? {
             Self::add_column_if_missing(conn, "codex_profile_routes", "last_error", "TEXT")?;
+        }
+        Ok(())
+    }
+
+    /// v14 -> v15：为可恢复的 Profile 路由变更保存无敏感补偿记录。
+    fn migrate_v14_to_v15(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "codex_profile_routes")? {
+            Self::add_column_if_missing(conn, "codex_profile_routes", "recovery_json", "TEXT")?;
         }
         Ok(())
     }

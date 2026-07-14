@@ -10,6 +10,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
@@ -79,6 +80,23 @@ pub struct CodexRouteManager {
     locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
+/// 补偿记录只保存路由标识与开关状态，避免把 Home 正文或凭证写入数据库。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RouteRecoveryRecord {
+    original: RouteRecoverySnapshot,
+    target: RouteRecoverySnapshot,
+    phase: String,
+    error_summary: Option<String>,
+}
+
+/// 可恢复的路由快照不包含 live backup、token 或认证配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RouteRecoverySnapshot {
+    current_provider_id: Option<String>,
+    enabled: bool,
+    failover_ids: Vec<String>,
+}
+
 impl CodexRouteManager {
     /// 使用注入依赖创建 Profile 隔离路由管理器。
     pub fn new(
@@ -106,6 +124,7 @@ impl CodexRouteManager {
     ) -> Result<(), AppError> {
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
+        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_route_operation()?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
@@ -148,6 +167,7 @@ impl CodexRouteManager {
             enabled: true,
             live_backup_json: Some(backup),
             last_error: None,
+            recovery_json: None,
             updated_at: Utc::now().timestamp_millis(),
         };
         if let Err(error) = self.persistence.save_route(&route) {
@@ -174,42 +194,56 @@ impl CodexRouteManager {
         provider_id: &str,
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
+        if provider_id.is_empty() {
+            return Err(AppError::InvalidInput("Codex 供应商不能为空".to_string()));
+        }
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
+        self.recover_pending_locked(profile_id).await?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let route = self
             .persistence
             .get_route(profile_id)?
             .ok_or_else(|| AppError::InvalidInput("Codex Profile 路由不存在".to_string()))?;
+        let old_failovers = self.persistence.list_failovers(profile_id)?;
         let old_snapshot = self.provider_snapshot(
             route
                 .current_provider_id
                 .as_deref()
                 .ok_or_else(|| AppError::InvalidInput("Codex Profile 未配置供应商".to_string()))?,
-            &self.persistence.list_failovers(profile_id)?,
+            &old_failovers,
         )?;
         let runtime = self.runtime(profile_id)?;
-        runtime.swap_provider_snapshot(snapshot).await;
         let changed = crate::codex_profile::CodexProfileRoute {
             current_provider_id: Some(provider_id.to_string()),
             last_error: None,
             updated_at: Utc::now().timestamp_millis(),
             ..route.clone()
         };
-        if let Err(error) = self.persistence.save_route(&changed) {
-            runtime.swap_provider_snapshot(old_snapshot).await;
-            self.persist_error(profile_id)?;
+        let recovery = RouteRecoveryRecord {
+            original: RouteRecoverySnapshot::from_route(&route, old_failovers.clone()),
+            target: RouteRecoverySnapshot::from_route(&changed, failover_ids.clone()),
+            phase: "prepared".to_string(),
+            error_summary: None,
+        };
+        let prepared = self.route_with_recovery(route.clone(), &recovery)?;
+        self.persistence.save_route(&prepared)?;
+        runtime.swap_provider_snapshot(snapshot).await;
+        let changing = self.route_with_recovery(changed.clone(), &recovery)?;
+        if let Err(error) = self.persistence.save_route(&changing) {
+            self.restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot, &recovery)
+                .await;
             return Err(error);
         }
         if let Err(error) = self
             .persistence
             .replace_failovers(profile_id, &failover_ids)
         {
-            runtime.swap_provider_snapshot(old_snapshot).await;
-            let restore_error = self.persistence.save_route(&route).err();
-            self.persist_switch_rollback_error(profile_id, restore_error.as_ref())?;
+            self.restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot, &recovery)
+                .await;
             return Err(error);
         }
+        self.persistence.save_route(&changed)?;
         Ok(())
     }
 
@@ -217,6 +251,7 @@ impl CodexRouteManager {
     pub async fn disable(&self, profile_id: &str) -> Result<(), AppError> {
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
+        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         let route = self
             .persistence
@@ -264,6 +299,7 @@ impl CodexRouteManager {
     pub async fn delete_custom_profile(&self, profile_id: &str) -> Result<(), AppError> {
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
+        self.recover_pending_locked(profile_id).await?;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_delete()?;
         if let Some(route) = self.persistence.get_route(profile_id)? {
@@ -288,6 +324,12 @@ impl CodexRouteManager {
                 continue;
             }
             let result = async {
+                let lock = self.profile_lock(&profile.id)?;
+                let _guard = lock.lock().await;
+                self.recover_pending_locked(&profile.id).await?;
+                let route = self.persistence.get_route(&profile.id)?.ok_or_else(|| {
+                    AppError::InvalidInput("Codex Profile 路由不存在".to_string())
+                })?;
                 let provider_id = route.current_provider_id.as_deref().ok_or_else(|| {
                     AppError::InvalidInput("Codex Profile 未配置供应商".to_string())
                 })?;
@@ -405,18 +447,94 @@ impl CodexRouteManager {
         Ok(())
     }
 
-    /// 切换回滚失败时保留运行时与持久化状态不一致的可重试摘要。
-    fn persist_switch_rollback_error(
+    /// 在锁内恢复上次未完成的切换；失败时保留记录并拒绝后续生命周期变更。
+    async fn recover_pending_locked(&self, profile_id: &str) -> Result<(), AppError> {
+        let Some(route) = self.persistence.get_route(profile_id)? else {
+            return Ok(());
+        };
+        let Some(recovery_json) = route.recovery_json.clone() else {
+            return Ok(());
+        };
+        let recovery: RouteRecoveryRecord = serde_json::from_str(&recovery_json).map_err(|_| {
+            AppError::InvalidInput("Codex Profile 路由补偿记录无效，拒绝继续变更".to_string())
+        })?;
+        let original = recovery.original;
+        let mut restored = route;
+        restored.current_provider_id = original.current_provider_id.clone();
+        restored.enabled = original.enabled;
+        restored.recovery_json = Some(recovery_json);
+        restored.last_error = Some("正在恢复未完成的路由变更".to_string());
+        self.persistence.save_route(&restored)?;
+        self.persistence
+            .replace_failovers(profile_id, &original.failover_ids)?;
+        if let Ok(runtime) = self.runtime(profile_id) {
+            let provider_id = original
+                .current_provider_id
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidInput("补偿记录缺少原始供应商".to_string()))?;
+            runtime
+                .swap_provider_snapshot(
+                    self.provider_snapshot(provider_id, &original.failover_ids)?,
+                )
+                .await;
+        }
+        restored.recovery_json = None;
+        restored.last_error = None;
+        restored.updated_at = Utc::now().timestamp_millis();
+        self.persistence.save_route(&restored)
+    }
+
+    /// 将失败切换收敛回旧的运行时和持久化快照；无法收敛时保留补偿记录。
+    async fn restore_switch_locked(
         &self,
         profile_id: &str,
-        restore_error: Option<&AppError>,
-    ) -> Result<(), AppError> {
-        let operation = if restore_error.is_some() {
-            "切换故障转移持久化失败，数据库回滚失败，请重试"
-        } else {
-            "切换故障转移持久化失败，运行时已回滚"
-        };
-        self.persist_error_summary(profile_id, operation, restore_error.is_some())
+        route: &CodexProfileRoute,
+        failovers: &[String],
+        old_snapshot: CodexRouteProviderSnapshot,
+        recovery: &RouteRecoveryRecord,
+    ) {
+        let mut restoring = self
+            .route_with_recovery(route.clone(), recovery)
+            .unwrap_or_else(|_| route.clone());
+        restoring.last_error = Some("切换失败，正在恢复原路由".to_string());
+        let persistence_result = self
+            .persistence
+            .save_route(&restoring)
+            .and_then(|_| self.persistence.replace_failovers(profile_id, failovers));
+        if let Ok(runtime) = self.runtime(profile_id) {
+            runtime.swap_provider_snapshot(old_snapshot).await;
+        }
+        if persistence_result.is_ok() {
+            restoring.recovery_json = None;
+            restoring.last_error = None;
+            restoring.updated_at = Utc::now().timestamp_millis();
+            let _ = self.persistence.save_route(&restoring);
+        }
+    }
+
+    /// 将补偿记录编码到路由字段；编码失败不应开始任何不可逆变更。
+    fn route_with_recovery(
+        &self,
+        mut route: CodexProfileRoute,
+        recovery: &RouteRecoveryRecord,
+    ) -> Result<CodexProfileRoute, AppError> {
+        route.recovery_json = Some(
+            serde_json::to_string(recovery)
+                .map_err(|error| AppError::Message(format!("编码路由补偿记录失败: {error}")))?,
+        );
+        route.updated_at = Utc::now().timestamp_millis();
+        Ok(route)
+    }
+}
+
+impl RouteRecoverySnapshot {
+    /// 从当前路由和故障转移列表创建不含敏感配置的恢复快照。
+    fn from_route(route: &CodexProfileRoute, failover_ids: Vec<String>) -> Self {
+        Self {
+            current_provider_id: route.current_provider_id.clone(),
+            enabled: route.enabled,
+            failover_ids,
+        }
     }
 }
 
@@ -527,6 +645,7 @@ mod codex_route_manager {
                 enabled: true,
                 live_backup_json: None,
                 last_error: None,
+                recovery_json: None,
                 updated_at: 1,
             })?;
         }
@@ -577,6 +696,7 @@ mod codex_route_manager {
             enabled: false,
             live_backup_json: None,
             last_error: None,
+            recovery_json: None,
             updated_at: 1,
         })?;
         let manager = CodexRouteManager::new(

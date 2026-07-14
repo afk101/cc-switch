@@ -7,7 +7,10 @@ use crate::codex_profile::CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS;
 use crate::codex_profile::{CodexProfileScope, CodexRuntimeStatus};
 use crate::database::Database;
 use crate::provider::Provider;
-use crate::proxy::{server::ProxyServer, ProxyError, ProxyServerInfo, ProxyStatus};
+use crate::proxy::{
+    server::{ProfileListenerState, ProxyServer},
+    ProxyError, ProxyServerInfo, ProxyStatus,
+};
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
 use tokio::sync::RwLock;
@@ -189,7 +192,13 @@ impl RouteRuntime {
 
     /// 返回运行时生命周期状态，不暴露内部可变状态。
     pub async fn status(&self) -> CodexRuntimeStatus {
-        self.status.read().await.clone()
+        match self.server.profile_listener_state().await {
+            ProfileListenerState::StopRequested => CodexRuntimeStatus::Stopping,
+            ProfileListenerState::StopFailed => CodexRuntimeStatus::Failed {
+                message: "Profile 监听器停止失败，可重试停止".to_string(),
+            },
+            _ => self.status.read().await.clone(),
+        }
     }
 
     /// 返回 Profile 独占的代理统计。

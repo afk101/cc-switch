@@ -30,6 +30,8 @@ pub struct CodexProfileRoute {
     pub live_backup_json: Option<String>,
     /// 该 Profile 最近一次独立路由生命周期失败摘要，绝不保存本地凭证。
     pub last_error: Option<String>,
+    /// 未完成路由变更的无敏感补偿记录，成功收敛后立即清除。
+    pub recovery_json: Option<String>,
     pub updated_at: i64,
 }
 

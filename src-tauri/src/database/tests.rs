@@ -515,8 +515,8 @@ fn migrates_v11_to_current_codex_profile_schema() {
 
     assert_eq!(
         Database::get_user_version(&conn).expect("read version"),
-        13,
-        "迁移后应写入 v13 user_version"
+        SCHEMA_VERSION,
+        "迁移后应写入当前 user_version"
     );
     for table in [
         "codex_profiles",
@@ -534,6 +534,7 @@ fn migrates_v11_to_current_codex_profile_schema() {
         ("proxy_request_logs", "profile_id"),
         ("session_log_sync", "profile_id"),
         ("codex_profile_routes", "live_backup_json"),
+        ("codex_profile_routes", "recovery_json"),
     ] {
         assert!(
             Database::has_column(&conn, table, column).expect("check column"),
@@ -596,12 +597,19 @@ fn migrates_v12_to_v13_profile_route_live_backup_schema() {
     .expect("restore v12 route schema");
     Database::set_user_version(&conn, 12).expect("set user_version=12");
 
-    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v12 to v13");
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v12 to current");
 
-    assert_eq!(Database::get_user_version(&conn).expect("read version"), 13);
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        SCHEMA_VERSION
+    );
     assert!(
         Database::has_column(&conn, "codex_profile_routes", "live_backup_json")
             .expect("check live backup column")
+    );
+    assert!(
+        Database::has_column(&conn, "codex_profile_routes", "recovery_json")
+            .expect("check recovery column")
     );
 }
 
@@ -716,6 +724,7 @@ fn codex_profile_dao_persists_route_failover_order_and_provider_refs() -> Result
         enabled: true,
         live_backup_json: Some("{\"config\":\"profile\"}".to_string()),
         last_error: None,
+        recovery_json: None,
         updated_at: 2,
     };
     db.save_codex_profile_route(&route).expect("save route");

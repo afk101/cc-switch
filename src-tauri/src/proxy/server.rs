@@ -36,6 +36,15 @@ use std::sync::{
 use tokio::sync::{oneshot, Notify, RwLock};
 use tokio::task::JoinHandle;
 
+/// Profile 监听器停止流程的可观察状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileListenerState {
+    Running,
+    StopRequested,
+    Stopped,
+    StopFailed,
+}
+
 /// 代理服务器状态（共享）
 #[derive(Clone)]
 pub struct ProxyState {
@@ -74,6 +83,8 @@ pub struct ProxyServer {
     shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
     /// 服务器任务句柄，用于等待服务器实际关闭
     server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    /// 停止超时后仍保留 join handle，后续 stop 会继续等待同一任务。
+    profile_listener_state: Arc<RwLock<ProfileListenerState>>,
 }
 
 impl ProxyServer {
@@ -110,6 +121,7 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            profile_listener_state: Arc::new(RwLock::new(ProfileListenerState::Stopped)),
         }
     }
 
@@ -155,6 +167,7 @@ impl ProxyServer {
             state,
             shutdown_tx: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
+            profile_listener_state: Arc::new(RwLock::new(ProfileListenerState::Stopped)),
         }
     }
 
@@ -283,6 +296,7 @@ impl ProxyServer {
 
         // 保存服务器任务句柄
         *self.server_handle.write().await = Some(handle);
+        *self.profile_listener_state.write().await = ProfileListenerState::Running;
 
         Ok(ProxyServerInfo {
             address: self.config.listen_address.clone(),
@@ -292,25 +306,39 @@ impl ProxyServer {
     }
 
     pub async fn stop(&self) -> Result<(), ProxyError> {
-        // 1. 发送关闭信号
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
-            let _ = tx.send(());
-        } else {
-            return Err(ProxyError::NotRunning);
+        // 1. 首次停止发送关闭信号；之后必须继续等待同一个 join handle。
+        if matches!(
+            *self.profile_listener_state.read().await,
+            ProfileListenerState::Running
+        ) {
+            if let Some(tx) = self.shutdown_tx.write().await.take() {
+                let _ = tx.send(());
+                *self.profile_listener_state.write().await = ProfileListenerState::StopRequested;
+            } else {
+                *self.profile_listener_state.write().await = ProfileListenerState::StopFailed;
+                return Err(ProxyError::NotRunning);
+            }
         }
 
         // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
+        let mut handle_guard = self.server_handle.write().await;
+        if let Some(handle) = handle_guard.as_mut() {
             match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {
+                    handle_guard.take();
+                    *self.profile_listener_state.write().await = ProfileListenerState::Stopped;
                     log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
                     Ok(())
                 }
                 Ok(Err(e)) => {
+                    handle_guard.take();
+                    *self.profile_listener_state.write().await = ProfileListenerState::StopFailed;
                     log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
                     Err(ProxyError::StopFailed(e.to_string()))
                 }
                 Err(_) => {
+                    *self.profile_listener_state.write().await =
+                        ProfileListenerState::StopRequested;
                     log::warn!(
                         "[{}] 代理服务器停止超时（5秒），强制继续",
                         log_srv::STOP_TIMEOUT
@@ -319,8 +347,19 @@ impl ProxyServer {
                 }
             }
         } else {
-            Ok(())
+            match *self.profile_listener_state.read().await {
+                ProfileListenerState::Stopped => Ok(()),
+                ProfileListenerState::StopFailed => {
+                    Err(ProxyError::StopFailed("监听器停止失败".to_string()))
+                }
+                _ => Err(ProxyError::NotRunning),
+            }
         }
+    }
+
+    /// 返回 Profile 监听器停止流程的可观察状态。
+    pub async fn profile_listener_state(&self) -> ProfileListenerState {
+        *self.profile_listener_state.read().await
     }
 
     pub async fn get_status(&self) -> ProxyStatus {
@@ -538,10 +577,12 @@ impl ProxyServer {
     pub(crate) async fn wait_for_profile_drain(&self, timeout: std::time::Duration) -> bool {
         let wait = async {
             loop {
+                // 先注册 waiter 再读取计数，避免最后一个请求在两者之间完成而漏掉通知。
+                let notified = self.state.profile_drain_notify.notified();
                 if self.state.profile_in_flight.load(Ordering::Acquire) == 0 {
                     return;
                 }
-                self.state.profile_drain_notify.notified().await;
+                notified.await;
             }
         };
         tokio::time::timeout(timeout, wait).await.is_ok()
