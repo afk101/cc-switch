@@ -685,6 +685,13 @@ impl CodexRouteManager {
         }
     }
 
+    /// 将恢复前置条件失败标记为未收敛，禁止调用方继续新的生命周期变更。
+    fn recovery_unconverged_error(error: AppError) -> AppError {
+        AppError::Message(format!(
+            "{CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR}: 无法安全恢复未完成的路由变更: {error}"
+        ))
+    }
+
     /// 创建未启用 Profile 的最小路由状态，供首次启用持久化操作记录。
     fn empty_route(profile_id: &str) -> CodexProfileRoute {
         CodexProfileRoute {
@@ -823,17 +830,25 @@ impl CodexRouteManager {
 
     /// 在锁内恢复上次未完成的切换；失败时保留记录并拒绝后续生命周期变更。
     async fn recover_pending_locked(&self, profile_id: &str) -> Result<(), AppError> {
-        let Some(route) = self.persistence.get_route(profile_id)? else {
+        let Some(route) = self
+            .persistence
+            .get_route(profile_id)
+            .map_err(Self::recovery_unconverged_error)?
+        else {
             return Ok(());
         };
         let Some(recovery_json) = route.recovery_json.clone() else {
             return Ok(());
         };
         let recovery: RouteRecoveryRecord = serde_json::from_str(&recovery_json).map_err(|_| {
-            AppError::InvalidInput("Codex Profile 路由补偿记录无效，拒绝继续变更".to_string())
+            Self::recovery_unconverged_error(AppError::InvalidInput(
+                "Codex Profile 路由补偿记录无效，拒绝继续变更".to_string(),
+            ))
         })?;
         self.validate_recovery_record(&recovery).map_err(|_| {
-            AppError::InvalidInput("Codex Profile 路由补偿记录非法，拒绝继续变更".to_string())
+            Self::recovery_unconverged_error(AppError::InvalidInput(
+                "Codex Profile 路由补偿记录非法，拒绝继续变更".to_string(),
+            ))
         })?;
         if recovery.operation == "enable" {
             return self
@@ -872,6 +887,18 @@ impl CodexRouteManager {
             return Ok(());
         }
         let original = recovery.before;
+        let provider_id = original.current_provider_id.as_deref().ok_or_else(|| {
+            Self::recovery_unconverged_error(AppError::InvalidInput(
+                "补偿记录缺少原始供应商".to_string(),
+            ))
+        })?;
+        let snapshot = self
+            .provider_snapshot(provider_id, &original.failover_ids)
+            .map_err(Self::recovery_unconverged_error)?;
+        let runtime = self
+            .runtime(profile_id)
+            .map_err(Self::recovery_unconverged_error)?;
+        runtime.swap_provider_snapshot(snapshot).await;
         let mut restored = route;
         restored.current_provider_id = original.current_provider_id.clone();
         restored.enabled = original.enabled;
@@ -880,17 +907,6 @@ impl CodexRouteManager {
         self.persistence.save_route(&restored)?;
         self.persistence
             .replace_failovers(profile_id, &original.failover_ids)?;
-        if let Ok(runtime) = self.runtime(profile_id) {
-            let provider_id = original
-                .current_provider_id
-                .as_deref()
-                .ok_or_else(|| AppError::InvalidInput("补偿记录缺少原始供应商".to_string()))?;
-            runtime
-                .swap_provider_snapshot(
-                    self.provider_snapshot(provider_id, &original.failover_ids)?,
-                )
-                .await;
-        }
         restored.recovery_json = None;
         restored.last_error = None;
         restored.updated_at = Utc::now().timestamp_millis();
@@ -2117,6 +2133,93 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 公共切换入口遇到缺失运行时的未完成切换时，必须保持持久化状态等待后续补偿。
+    #[tokio::test]
+    async fn switching_with_pending_switch_without_runtime_keeps_route_failovers_and_recovery(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        for provider_id in ["provider-old", "provider-new", "provider-requested"] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    provider_id.to_string(),
+                    provider_id.to_string(),
+                    json!({}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: "/tmp/profile-a".to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery_json = serde_json::to_string(&RouteRecoveryRecord {
+            operation: "switch".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-old".to_string()),
+                enabled: true,
+                failover_ids: vec!["provider-old".to_string()],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-new".to_string()),
+                enabled: true,
+                failover_ids: vec!["provider-new".to_string()],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED.to_string(),
+            last_error: None,
+        })
+        .expect("编码恢复记录");
+        let route = CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: Some("provider-new".to_string()),
+            enabled: true,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: Some(recovery_json.clone()),
+            updated_at: 1,
+        };
+        db.save_codex_profile_route(&route)?;
+        db.replace_codex_profile_failovers("profile-a", &["provider-new".to_string()])?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .switch_provider("profile-a", "provider-requested", vec![])
+            .await
+            .expect_err("未收敛的切换不能继续执行新切换");
+
+        assert!(error
+            .to_string()
+            .contains(CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR));
+        assert_eq!(
+            db.get_codex_profile_route("profile-a")?.expect("路由记录"),
+            route
+        );
+        assert_eq!(
+            db.list_codex_profile_failovers("profile-a")?,
+            vec!["provider-new".to_string()]
+        );
+        assert_eq!(
+            db.get_codex_profile_route("profile-a")?
+                .expect("路由记录")
+                .recovery_json
+                .as_deref(),
+            Some(recovery_json.as_str())
+        );
+        Ok(())
+    }
+
     /// 切换补偿记录解析失败时不得改写当前路由或清除原始记录。
     #[tokio::test]
     async fn restoring_switch_with_invalid_recovery_keeps_current_route_unchanged(
@@ -2333,10 +2436,13 @@ mod codex_route_manager {
                 tokens.clone(),
                 Arc::new(FakeFactory),
             );
-            assert!(manager
+            let error = manager
                 .switch_provider("profile-a", "provider-a", vec![])
                 .await
-                .is_err());
+                .expect_err("非法恢复记录不能继续切换");
+            assert!(error
+                .to_string()
+                .contains(CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR));
             assert_eq!(
                 db.get_codex_profile_route("profile-a")?
                     .expect("路由")
