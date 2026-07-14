@@ -41,6 +41,7 @@ function createManagerProps(
     }),
     onCreate: vi.fn().mockResolvedValue(customProfile),
     onUpdate: vi.fn().mockResolvedValue(customProfile),
+    onStopRoute: vi.fn().mockResolvedValue(undefined),
     onDelete: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
@@ -105,6 +106,80 @@ describe("CodexProfileManagerDialog", () => {
     expect(screen.getByLabelText("Profile 名称")).toBeEnabled();
     expect(screen.getByLabelText("CODEX_HOME 路径")).toBeDisabled();
     expect(screen.getByLabelText("监听端口")).toBeDisabled();
+  });
+
+  it("停止运行中 Profile 后刷新状态并解锁 Home 和端口", async () => {
+    const runningState = {
+      profile: customProfile,
+      route: {
+        profileId: customProfile.id,
+        currentProviderId: "provider-a",
+        enabled: true,
+        lastError: null,
+        recoveryJson: null,
+        updatedAt: 2,
+      },
+      runtimeStatus: "running" as const,
+    };
+    const stoppedState = {
+      profile: customProfile,
+      route: {
+        ...runningState.route,
+        enabled: false,
+        updatedAt: 3,
+      },
+      runtimeStatus: "stopped" as const,
+    };
+    const loadProfileState = vi
+      .fn()
+      .mockResolvedValueOnce(runningState)
+      .mockResolvedValueOnce(stoppedState);
+    const { props, user } = renderManager({
+      profiles: [customProfile],
+      loadProfileState,
+    });
+
+    await user.click(screen.getByRole("button", { name: "编辑 Profile" }));
+    await user.click(await screen.findByRole("button", { name: "停止路由" }));
+
+    await waitFor(() => {
+      expect(props.onStopRoute).toHaveBeenCalledWith(customProfile.id);
+      expect(loadProfileState).toHaveBeenCalledTimes(2);
+    });
+    expect(screen.getByLabelText("CODEX_HOME 路径")).toBeEnabled();
+    expect(screen.getByLabelText("监听端口")).toBeEnabled();
+    expect(
+      screen.queryByText("请先停止该 Profile 的路由后再修改"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("停止路由失败时保留编辑页并就地显示错误", async () => {
+    const loadProfileState = vi.fn().mockResolvedValue({
+      profile: customProfile,
+      route: {
+        profileId: customProfile.id,
+        currentProviderId: "provider-a",
+        enabled: true,
+        lastError: null,
+        recoveryJson: null,
+        updatedAt: 2,
+      },
+      runtimeStatus: "running" as const,
+    });
+    const { user } = renderManager({
+      profiles: [customProfile],
+      loadProfileState,
+      onStopRoute: vi.fn().mockRejectedValue(new Error("监听器停止失败")),
+    });
+
+    await user.click(screen.getByRole("button", { name: "编辑 Profile" }));
+    await user.click(await screen.findByRole("button", { name: "停止路由" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "监听器停止失败",
+    );
+    expect(screen.getByRole("button", { name: "停止路由" })).toBeEnabled();
+    expect(screen.getByLabelText("CODEX_HOME 路径")).toBeDisabled();
   });
 
   it("默认 Profile 编辑页允许名称和端口但锁定 Home", async () => {

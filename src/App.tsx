@@ -232,12 +232,17 @@ function App() {
       });
     }
   };
-  const { createProfile, updateProfile, deleteProfile, loadProfileState } =
-    useCodexProfileManagement({
-      profiles: codexProfiles,
-      selectedProfileId: selectedCodexProfileId,
-      onSelectProfile: selectCodexProfile,
-    });
+  const {
+    createProfile,
+    updateProfile,
+    stopRoute,
+    deleteProfile,
+    loadProfileState,
+  } = useCodexProfileManagement({
+    profiles: codexProfiles,
+    selectedProfileId: selectedCodexProfileId,
+    onSelectProfile: selectCodexProfile,
+  });
   const useAppWindowControls =
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
@@ -1105,6 +1110,7 @@ function App() {
                         loadProfileState={loadProfileState}
                         onCreate={createProfile}
                         onUpdate={updateProfile}
+                        onStopRoute={stopRoute}
                         onDelete={deleteProfile}
                       />
                     )}

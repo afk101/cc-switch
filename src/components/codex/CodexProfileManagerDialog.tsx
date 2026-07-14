@@ -35,6 +35,7 @@ interface CodexProfileManagerDialogProps {
   loadProfileState: (profileId: string) => Promise<CodexProfileState>;
   onCreate: (input: CreateCodexProfileInput) => Promise<CodexProfile>;
   onUpdate: (input: UpdateCodexProfileInput) => Promise<CodexProfile>;
+  onStopRoute: (profileId: string) => Promise<void>;
   onDelete: (profileId: string) => Promise<void>;
 }
 
@@ -85,12 +86,15 @@ export function CodexProfileManagerDialog({
   loadProfileState,
   onCreate,
   onUpdate,
+  onStopRoute,
   onDelete,
 }: CodexProfileManagerDialogProps) {
   const [view, setView] = useState<ProfileManagerView>({ kind: "list" });
   const [editState, setEditState] = useState<CodexProfileState | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
   const [isEditLoading, setIsEditLoading] = useState(false);
+  const [stopRouteError, setStopRouteError] = useState<string | null>(null);
+  const [isStoppingRoute, setIsStoppingRoute] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
@@ -99,6 +103,8 @@ export function CodexProfileManagerDialog({
       setView({ kind: "list" });
       setEditState(null);
       setEditError(null);
+      setStopRouteError(null);
+      setIsStoppingRoute(false);
       setDeleteError(null);
       setIsDeleting(false);
     }
@@ -112,6 +118,7 @@ export function CodexProfileManagerDialog({
     setIsEditLoading(true);
     setEditState(null);
     setEditError(null);
+    setStopRouteError(null);
     loadProfileState(view.profileId)
       .then((state) => {
         if (!cancelled) {
@@ -153,6 +160,25 @@ export function CodexProfileManagerDialog({
     });
     toast.success("Codex Profile 更新成功");
     setView({ kind: "list" });
+  }
+
+  /** 停止当前编辑目标的路由，并重新读取状态以解锁受限字段。 */
+  async function handleStopRoute(): Promise<void> {
+    if (view.kind !== "edit") {
+      return;
+    }
+    setStopRouteError(null);
+    setIsStoppingRoute(true);
+    try {
+      await onStopRoute(view.profileId);
+      const refreshedState = await loadProfileState(view.profileId);
+      setEditState(refreshedState);
+      toast.success("Codex Profile 路由已停止");
+    } catch (error) {
+      setStopRouteError(extractErrorMessage(error) || "停止路由失败");
+    } finally {
+      setIsStoppingRoute(false);
+    }
   }
 
   /** 确认删除当前目标，失败时留在当前页展示错误。 */
@@ -282,8 +308,23 @@ export function CodexProfileManagerDialog({
             {!isEditLoading && editProfile && (
               <div className="space-y-3">
                 {editIsActive && (
-                  <p className="text-sm text-amber-600 dark:text-amber-400">
-                    请先停止该 Profile 的路由后再修改
+                  <section className="space-y-2">
+                    <p className="text-sm text-amber-600 dark:text-amber-400">
+                      请先停止该 Profile 的路由后再修改
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={isStoppingRoute}
+                      onClick={() => void handleStopRoute()}
+                    >
+                      {isStoppingRoute ? "停止中..." : "停止路由"}
+                    </Button>
+                  </section>
+                )}
+                {stopRouteError && (
+                  <p role="alert" className="text-sm text-red-500">
+                    {stopRouteError}
                   </p>
                 )}
                 <CodexProfileForm

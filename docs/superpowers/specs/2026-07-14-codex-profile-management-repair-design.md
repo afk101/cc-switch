@@ -147,6 +147,7 @@ Profile 管理代码不得继续使用 `"default"` 等魔法字符串判断默�
 - 字段：名称、Home、监听端口。
 - 默认 Profile 的 Home 始终只读。
 - 打开编辑页时按目标 ID 加载实时状态；路由运行中时 Home 与端口禁用，并提示先停止该 Profile 路由。
+- 运行中的编辑页提供 Profile 级“停止路由”入口；停止成功后重新读取该 Profile 状态并立即解锁 Home 与端口，失败则保留编辑页并就地显示错误。
 - 保存成功后刷新列表和目标状态，返回列表页并显示成功提示。
 
 ### 删除确认页
@@ -170,6 +171,7 @@ Profile 管理代码不得继续使用 `"default"` 等魔法字符串判断默�
 - 创建/编辑字段校验、可选端口转换、提交中状态和错误保留。
 - 默认 Profile 使用 `codex-default` 正确禁用删除和 Home 编辑。
 - 运行中 Profile 仅名称可编辑。
+- 停止运行中 Profile 后只刷新目标状态缓存，并在同一编辑页解锁 Home 与端口。
 - 删除确认文案、取消和确认行为。
 - Dialog 关闭重开后恢复列表页。
 - mutation 正确隔离、刷新和移除 Profile 查询缓存。
@@ -192,5 +194,6 @@ Profile 管理代码不得继续使用 `"default"` 等魔法字符串判断默�
 - 创建、编辑和删除全程不出现第二个 Dialog 或原生 prompt。
 - Profile 管理链路中不存在 `window.prompt`。
 - 默认 Profile 不可删除或重绑 Home，但可改名和停用状态下改端口。
+- 任何运行中的 Profile（包括默认 Profile）均可从编辑页停止路由，停止后监听端口释放且路由状态禁用。
 - `CC_SWITCH_DUMP_BODY=1` 的真实请求日志证明不同 Profile 的请求正文仍按监听端口和 Profile 隔离，没有跨 Home 串流。
 - 所有目标测试、类型检查、格式检查、Rust check 通过。

@@ -196,4 +196,39 @@ describe("useCodexProfileManagement", () => {
       queryClient.getQueryData(["codexProfiles", "state", "profile-new"]),
     ).toEqual(otherState);
   });
+
+  it("停止路由后只刷新目标 Profile 状态", async () => {
+    const queryClient = createQueryClient();
+    const onSelectProfile = vi.fn();
+    const otherState: CodexProfileState = {
+      profile: newProfile,
+      route: null,
+      runtimeStatus: "stopped",
+    };
+    queryClient.setQueryData(
+      ["codexProfiles", "state", "profile-new"],
+      otherState,
+    );
+    const disableRoute = vi
+      .spyOn(codexProfilesApi, "disableRoute")
+      .mockResolvedValue(true);
+    const { result } = renderHook(
+      () =>
+        useCodexProfileManagement({
+          profiles: [currentProfile, newProfile],
+          selectedProfileId: "profile-current",
+          onSelectProfile,
+        }),
+      { wrapper: createQueryWrapper(queryClient) },
+    );
+
+    await act(async () => {
+      await result.current.stopRoute("profile-current");
+    });
+
+    expect(disableRoute).toHaveBeenCalledWith("profile-current");
+    expect(
+      queryClient.getQueryData(["codexProfiles", "state", "profile-new"]),
+    ).toEqual(otherState);
+  });
 });

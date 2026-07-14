@@ -907,3 +907,36 @@ git commit -m "fix(codex): wire profile management workflow"
 Run: `git status --short`
 
 Expected: 工作区干净。
+
+### Task 6: 补齐运行中 Profile 的停止路由闭环
+
+**Files:**
+
+- Modify: `src/lib/query/codexProfiles.ts`
+- Modify: `src/hooks/useCodexProfileManagement.ts`
+- Modify: `src/components/codex/CodexProfileManagerDialog.tsx`
+- Modify: `src/App.tsx`
+- Test: `src/hooks/useCodexProfileManagement.test.tsx`
+- Test: `src/components/codex/CodexProfileManagerDialog.test.tsx`
+
+- [ ] **Step 1: 写停止路由的失败测试**
+
+组件测试覆盖运行中编辑页显示“停止路由”、成功后重新加载状态并解锁 Home/端口、失败后保留编辑页和错误。Hook 测试覆盖 `disable_codex_profile_route` 仅刷新目标 Profile 状态缓存，不影响其他 Profile。
+
+- [ ] **Step 2: 实现目标状态刷新与编辑页停止入口**
+
+查询层增加专用停止 mutation；管理 hook 暴露 `stopRoute(profileId)`；Dialog 停止成功后调用 `loadProfileState(profileId)`，失败时就地展示错误。`App.tsx` 只负责把 action 传给 Dialog。
+
+- [ ] **Step 3: 运行目标测试和完整回归**
+
+Run: `pnpm exec vitest run src/components/codex/CodexProfileManagerDialog.test.tsx src/hooks/useCodexProfileManagement.test.tsx src/lib/query/codexProfiles.test.ts --reporter=dot`
+
+Expected: 全部通过。
+
+Run: `pnpm exec vitest run --reporter=dot && pnpm typecheck && pnpm format:check`
+
+Expected: 前端全量测试、类型和格式检查通过。
+
+- [ ] **Step 4: 使用真实服务验证停止生命周期**
+
+在 `pnpm run dev:dump` 对两个并行运行的测试 Profile 分别点击“编辑 Profile → 停止路由”，确认成功提示、Home/端口立即解锁、数据库路由状态为禁用、两个监听端口分别释放，后端日志记录各自监听器完全停止。

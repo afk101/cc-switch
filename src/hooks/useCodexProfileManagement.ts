@@ -6,6 +6,7 @@ import {
   codexProfileKeys,
   useCreateCodexProfile,
   useDeleteCodexProfile,
+  useDisableCodexProfileRoute,
   useUpdateCodexProfile,
 } from "@/lib/query/codexProfiles";
 import type {
@@ -45,6 +46,7 @@ export function useCodexProfileManagement({
   const queryClient = useQueryClient();
   const createMutation = useCreateCodexProfile();
   const updateMutation = useUpdateCodexProfile();
+  const disableRouteMutation = useDisableCodexProfileRoute();
   const deleteMutation = useDeleteCodexProfile();
 
   /** 创建 Profile，并在成功后将它设为当前 Profile。 */
@@ -62,6 +64,14 @@ export function useCodexProfileManagement({
     (input: UpdateCodexProfileInput): Promise<CodexProfile> =>
       updateMutation.mutateAsync(input),
     [updateMutation],
+  );
+
+  /** 停止指定 Profile 的独立路由。 */
+  const stopRoute = useCallback(
+    async (profileId: string): Promise<void> => {
+      await disableRouteMutation.mutateAsync(profileId);
+    },
+    [disableRouteMutation],
   );
 
   /** 删除 Profile，并只在删除当前项时选择安全回退项。 */
@@ -91,6 +101,7 @@ export function useCodexProfileManagement({
   return {
     createProfile,
     updateProfile,
+    stopRoute,
     deleteProfile,
     loadProfileState,
   };

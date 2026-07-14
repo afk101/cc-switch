@@ -16,6 +16,11 @@ export const codexProfileKeys = {
     [...codexProfileKeys.all, "refs", providerId] as const,
 };
 
+/** 将 TanStack mutation 的变量适配为单参数路由停止调用。 */
+function disableCodexProfileRoute(profileId: string): Promise<boolean> {
+  return codexProfilesApi.disableRoute(profileId);
+}
+
 /** 获取全部 Codex Profile。 */
 export function useCodexProfiles() {
   return useQuery({
@@ -57,6 +62,19 @@ export function useUpdateCodexProfile() {
       });
       await queryClient.invalidateQueries({
         queryKey: codexProfileKeys.state(input.profileId),
+      });
+    },
+  });
+}
+
+/** 停止指定 Profile 路由并只刷新该 Profile 的运行时状态。 */
+export function useDisableCodexProfileRoute() {
+  const queryClient = useQueryClient();
+  return useMutation<boolean, Error, string>({
+    mutationFn: disableCodexProfileRoute,
+    onSuccess: async (_, profileId) => {
+      await queryClient.invalidateQueries({
+        queryKey: codexProfileKeys.state(profileId),
       });
     },
   });

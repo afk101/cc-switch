@@ -169,3 +169,24 @@
 - 规范自审确认 `CodexHomeContextBar` 的真实可见文案正是“路由已启用/路由未启用”，因此计划中的 UI 断言可直接验证 Profile 状态刷新，不依赖测试专用标识。
 - 自审发现 focused Plan 的最后提交步骤重复暂存应在 brainstorming 阶段先提交的文档，并可能要求空提交；已调整为文档先独立提交、实现提交后只检查剩余差异，存在未提交的本任务变更时才创建补充提交。
 - 自审发现状态函数示例只在文字中要求 JSDoc、代码块未展示注释；已在 Plan 示例中补齐中文 JSDoc，保证零背景实施者也能遵守项目规则。
+
+## 真实验收发现：运行中 Profile 缺少停止入口
+
+- `pnpm run dev:dump` 与 Computer Use 验收确认，运行中的 Profile 编辑页会按设计禁用 Home 和端口并提示“请先停止该 Profile 的路由后再修改”，但原界面没有任何 Profile 级停止入口；用户只能删除后重建，提示与可执行操作不闭环。
+- 后端 `disable_codex_profile_route`、幂等停止状态机和前端 `codexProfilesApi.disableRoute` 已存在，缺口仅在 Query mutation、管理 hook、Dialog action 与 App 接线。
+- 推荐方案是在运行中的编辑页显示“停止路由”：成功后重新读取目标 Profile 状态并解锁字段，失败时保留编辑页和错误；缓存刷新必须携带 Profile ID，不能影响其他 Home。
+- TDD RED 证据：组件找不到“停止路由”按钮，hook 没有 `stopRoute`；实现后 3 个目标文件共 25 个测试通过。
+- 真实 UI 证据：两个并行运行的 Profile 分别在编辑页成功停止，均显示“Codex Profile 路由已停止”，Home/端口随即解锁；后端分别记录端口 15722、15731 开始排空和 `[SRV-002] 代理服务器已完全停止`。
+- 运行时证据：停止后数据库中两个路由的 `enabled` 都为 `0`，`lsof` 确认 15722、15731 均已释放；另一个 Profile 的状态和 token 未被交叉修改。
+
+## 停止入口实施后的全量回归调查
+
+- 首次全量前端回归中，目标组件、hook 和 query 测试全部通过；唯一失败是既有 `tests/integration/App.test.tsx` 基础流程在固定 5000ms 总时限超时。此前同一用例通过，因此先按时序抖动调查，不直接提高超时上限。
+- 失败没有断言堆栈，说明用例整体超过总时限；该用例包含多次异步供应商创建、编辑、切换和复制，而本次产品差异只在 App 顶层多取得一个 `stopRoute` 回调并传入未打开的 Profile Dialog。
+- 当前单一假设：`useCodexProfileManagement` 依赖整个 TanStack mutation 对象构造 `stopRoute`，可能让回调引用在 App 重渲染时变化，但 Dialog 未打开，不足以直接解释 5 秒超时；下一步先单文件重复运行并记录实际时长，判断是稳定回归还是全量并发负载造成的既有临界超时。
+- 单文件替代复现通过：基础流程实际用时 2215ms，App 文件 4 个测试共 2440ms；没有出现停止路由相关错误或未处理 Profile 请求，因此排除稳定产品回归和新增 hook 调用死锁。
+- 全量失败时同一基础流程耗时 5113ms，刚好越过 Vitest 默认 5000ms；同时存在 3678ms 的 SessionManager 等重型 UI 测试并行运行。机器为 12 逻辑核，项目未检出自定义 `testTimeout/maxWorkers/fileParallelism` 设置。当前证据支持“全量并发负载放大既有临界总时限”的假设，暂不改产品代码或放宽测试时限；将用不同执行配置重新验证全量行为。
+- 第一个替代全量命令 `--maxWorkers=1` 在收集前失败：Tinypool 报告 `options.minThreads and options.maxThreads must not conflict`，没有执行任何测试。该方法不再重复；原因是项目确有 `vitest.config.ts`，前一次搜索模式没有命中配置内容，需要直接读取配置后选择兼容参数。
+- 直接读取 `vitest.config.ts` 确认项目没有显式 worker 或 timeout 设置；Vitest 2 CLI 同时支持 `--minWorkers`、`--maxWorkers` 和 `--no-file-parallelism`。失败来自只覆盖最大值而保留内部最小值的参数组合，下一种验证同时设置最小/最大为 1，避免冲突且不改仓库配置。
+- 兼容的单 worker 全量验证通过：69 个测试文件、426 个测试全部通过；App 基础流程用时 1478ms。结合单文件默认调度的 2215ms 与首次并发全量的 5113ms，根本原因已确认是机器同时运行 dev App、Computer Use 和并行测试时的瞬时调度负载放大了既有 5 秒总时限，不是停止路由实现的逻辑回归。
+- 本次不修改产品代码、测试时限或 Vitest 配置：目标功能已有专用测试和真实 UI 证据；为验证而放宽固定时限会掩盖慢测试，改变 worker 配置也超出 Profile 功能范围。保留默认单文件通过与单 worker 全量通过作为两种独立证据，最终环境清理后再执行一次默认全量作为确认。
