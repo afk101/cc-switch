@@ -66,7 +66,7 @@ export function useCodexProfileManagement({
 
   /** 删除 Profile，并只在删除当前项时选择安全回退项。 */
   const deleteProfile = useCallback(
-    async (profileId: string): Promise<boolean> => {
+    async (profileId: string): Promise<void> => {
       const deleted = await deleteMutation.mutateAsync(profileId);
       if (deleted && profileId === selectedProfileId) {
         const fallbackProfile = findSelectionAfterDelete(profiles, profileId);
@@ -74,7 +74,6 @@ export function useCodexProfileManagement({
           onSelectProfile(fallbackProfile.id);
         }
       }
-      return deleted;
     },
     [deleteMutation, onSelectProfile, profiles, selectedProfileId],
   );

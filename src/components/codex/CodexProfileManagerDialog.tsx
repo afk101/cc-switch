@@ -1,4 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { toast } from "sonner";
+import {
+  CodexProfileForm,
+  type CodexProfileFormValues,
+} from "@/components/codex/CodexProfileForm";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -8,17 +13,68 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import type { CodexProfile } from "@/types/codexProfile";
+import { CODEX_DEFAULT_PROFILE_ID } from "@/config/constants";
+import type {
+  CodexProfile,
+  CodexProfileState,
+  CreateCodexProfileInput,
+  UpdateCodexProfileInput,
+} from "@/types/codexProfile";
+import { extractErrorMessage } from "@/utils/errorUtils";
+
+type ProfileManagerView =
+  | { kind: "list" }
+  | { kind: "create" }
+  | { kind: "edit"; profileId: string }
+  | { kind: "delete-confirm"; profileId: string };
 
 interface CodexProfileManagerDialogProps {
   open: boolean;
   profiles: CodexProfile[];
   onOpenChange: (open: boolean) => void;
-  onUpdatePort: (profileId: string, listenPort: number) => void;
-  onDelete: (profileId: string) => void;
-  onRebind: (profileId: string) => void;
-  onCreate: () => void;
+  loadProfileState: (profileId: string) => Promise<CodexProfileState>;
+  onCreate: (input: CreateCodexProfileInput) => Promise<CodexProfile>;
+  onUpdate: (input: UpdateCodexProfileInput) => Promise<CodexProfile>;
+  onDelete: (profileId: string) => Promise<void>;
+}
+
+/** 判断运行时状态是否禁止修改监听器绑定。 */
+function isActiveRuntimeStatus(
+  runtimeStatus: CodexProfileState["runtimeStatus"],
+): boolean {
+  return (
+    runtimeStatus === "starting" ||
+    runtimeStatus === "running" ||
+    runtimeStatus === "stopping"
+  );
+}
+
+/** 返回当前视图对应的标题。 */
+function getViewTitle(view: ProfileManagerView): string {
+  switch (view.kind) {
+    case "create":
+      return "新建 Codex Profile";
+    case "edit":
+      return "编辑 Codex Profile";
+    case "delete-confirm":
+      return "删除 Codex Profile";
+    default:
+      return "管理 Codex Profile";
+  }
+}
+
+/** 返回当前视图对应的说明。 */
+function getViewDescription(view: ProfileManagerView): string {
+  switch (view.kind) {
+    case "create":
+      return "为新的 CODEX_HOME 建立独立 Profile。";
+    case "edit":
+      return "一次保存名称、CODEX_HOME 与监听端口。";
+    case "delete-confirm":
+      return "确认删除 CC Switch 中的 Profile 绑定。";
+    default:
+      return "删除只删除 CC Switch 绑定和本地 token，不删除 Home 目录。";
+  }
 }
 
 /** 管理 Codex Profile；默认 Profile 只锁定路径重绑与删除能力。 */
@@ -26,88 +82,271 @@ export function CodexProfileManagerDialog({
   open,
   profiles,
   onOpenChange,
-  onUpdatePort,
-  onDelete,
-  onRebind,
+  loadProfileState,
   onCreate,
+  onUpdate,
+  onDelete,
 }: CodexProfileManagerDialogProps) {
-  const [ports, setPorts] = useState<Record<string, string>>({});
+  const [view, setView] = useState<ProfileManagerView>({ kind: "list" });
+  const [editState, setEditState] = useState<CodexProfileState | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [isEditLoading, setIsEditLoading] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setView({ kind: "list" });
+      setEditState(null);
+      setEditError(null);
+      setDeleteError(null);
+      setIsDeleting(false);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || view.kind !== "edit") {
+      return;
+    }
+    let cancelled = false;
+    setIsEditLoading(true);
+    setEditState(null);
+    setEditError(null);
+    loadProfileState(view.profileId)
+      .then((state) => {
+        if (!cancelled) {
+          setEditState(state);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setEditError(extractErrorMessage(error) || "加载 Profile 状态失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsEditLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [loadProfileState, open, view]);
+
+  /** 创建成功后回到当前 Dialog 的列表页。 */
+  async function handleCreate(values: CodexProfileFormValues): Promise<void> {
+    await onCreate(values);
+    toast.success("Codex Profile 创建成功");
+    setView({ kind: "list" });
+  }
+
+  /** 原子保存编辑字段并回到列表页。 */
+  async function handleUpdate(values: CodexProfileFormValues): Promise<void> {
+    if (view.kind !== "edit" || values.listenPort === undefined) {
+      throw new Error("监听端口不能为空");
+    }
+    await onUpdate({
+      profileId: view.profileId,
+      name: values.name,
+      homePath: values.homePath,
+      listenPort: values.listenPort,
+    });
+    toast.success("Codex Profile 更新成功");
+    setView({ kind: "list" });
+  }
+
+  /** 确认删除当前目标，失败时留在当前页展示错误。 */
+  async function handleDelete(): Promise<void> {
+    if (view.kind !== "delete-confirm") {
+      return;
+    }
+    setDeleteError(null);
+    setIsDeleting(true);
+    try {
+      await onDelete(view.profileId);
+      toast.success("Codex Profile 删除成功");
+      setView({ kind: "list" });
+    } catch (error) {
+      setDeleteError(extractErrorMessage(error) || "删除 Profile 失败");
+    } finally {
+      setIsDeleting(false);
+    }
+  }
+
+  const deleteTarget =
+    view.kind === "delete-confirm"
+      ? profiles.find((profile) => profile.id === view.profileId)
+      : undefined;
+  const editProfile = editState?.profile;
+  const editIsActive = editState
+    ? isActiveRuntimeStatus(editState.runtimeStatus)
+    : false;
+  const canEditHome = Boolean(
+    editProfile && editProfile.id !== CODEX_DEFAULT_PROFILE_ID && !editIsActive,
+  );
+  const canEditPort = Boolean(editProfile && !editIsActive);
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>管理 Codex Profile</DialogTitle>
-          <DialogDescription>
-            删除只删除 CC Switch 绑定和本地 token，不删除 Home 目录。
-          </DialogDescription>
+          <DialogTitle>{getViewTitle(view)}</DialogTitle>
+          <DialogDescription>{getViewDescription(view)}</DialogDescription>
         </DialogHeader>
-        <div className="space-y-3 overflow-y-auto px-6 py-4">
-          {profiles.map((profile) => {
-            const isDefault = profile.id === "default";
-            const port = ports[profile.id] ?? String(profile.listenPort);
-            return (
-              <section
-                key={profile.id}
-                className="rounded-md border border-border-default p-3"
-              >
-                <div className="font-medium">{profile.name}</div>
-                <div className="mt-1 truncate text-xs text-muted-foreground">
-                  {profile.canonicalHomePath}
-                </div>
-                <label
-                  className="mt-3 block text-xs text-muted-foreground"
-                  htmlFor={`codex-port-${profile.id}`}
+
+        {view.kind === "list" && (
+          <>
+            <div className="space-y-3 overflow-y-auto px-6 py-4">
+              {profiles.map((profile) => (
+                <section
+                  key={profile.id}
+                  className="rounded-md border border-border-default p-3"
                 >
-                  监听端口
-                </label>
-                <div className="mt-1 flex gap-2">
-                  <Input
-                    id={`codex-port-${profile.id}`}
-                    aria-label="监听端口"
-                    type="number"
-                    value={port}
-                    onChange={(event) =>
-                      setPorts((current) => ({
-                        ...current,
-                        [profile.id]: event.target.value,
-                      }))
-                    }
-                  />
-                  <Button
-                    size="sm"
-                    onClick={() => onUpdatePort(profile.id, Number(port))}
-                  >
-                    保存端口
-                  </Button>
-                </div>
-                <div className="mt-3 flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={isDefault}
-                    onClick={() => onRebind(profile.id)}
-                  >
-                    重新绑定 Home
-                  </Button>
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    disabled={isDefault}
-                    onClick={() => onDelete(profile.id)}
-                  >
-                    删除 Profile
-                  </Button>
-                </div>
+                  <div className="font-medium">{profile.name}</div>
+                  <div className="mt-1 truncate text-xs text-muted-foreground">
+                    {profile.canonicalHomePath}
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    监听端口：{profile.listenPort}
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        setView({ kind: "edit", profileId: profile.id })
+                      }
+                    >
+                      编辑 Profile
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      disabled={profile.id === CODEX_DEFAULT_PROFILE_ID}
+                      onClick={() => {
+                        setDeleteError(null);
+                        setView({
+                          kind: "delete-confirm",
+                          profileId: profile.id,
+                        });
+                      }}
+                    >
+                      删除 Profile
+                    </Button>
+                  </div>
+                </section>
+              ))}
+            </div>
+            <DialogFooter>
+              <Button onClick={() => setView({ kind: "create" })}>
+                新建 Profile
+              </Button>
+              <Button variant="outline" onClick={() => onOpenChange(false)}>
+                关闭
+              </Button>
+            </DialogFooter>
+          </>
+        )}
+
+        {view.kind === "create" && (
+          <div className="overflow-y-auto px-6 py-4">
+            <CodexProfileForm
+              key="create"
+              mode="create"
+              onSubmit={handleCreate}
+              onCancel={() => setView({ kind: "list" })}
+            />
+          </div>
+        )}
+
+        {view.kind === "edit" && (
+          <div className="overflow-y-auto px-6 py-4">
+            {isEditLoading && (
+              <p className="text-sm text-muted-foreground">
+                正在加载 Profile 状态...
+              </p>
+            )}
+            {!isEditLoading && editError && (
+              <section className="space-y-4">
+                <p role="alert" className="text-sm text-red-500">
+                  {editError}
+                </p>
+                <Button
+                  variant="outline"
+                  onClick={() => setView({ kind: "list" })}
+                >
+                  返回列表
+                </Button>
               </section>
-            );
-          })}
-        </div>
-        <DialogFooter>
-          <Button onClick={onCreate}>新建 Profile</Button>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            关闭
-          </Button>
-        </DialogFooter>
+            )}
+            {!isEditLoading && editProfile && (
+              <div className="space-y-3">
+                {editIsActive && (
+                  <p className="text-sm text-amber-600 dark:text-amber-400">
+                    请先停止该 Profile 的路由后再修改
+                  </p>
+                )}
+                <CodexProfileForm
+                  key={editProfile.id}
+                  mode="edit"
+                  initialValues={{
+                    name: editProfile.name,
+                    homePath: editProfile.canonicalHomePath,
+                    listenPort: editProfile.listenPort,
+                  }}
+                  canEditHome={canEditHome}
+                  canEditPort={canEditPort}
+                  onSubmit={handleUpdate}
+                  onCancel={() => setView({ kind: "list" })}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {view.kind === "delete-confirm" && (
+          <div className="space-y-4 overflow-y-auto px-6 py-4">
+            {deleteTarget ? (
+              <>
+                <div className="rounded-md border border-border-default p-3">
+                  <div className="font-medium">{deleteTarget.name}</div>
+                  <div className="mt-1 break-all text-xs text-muted-foreground">
+                    {deleteTarget.canonicalHomePath}
+                  </div>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  此操作只删除 CC Switch 中的绑定和本地 token，不删除 Home
+                  目录，也不会删除其中的 auth.json、config.toml 或任何会话。
+                </p>
+              </>
+            ) : (
+              <p role="alert" className="text-sm text-red-500">
+                找不到待删除的 Profile
+              </p>
+            )}
+            {deleteError && (
+              <p role="alert" className="text-sm text-red-500">
+                {deleteError}
+              </p>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="outline"
+                disabled={isDeleting}
+                onClick={() => setView({ kind: "list" })}
+              >
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                disabled={isDeleting || !deleteTarget}
+                onClick={() => void handleDelete()}
+              >
+                {isDeleting ? "删除中..." : "确认删除"}
+              </Button>
+            </div>
+          </div>
+        )}
       </DialogContent>
     </Dialog>
   );

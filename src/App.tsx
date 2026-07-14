@@ -52,6 +52,7 @@ import { useUsageCacheBridge } from "@/hooks/useUsageCacheBridge";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { useScanUnmanagedSkills } from "@/hooks/useSkills";
+import { useCodexProfileManagement } from "@/hooks/useCodexProfileManagement";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { deepClone } from "@/utils/deepClone";
@@ -197,8 +198,7 @@ function App() {
   }, [currentView]);
 
   const { data: settingsData } = useSettingsQuery();
-  const { data: codexProfiles = [], refetch: refetchCodexProfiles } =
-    useCodexProfiles();
+  const { data: codexProfiles = [] } = useCodexProfiles();
   const {
     data: codexProfileState,
     isLoading: isCodexProfileStateLoading,
@@ -232,6 +232,12 @@ function App() {
       });
     }
   };
+  const { createProfile, updateProfile, deleteProfile, loadProfileState } =
+    useCodexProfileManagement({
+      profiles: codexProfiles,
+      selectedProfileId: selectedCodexProfileId,
+      onSelectProfile: selectCodexProfile,
+    });
   const useAppWindowControls =
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
@@ -1096,58 +1102,10 @@ function App() {
                         open={isCodexProfileManagerOpen}
                         profiles={codexProfiles}
                         onOpenChange={setIsCodexProfileManagerOpen}
-                        onUpdatePort={(profileId, listenPort) => {
-                          void codexProfilesApi
-                            .updatePort(profileId, listenPort)
-                            .then(() => {
-                              void refetchCodexProfiles();
-                              void refetchCodexProfileState();
-                            })
-                            .catch((error) =>
-                              toast.error(extractErrorMessage(error)),
-                            );
-                        }}
-                        onDelete={(profileId) => {
-                          void codexProfilesApi
-                            .delete(profileId)
-                            .then(() => {
-                              void refetchCodexProfiles();
-                              if (profileId === selectedCodexProfileId) {
-                                setSelectedCodexProfileId(null);
-                              }
-                            })
-                            .catch((error) =>
-                              toast.error(extractErrorMessage(error)),
-                            );
-                        }}
-                        onRebind={(profileId) => {
-                          const homePath =
-                            window.prompt("新的 CODEX_HOME 路径");
-                          if (!homePath) return;
-                          void codexProfilesApi
-                            .rebind(profileId, homePath)
-                            .then(() => {
-                              void refetchCodexProfiles();
-                              void refetchCodexProfileState();
-                            })
-                            .catch((error) =>
-                              toast.error(extractErrorMessage(error)),
-                            );
-                        }}
-                        onCreate={() => {
-                          const name = window.prompt("Profile 名称");
-                          const homePath = window.prompt("CODEX_HOME 路径");
-                          if (!name || !homePath) return;
-                          void codexProfilesApi
-                            .create({ name, homePath })
-                            .then((profile) => {
-                              selectCodexProfile(profile.id);
-                              void refetchCodexProfiles();
-                            })
-                            .catch((error) =>
-                              toast.error(extractErrorMessage(error)),
-                            );
-                        }}
+                        loadProfileState={loadProfileState}
+                        onCreate={createProfile}
+                        onUpdate={updateProfile}
+                        onDelete={deleteProfile}
                       />
                     )}
                   </motion.div>
