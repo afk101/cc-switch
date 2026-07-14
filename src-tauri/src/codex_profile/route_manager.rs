@@ -877,7 +877,7 @@ impl CodexRouteManager {
             recovered.updated_at = Utc::now().timestamp_millis();
             return self.persistence.save_route(&recovered);
         }
-        if Self::is_disable_recovery_phase(&recovery.phase) {
+        if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             if let Some(backup) = route.live_backup_json.as_deref() {
                 let profile = self.persistence.get_profile(profile_id)?;
                 if let Err(error) = self
@@ -893,7 +893,7 @@ impl CodexRouteManager {
                 }
             }
         }
-        if Self::is_disable_recovery_phase(&recovery.phase) {
+        if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             if let Ok(runtime) = self.runtime(profile_id) {
                 if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
                     self.persist_operation_error(
@@ -1008,14 +1008,15 @@ impl CodexRouteManager {
     }
 
     /// 判断恢复记录是否属于必须先恢复 Home 再收敛关闭状态的关闭流程。
-    fn is_disable_recovery_phase(phase: &str) -> bool {
-        matches!(
-            phase,
-            CODEX_ROUTE_RECOVERY_PHASE_PREPARED
-                | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED
-                | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
-                | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED
-        )
+    fn is_disable_recovery(operation: &str, phase: &str) -> bool {
+        operation == "disable"
+            && matches!(
+                phase,
+                CODEX_ROUTE_RECOVERY_PHASE_PREPARED
+                    | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED
+                    | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
+                    | CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED
+            )
     }
 
     /// Home 或运行时补偿失败时保留操作记录及经过脱敏的错误摘要。
@@ -2272,7 +2273,7 @@ mod codex_route_manager {
         Ok(())
     }
 
-    /// 公共切换入口遇到缺失运行时的未完成切换时，必须保持持久化状态等待后续补偿。
+    /// 公共切换入口遇到 prepared 阶段且缺失运行时的未完成切换时，必须保持持久化状态等待后续补偿。
     #[tokio::test]
     async fn switching_with_pending_switch_without_runtime_keeps_route_failovers_and_recovery(
     ) -> Result<(), AppError> {
@@ -2308,7 +2309,7 @@ mod codex_route_manager {
                 enabled: true,
                 failover_ids: vec!["provider-new".to_string()],
             },
-            phase: CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED.to_string(),
+            phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(),
             last_error: None,
         })
         .expect("编码恢复记录");
@@ -2356,6 +2357,85 @@ mod codex_route_manager {
                 .as_deref(),
             Some(recovery_json.as_str())
         );
+        Ok(())
+    }
+
+    /// 启动恢复遇到 prepared 阶段的切换残留时，不得改写 Home、停止运行时或伪装成已关闭。
+    #[tokio::test]
+    async fn restoring_prepared_switch_without_runtime_keeps_route_and_recovery(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, "model = \"current\"\n").expect("写入当前配置");
+        for provider_id in ["provider-old", "provider-new"] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    provider_id.to_string(),
+                    provider_id.to_string(),
+                    json!({}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery_json = serde_json::to_string(&RouteRecoveryRecord {
+            operation: "switch".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-old".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-new".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(),
+            last_error: None,
+        })
+        .expect("编码恢复记录");
+        let route = CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: Some("provider-new".to_string()),
+            enabled: true,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: Some(recovery_json.clone()),
+            updated_at: 1,
+        };
+        db.save_codex_profile_route(&route)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取当前配置"),
+            "model = \"current\"\n"
+        );
+        assert_eq!(
+            db.get_codex_profile_route("profile-a")?.expect("路由记录"),
+            route
+        );
+        assert!(manager.status("profile-a").await.is_err());
         Ok(())
     }
 
