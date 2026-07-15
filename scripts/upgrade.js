@@ -29,17 +29,13 @@ const BRANCH_VERSION_RE = /v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?/;
  * @param {object} [opts] - 可选配置
  * @param {boolean} [opts.silent] - 是否抑制 stderr 输出
  * @returns {string}
+ * @throws {Error} 命令返回非零退出码时向上抛出异常
  */
 function run(cmd, opts = {}) {
-  try {
-    return execSync(cmd, {
-      encoding: "utf8",
-      stdio: opts.silent ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
-    }).trim();
-  } catch (err) {
-    if (opts.throwOnError) throw err;
-    return "";
-  }
+  return execSync(cmd, {
+    encoding: "utf8",
+    stdio: opts.silent ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
+  }).trim();
 }
 
 /**
@@ -265,7 +261,12 @@ async function performUpgrade(targetTag) {
 
   // 检查目标分支是否已存在
   const existingBranches = run("git branch --list");
-  if (existingBranches.split("\n").map((b) => b.trim().replace(/^\* /, "")).includes(newBranch)) {
+  if (
+    existingBranches
+      .split("\n")
+      .map((b) => b.trim().replace(/^\* /, ""))
+      .includes(newBranch)
+  ) {
     log(`分支 "${newBranch}" 已存在`, "error");
     log("请手动删除该分支或选择其他版本", "warn");
     process.exit(1);
@@ -297,10 +298,7 @@ async function performUpgrade(targetTag) {
 
   // 自动 push
   const rl = createRL();
-  const confirm = await ask(
-    rl,
-    `\n是否立即推送到 origin？[Y/n]：`,
-  );
+  const confirm = await ask(rl, `\n是否立即推送到 origin？[Y/n]：`);
   rl.close();
 
   const shouldPush = confirm.trim().toLowerCase() !== "n";
