@@ -28,7 +28,7 @@ export function CodexHomeContextBar({
   onManage,
 }: CodexHomeContextBarProps) {
   return (
-    <section className="flex items-center gap-3 rounded-lg border border-border-default bg-muted/20 px-3 py-2">
+    <section className="flex items-end gap-3 rounded-lg border border-border-default bg-muted/20 px-3 py-2">
       <div className="min-w-0 flex-1">
         <div className="text-xs text-muted-foreground">当前 CODEX_HOME</div>
         <Select
@@ -47,7 +47,7 @@ export function CodexHomeContextBar({
           </SelectContent>
         </Select>
       </div>
-      <div className="min-w-0 flex-1 text-xs text-muted-foreground">
+      <div className="flex h-8 min-w-0 flex-1 items-center text-xs text-muted-foreground">
         {isStateLoading ? (
           <span>正在加载 Profile 状态…</span>
         ) : state ? (

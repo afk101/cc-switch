@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { CODEX_DEFAULT_PROFILE_ID } from "@/config/constants";
-import type { CodexProfile } from "@/types/codexProfile";
+import type { CodexProfile, CodexProfileState } from "@/types/codexProfile";
 import { CodexProfileManagerDialog } from "./CodexProfileManagerDialog";
 
 const defaultProfile: CodexProfile = {
@@ -62,6 +62,73 @@ function renderManager(
 }
 
 describe("CodexProfileManagerDialog", () => {
+  it("使用最高弹窗层级覆盖顶部导航", () => {
+    renderManager();
+
+    const dialog = screen.getByRole("dialog");
+
+    expect(dialog).toHaveClass("z-[110]");
+    expect(dialog.previousElementSibling).toHaveClass("z-[110]");
+  });
+
+  it("为弹窗和遮罩提供进入与退出动画钩子", () => {
+    renderManager();
+
+    const dialog = screen.getByRole("dialog");
+
+    expect(dialog).toHaveClass("codex-profile-dialog");
+    expect(dialog.previousElementSibling).toHaveClass(
+      "codex-profile-dialog-overlay",
+    );
+  });
+
+  it("列表与编辑页通过独立动画容器切换", async () => {
+    const { user } = renderManager({ profiles: [customProfile] });
+    const dialog = screen.getByRole("dialog");
+
+    expect(dialog.querySelector('[data-profile-view="list"]')).toHaveClass(
+      "codex-profile-dialog-view",
+    );
+
+    await user.click(screen.getByRole("button", { name: "编辑 Profile" }));
+
+    await waitFor(() => {
+      expect(dialog.querySelector('[data-profile-view="edit"]')).toHaveClass(
+        "codex-profile-dialog-view",
+      );
+    });
+  });
+
+  it("编辑状态加载完成前保持列表且不展示中间加载页", async () => {
+    let resolveProfileState: (state: CodexProfileState) => void = () => {};
+    const loadProfileState = vi.fn(
+      () =>
+        new Promise<CodexProfileState>((resolve) => {
+          resolveProfileState = resolve;
+        }),
+    );
+    const { user } = renderManager({
+      profiles: [customProfile],
+      loadProfileState,
+    });
+
+    await user.click(screen.getByRole("button", { name: "编辑 Profile" }));
+
+    expect(screen.getByRole("dialog")).toHaveTextContent("管理 Codex Profile");
+    expect(
+      screen.queryByText("正在加载 Profile 状态..."),
+    ).not.toBeInTheDocument();
+
+    resolveProfileState({
+      profile: customProfile,
+      route: null,
+      runtimeStatus: "stopped",
+    });
+
+    expect(await screen.findByLabelText("Profile 名称")).toHaveValue("工作");
+    expect(screen.getByRole("dialog")).toHaveTextContent("编辑 Codex Profile");
+  });
+
   it("点击新建后在同一 Dialog 显示创建表单且不调用 prompt", async () => {
     const promptSpy = vi.spyOn(window, "prompt");
     const { user } = renderManager();
