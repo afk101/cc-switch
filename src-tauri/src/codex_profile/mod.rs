@@ -14,8 +14,8 @@ mod secret_store;
 pub use constants::*;
 pub(crate) use home_config::build_codex_route_toml_base;
 pub use home_config::{
-    build_codex_profile_route_toml, CodexHomeConfigService, CodexHomeFileOps,
-    CodexHomeReconcileOwnership, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
+    build_codex_profile_route_toml, CodexDirectProviderConfigPlan, CodexHomeConfigService,
+    CodexHomeFileOps, CodexHomeReconcileOwnership, CodexLiveConfigSnapshot, CodexRouteConfigPlan,
     SystemCodexHomeFileOps,
 };
 pub use migration::{

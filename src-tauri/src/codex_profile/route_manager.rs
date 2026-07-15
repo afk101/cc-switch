@@ -319,6 +319,30 @@ impl CodexRouteManager {
         provider_id: &str,
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
+        self.switch_provider_internal(profile_id, provider_id, failover_ids, None)
+            .await
+    }
+
+    /// 使用命令层已合并公共配置的供应商设置执行 Profile 供应商选择。
+    pub async fn switch_provider_with_effective_settings(
+        &self,
+        profile_id: &str,
+        provider: Provider,
+        failover_ids: Vec<String>,
+    ) -> Result<(), AppError> {
+        let provider_id = provider.id.clone();
+        self.switch_provider_internal(profile_id, &provider_id, failover_ids, Some(provider))
+            .await
+    }
+
+    /// 在 Profile 锁内按权威路由状态分派直连写入或运行时热切换。
+    async fn switch_provider_internal(
+        &self,
+        profile_id: &str,
+        provider_id: &str,
+        failover_ids: Vec<String>,
+        effective_provider: Option<Provider>,
+    ) -> Result<(), AppError> {
         if provider_id.is_empty() {
             return Err(AppError::InvalidInput("Codex 供应商不能为空".to_string()));
         }
@@ -326,15 +350,45 @@ impl CodexRouteManager {
         let _ = self.provider_snapshot(provider_id, &failover_ids)?;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
-        self.persistence
-            .get_profile(profile_id)?
-            .validate_route_operation()?;
+        let profile = self.persistence.get_profile(profile_id)?;
+        profile.validate_route_operation()?;
+        let pending_lifecycle_operation = self
+            .persistence
+            .get_route(profile_id)?
+            .and_then(|route| route.recovery_json)
+            .and_then(|json| serde_json::from_str::<RouteRecoveryRecord>(&json).ok())
+            .is_some_and(|recovery| recovery.operation != "switch");
         self.recover_pending_locked(profile_id).await?;
+        if pending_lifecycle_operation {
+            return Err(AppError::InvalidInput(
+                "已完成上一次 Codex Profile 路由恢复，请重试供应商切换".to_string(),
+            ));
+        }
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let route = self
             .persistence
             .get_route(profile_id)?
             .ok_or_else(|| AppError::InvalidInput("Codex Profile 路由不存在".to_string()))?;
+        let selected_provider = match effective_provider {
+            Some(provider) => provider,
+            None => self
+                .persistence
+                .get_provider(provider_id)?
+                .ok_or_else(|| AppError::InvalidInput("Codex 供应商不存在".to_string()))?,
+        };
+        if !route.enabled {
+            return self.switch_direct_provider_locked(
+                &profile,
+                route,
+                selected_provider,
+                failover_ids,
+            );
+        }
+        if selected_provider.category.as_deref() == Some("official") {
+            return Err(AppError::InvalidInput(
+                "官方订阅供应商不能经过 Profile 路由，请先关闭路由".to_string(),
+            ));
+        }
         let old_failovers = self.persistence.list_failovers(profile_id)?;
         let old_snapshot = self.provider_snapshot(
             route
@@ -423,6 +477,50 @@ impl CodexRouteManager {
             return Err(Self::compensation_failure_error(
                 &error,
                 persistence_error.as_ref(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 在路由关闭态应用供应商直连配置，并在持久化失败时恢复 Home。
+    fn switch_direct_provider_locked(
+        &self,
+        profile: &CodexProfile,
+        route: CodexProfileRoute,
+        provider: Provider,
+        failover_ids: Vec<String>,
+    ) -> Result<(), AppError> {
+        let home = std::path::Path::new(&profile.canonical_home_path);
+        let plan = self
+            .home_config
+            .build_direct_provider_plan(home, &provider)?;
+        self.home_config.apply_direct_provider_plan(&plan)?;
+        let changed = CodexProfileRoute {
+            current_provider_id: Some(provider.id),
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: Utc::now().timestamp_millis(),
+            ..route.clone()
+        };
+        if let Err(error) = self.persistence.save_route(&changed) {
+            let compensation_error = self.home_config.restore_direct_provider_plan(&plan).err();
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
+        if let Err(error) = self
+            .persistence
+            .replace_failovers(&profile.id, &failover_ids)
+        {
+            let route_compensation = self.persistence.save_route(&route).err();
+            let home_compensation = self.home_config.restore_direct_provider_plan(&plan).err();
+            let compensation_error = route_compensation.or(home_compensation);
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
             ));
         }
         Ok(())
@@ -1681,6 +1779,205 @@ mod codex_route_manager {
             updated_at: 1,
         })?;
         Ok(plan)
+    }
+
+    /// 关闭态选择供应商只更新目标 Home 与供应商引用，不得创建 token 或启动路由。
+    #[tokio::test]
+    async fn switching_disabled_profile_preserves_route_state() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let mut provider = Provider::with_id(
+            "official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({
+                "auth": {"auth_mode": "chatgpt"},
+                "config": "model = \"gpt-official\"\n"
+            }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(TrackingTokenStore {
+            ensured: AtomicUsize::new(0),
+            deleted: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .switch_provider("profile-a", "official", vec![])
+            .await?;
+
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert!(!route.enabled);
+        assert_eq!(route.current_provider_id.as_deref(), Some("official"));
+        assert!(route.live_backup_json.is_none());
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 0);
+        assert!(manager.runtimes.lock().expect("运行时锁").is_empty());
+        let config =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取直连配置");
+        assert!(config.contains("gpt-official"));
+        assert!(!config.contains("127.0.0.1:"));
+        Ok(())
+    }
+
+    /// 关闭态供应商引用保存失败时必须恢复 Home，避免配置与数据库分裂。
+    #[tokio::test]
+    async fn switching_disabled_profile_save_failure_restores_home() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        fs::write(&config_path, "model = \"before\"\n").expect("写入原配置");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-new".to_string(),
+                "Provider New".to_string(),
+                json!({"auth": {}, "config": "model = \"after\"\n"}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db: db.clone(),
+                save_count: AtomicUsize::new(0),
+                fail_on_save: 1,
+                fail_replace: false,
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        assert!(manager
+            .switch_provider("profile-a", "provider-new", vec![])
+            .await
+            .is_err());
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("重读原配置"),
+            "model = \"before\"\n"
+        );
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert!(!route.enabled);
+        assert!(route.current_provider_id.is_none());
+        Ok(())
+    }
+
+    /// 已启用路由不能热切到官方订阅供应商，必须先由用户显式关闭路由。
+    #[tokio::test]
+    async fn switching_enabled_profile_rejects_official_provider() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-old".to_string(),
+                "Provider Old".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        let mut official = Provider::with_id(
+            "official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth": {"auth_mode": "chatgpt"}, "config": ""}),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider(AppType::Codex.as_str(), &official)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: "/tmp/profile-a".to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: Some("provider-old".to_string()),
+            enabled: true,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let runtime = Arc::new(FakeRuntime {
+            provider: AsyncMutex::new("provider-old".to_string()),
+            port: 16001,
+        });
+        manager
+            .runtimes
+            .lock()
+            .expect("运行时锁")
+            .insert("profile-a".to_string(), runtime.clone());
+
+        let error = manager
+            .switch_provider("profile-a", "official", vec![])
+            .await
+            .expect_err("官方订阅不能经过路由");
+
+        assert!(error.to_string().contains("请先关闭路由"));
+        assert_eq!(*runtime.provider.lock().await, "provider-old");
+        assert_eq!(
+            db.get_codex_profile_route("profile-a")?
+                .expect("路由记录")
+                .current_provider_id
+                .as_deref(),
+            Some("provider-old")
+        );
+        Ok(())
     }
 
     /// 启动所有权判断必须基于任意 Profile 路由，而不是默认 Home 身份。

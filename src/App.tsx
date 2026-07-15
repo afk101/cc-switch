@@ -54,6 +54,8 @@ import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { useScanUnmanagedSkills } from "@/hooks/useSkills";
 import { useCodexProfileManagement } from "@/hooks/useCodexProfileManagement";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { getCodexProviderRouteRequirement } from "@/utils/providerRouteRequirement";
+import { CODEX_PROVIDER_ROUTE_REQUIREMENTS } from "@/config/constants";
 import { isTextEditableTarget } from "@/utils/domUtils";
 import { deepClone } from "@/utils/deepClone";
 import { cn } from "@/lib/utils";
@@ -390,10 +392,26 @@ function App() {
       return;
     }
     const routeEnabled = codexProfileState?.route?.enabled === true;
-    const request = routeEnabled
-      ? codexProfilesApi.switchProvider(selectedCodexProfileId, provider.id, [])
-      : codexProfilesApi.enableRoute(selectedCodexProfileId, provider.id, []);
-    void request
+    const routeRequirement = getCodexProviderRouteRequirement(provider);
+    if (!routeEnabled && routeRequirement) {
+      const reason =
+        routeRequirement === CODEX_PROVIDER_ROUTE_REQUIREMENTS.OPENAI_CHAT
+          ? t("notifications.proxyReasonOpenAIChat", {
+              defaultValue: "使用 OpenAI Chat 接口格式",
+            })
+          : t("notifications.proxyReasonFullUrl", {
+              defaultValue: "开启了完整 URL 连接模式",
+            });
+      toast.warning(
+        t("notifications.proxyRequiredForSwitch", {
+          reason,
+          defaultValue:
+            "此供应商{{reason}}，需要代理服务才能正常使用，请先启动代理",
+        }),
+      );
+    }
+    void codexProfilesApi
+      .switchProvider(selectedCodexProfileId, provider.id, [])
       .then(() => {
         void refetchCodexProfileState();
       })

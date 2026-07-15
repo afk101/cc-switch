@@ -36,7 +36,15 @@ vi.mock("@/components/providers/ProviderList", () => ({
     <div>
       <div data-testid="provider-list">{JSON.stringify(providers)}</div>
       <div data-testid="current-provider">{currentProviderId}</div>
-      <button onClick={() => onSwitch(providers[currentProviderId])}>
+      <button
+        onClick={() =>
+          onSwitch(
+            Object.values(providers).find(
+              (provider: any) => provider.id !== currentProviderId,
+            ) ?? providers[currentProviderId],
+          )
+        }
+      >
         switch
       </button>
       <button onClick={() => onEdit(providers[currentProviderId])}>edit</button>
@@ -234,8 +242,11 @@ describe("App integration with MSW", () => {
 
     fireEvent.click(screen.getByText("switch"));
     await waitFor(() =>
-      expect(screen.getByText(/路由已启用/)).toBeInTheDocument(),
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-2",
+      ),
     );
+    expect(screen.getByText(/路由未启用/)).toBeInTheDocument();
     fireEvent.click(screen.getByText("duplicate"));
     await waitFor(() =>
       expect(screen.getByTestId("provider-list").textContent).toMatch(/copy/),

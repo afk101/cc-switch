@@ -20,10 +20,8 @@ import {
 import { usageKeys } from "@/lib/query/usage";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { openclawKeys } from "@/hooks/useOpenClaw";
-import {
-  extractCodexWireApi,
-  isCodexChatWireApi,
-} from "@/utils/providerConfigUtils";
+import { getCodexProviderRouteRequirement } from "@/utils/providerRouteRequirement";
+import { CODEX_PROVIDER_ROUTE_REQUIREMENTS } from "@/config/constants";
 
 /**
  * Hook for managing provider actions (add, update, delete, switch)
@@ -155,16 +153,10 @@ export function useProviderActions(
       const isCopilotProvider =
         activeApp === "claude" &&
         provider.meta?.providerType === "github_copilot";
-      const isCodexChatFormat =
-        activeApp === "codex" &&
-        (provider.meta?.apiFormat === "openai_chat" ||
-          (typeof (provider.settingsConfig as Record<string, any>)?.config ===
-            "string" &&
-            isCodexChatWireApi(
-              extractCodexWireApi(
-                (provider.settingsConfig as Record<string, any>).config,
-              ),
-            )));
+      const codexRouteRequirement =
+        activeApp === "codex"
+          ? getCodexProviderRouteRequirement(provider)
+          : null;
 
       // Determine why this provider requires the proxy
       let proxyRequiredReason: string | null = null;
@@ -187,7 +179,10 @@ export function useProviderActions(
           proxyRequiredReason = t("notifications.proxyReasonOpenAIResponses", {
             defaultValue: "使用 OpenAI Responses 接口格式",
           });
-        } else if (isCodexChatFormat) {
+        } else if (
+          codexRouteRequirement ===
+          CODEX_PROVIDER_ROUTE_REQUIREMENTS.OPENAI_CHAT
+        ) {
           proxyRequiredReason = t("notifications.proxyReasonOpenAIChat", {
             defaultValue: "使用 OpenAI Chat 接口格式",
           });
@@ -199,8 +194,8 @@ export function useProviderActions(
             defaultValue: "使用 Claude Desktop 本地路由模式",
           });
         } else if (
-          provider.meta?.isFullUrl &&
-          (activeApp === "claude" || activeApp === "codex")
+          (provider.meta?.isFullUrl && activeApp === "claude") ||
+          codexRouteRequirement === CODEX_PROVIDER_ROUTE_REQUIREMENTS.FULL_URL
         ) {
           proxyRequiredReason = t("notifications.proxyReasonFullUrl", {
             defaultValue: "开启了完整 URL 连接模式",

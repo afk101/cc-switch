@@ -76,6 +76,29 @@
 | Profile API 内部根据 route.enabled 分派热切换或直连切换           | 前端只表达“选择此供应商”，后端在同一 Profile 锁内依据权威状态执行，避免 UI 快照竞态。 |
 | 只有 `enable_codex_profile_route` 能把 enabled 从 false 改为 true | 用后端命令边界保证任何 UI、托盘或未来调用者都无法通过普通供应商选择隐式启动路由。     |
 
+## 实施结果
+
+- `App.handleSwitchProvider` 已删除 `enableRoute` 分支，Codex 供应商卡片始终调用 `switch_codex_profile_provider`。
+- 后端在 Profile 锁内读取权威 `route.enabled`：关闭态应用目标 Home 的直连配置并保持 `enabled=false`；启用态继续走运行时快照热切换。
+- 关闭态切换不会创建 listener token、不会启动 runtime、不会生成 live backup；Home 写入后若路由保存失败会恢复原配置。
+- 官方订阅直连只写目标 Home 的 `config.toml`，不读取或覆盖该 Home 的 `auth.json`；第三方供应商把自身 API key 投影到 config。
+- 模型目录准备已拆为无副作用函数，Profile 直连计划把 `cc-switch-model-catalog.json` 写入选中的 Home，并与 config 一起补偿。
+- 命令层先合并供应商公共配置，再交给 route manager，避免 Profile 直连丢失既有 common config 语义。
+- 已启用路由时切换官方订阅会明确要求先关闭路由，避免把订阅认证流量送入本地代理；任意 Profile 在路由关闭后都可使用官方订阅。
+- 前端共享 `getCodexProviderRouteRequirement` 判断 OpenAI Chat/完整 URL 路由需求，只显示 warning，不代替用户开启路由。
+
+## 定向验证证据
+
+- RED：原集成用例改为断言“供应商切换且路由未启用”后失败，证明旧 `App` 仍调用 enable command。
+- RED：Rust 直连计划测试最初因缺少 `build_direct_provider_plan` / `apply_direct_provider_plan` 编译失败。
+- GREEN：`cargo test --manifest-path src-tauri/Cargo.toml codex_profile::home_config::codex_home_config::direct_ --lib`，3 项通过。
+- GREEN：`cargo test --manifest-path src-tauri/Cargo.toml codex_profile::route_manager::codex_route_manager --lib`，40 项通过。
+- GREEN：`pnpm exec vitest run src/utils/providerRouteRequirement.test.ts tests/integration/App.test.tsx src/components/codex/CodexProfileRouteToggle.test.tsx`，14 项通过。
+- GREEN：`pnpm exec vitest run`，71 个测试文件、443 项测试全部通过；计划中的 `pnpm test -- --run` 因项目未定义 `test` script 不适用，已改为实际 Vitest 命令。
+- GREEN：`cargo test --manifest-path src-tauri/Cargo.toml --lib`，1850 项通过、2 项忽略、0 失败。
+- GREEN：`pnpm run typecheck`、目标文件 Prettier 检查、`cargo fmt -- --check` 与 `git diff --check` 全部通过。
+- 现场复核：`~/.codex-api` 无 `base_url`、无 `experimental_bearer_token`，`requires_openai_auth=true`、`auth_mode=chatgpt`；数据库路由关闭且无 backup/recovery/error，15722 无监听。
+
 ## 遇到的问题
 
 | 问题                                             | 解决方案                                                                                |

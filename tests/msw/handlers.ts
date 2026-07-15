@@ -16,6 +16,7 @@ import {
   resetProviderState,
   setCurrentProviderId,
   setCodexProfileRoute,
+  switchCodexProfileProvider,
   updateProvider,
   updateSortOrder,
   getSettings,
@@ -55,6 +56,19 @@ const handleCodexProfileRouteUpdate = async (request: Request) => {
   return success(true);
 };
 
+/** 校验请求并仅更新 Codex Profile 的供应商引用。 */
+const handleCodexProfileProviderSwitch = async (request: Request) => {
+  const { profileId, providerId } = await withJson<{
+    profileId: string;
+    providerId: string;
+  }>(request);
+  const providerExists = Boolean(getProviders("codex")[providerId]);
+  if (!providerExists || !switchCodexProfileProvider(profileId, providerId)) {
+    return HttpResponse.json(false, { status: 404 });
+  }
+  return success(true);
+};
+
 export const handlers = [
   http.post(`${TAURI_ENDPOINT}/get_migration_result`, () => success(false)),
   http.post(`${TAURI_ENDPOINT}/get_skills_migration_result`, () =>
@@ -88,7 +102,7 @@ export const handlers = [
   ),
 
   http.post(`${TAURI_ENDPOINT}/switch_codex_profile_provider`, ({ request }) =>
-    handleCodexProfileRouteUpdate(request),
+    handleCodexProfileProviderSwitch(request),
   ),
 
   http.post(

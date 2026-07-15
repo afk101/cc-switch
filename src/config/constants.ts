@@ -23,3 +23,12 @@ export const CODEX_DEFAULT_PROFILE_ID = "codex-default";
 // Codex Profile 可使用的监听端口范围
 export const CODEX_PROFILE_MIN_PORT = 1;
 export const CODEX_PROFILE_MAX_PORT = 65_535;
+
+// Codex 供应商需要本地路由的原因
+export const CODEX_PROVIDER_ROUTE_REQUIREMENTS = {
+  OPENAI_CHAT: "openaiChat",
+  FULL_URL: "fullUrl",
+} as const;
+
+export type CodexProviderRouteRequirement =
+  (typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS)[keyof typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS];

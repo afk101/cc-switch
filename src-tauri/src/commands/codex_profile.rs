@@ -1,5 +1,6 @@
 //! Codex Profile 的窄 Tauri 命令。
 
+use crate::app_config::AppType;
 use crate::codex_profile::{
     CodexProfile, CodexProfileRef, CodexProfileRepository, CodexProfileState, CodexRuntimeStatus,
     SystemHomePathCanonicalizer, SystemPortAvailability,
@@ -205,9 +206,21 @@ pub async fn switch_codex_profile_provider(
     #[allow(non_snake_case)] providerId: String,
     #[allow(non_snake_case)] failoverIds: Vec<String>,
 ) -> Result<bool, String> {
+    let mut provider = state
+        .db
+        .get_provider_by_id(&providerId, AppType::Codex.as_str())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Codex 供应商不存在".to_string())?;
+    provider.settings_config =
+        crate::services::provider::build_effective_settings_with_common_config(
+            state.db.as_ref(),
+            &AppType::Codex,
+            &provider,
+        )
+        .map_err(|error| error.to_string())?;
     state
         .codex_route_manager
-        .switch_provider(&profileId, &providerId, failoverIds)
+        .switch_provider_with_effective_settings(&profileId, provider, failoverIds)
         .await
         .map(|_| true)
         .map_err(|error| error.to_string())

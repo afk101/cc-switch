@@ -1,4 +1,6 @@
-use crate::codex_config::codex_config_path_for_home;
+use crate::codex_config::{
+    codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
+};
 use crate::error::AppError;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,23 @@ pub struct CodexRouteConfigPlan {
     target_fingerprint: String,
     /// 预留给路由配置构建器记录模型选择变化，文件写入阶段不解释该字段。
     model_changes: Vec<String>,
+}
+
+/// 模型目录辅助文件的原内容与目标内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexAuxiliaryFilePlan {
+    path: PathBuf,
+    previous_content: Option<Vec<u8>>,
+    previous_fingerprint: String,
+    target_content: Vec<u8>,
+    target_fingerprint: String,
+}
+
+/// 单个 Profile Home 的供应商直连配置计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexDirectProviderConfigPlan {
+    config: CodexRouteConfigPlan,
+    model_catalog: Option<CodexAuxiliaryFilePlan>,
 }
 
 impl CodexRouteConfigPlan {
@@ -154,6 +173,122 @@ impl CodexHomeConfigService {
             home,
             &build_codex_profile_route_toml(current_toml, listen_port, provider, listener_token),
         )
+    }
+
+    /// 构造指定 Profile Home 的供应商直连计划，不读取或写入该 Home 的认证文件。
+    pub fn build_direct_provider_plan(
+        &self,
+        home: &Path,
+        provider: &Provider,
+    ) -> Result<CodexDirectProviderConfigPlan, AppError> {
+        let mut settings = provider.settings_config.clone();
+        crate::codex_config::apply_codex_unified_session_bucket_to_settings(
+            provider.category.as_deref(),
+            &mut settings,
+        )?;
+        let config_text = settings
+            .get("config")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let direct_config = if provider.category.as_deref() == Some("official") {
+            config_text.to_string()
+        } else {
+            let auth = settings.get("auth").unwrap_or(&serde_json::Value::Null);
+            crate::codex_config::prepare_codex_provider_live_config(auth, config_text)?
+        };
+        let catalog_profile = CodexCatalogToolProfile::from_api_format(
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.as_deref()),
+        );
+        let prepared = crate::codex_config::prepare_codex_config_with_model_catalog(
+            &settings,
+            &direct_config,
+            catalog_profile,
+        )?;
+        let config = self.build_route_plan(home, &prepared.config_text)?;
+        let model_catalog = prepared
+            .model_catalog
+            .map(|catalog| {
+                serde_json::to_vec_pretty(&catalog)
+                    .map_err(|source| AppError::JsonSerialize { source })
+            })
+            .transpose()?
+            .map(|target_content| {
+                let path = home.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+                let previous_content = self.file_ops.read(&path)?;
+                Ok::<CodexAuxiliaryFilePlan, AppError>(CodexAuxiliaryFilePlan {
+                    previous_fingerprint: fingerprint_content(previous_content.as_deref()),
+                    target_fingerprint: fingerprint_content(Some(&target_content)),
+                    path,
+                    previous_content,
+                    target_content,
+                })
+            })
+            .transpose()?;
+        Ok(CodexDirectProviderConfigPlan {
+            config,
+            model_catalog,
+        })
+    }
+
+    /// 原子应用供应商直连计划，失败时不改变计划构造时的 Home 内容。
+    pub fn apply_direct_provider_plan(
+        &self,
+        plan: &CodexDirectProviderConfigPlan,
+    ) -> Result<(), AppError> {
+        if let Some(catalog) = &plan.model_catalog {
+            self.apply_auxiliary_plan(catalog)?;
+        }
+        if let Err(error) = self.apply_route_plan(&plan.config) {
+            let compensation_error = plan
+                .model_catalog
+                .as_ref()
+                .and_then(|catalog| self.restore_auxiliary_plan(catalog).err());
+            return match compensation_error {
+                Some(compensation) => Err(AppError::Message(format!(
+                    "应用 Codex 直连配置失败: {error}；模型目录补偿失败: {compensation}"
+                ))),
+                None => Err(error),
+            };
+        }
+        Ok(())
+    }
+
+    /// 仅在 Home 仍由该直连计划持有时恢复应用前配置。
+    pub fn restore_direct_provider_plan(
+        &self,
+        plan: &CodexDirectProviderConfigPlan,
+    ) -> Result<(), AppError> {
+        self.restore(&plan.config)?;
+        if let Some(catalog) = &plan.model_catalog {
+            self.restore_auxiliary_plan(catalog)?;
+        }
+        Ok(())
+    }
+
+    /// 校验模型目录未被外部修改后原子写入目标内容。
+    fn apply_auxiliary_plan(&self, plan: &CodexAuxiliaryFilePlan) -> Result<(), AppError> {
+        let current = self.file_ops.read(&plan.path)?;
+        ensure_fingerprint(
+            &plan.previous_fingerprint,
+            &fingerprint_content(current.as_deref()),
+        )?;
+        self.file_ops.write_atomic(&plan.path, &plan.target_content)
+    }
+
+    /// 仅在模型目录仍属于当前计划时恢复原内容。
+    fn restore_auxiliary_plan(&self, plan: &CodexAuxiliaryFilePlan) -> Result<(), AppError> {
+        let current = self.file_ops.read(&plan.path)?;
+        ensure_fingerprint(
+            &plan.target_fingerprint,
+            &fingerprint_content(current.as_deref()),
+        )?;
+        match &plan.previous_content {
+            Some(content) => self.file_ops.write_atomic(&plan.path, content),
+            None => self.file_ops.remove_file(&plan.path),
+        }
     }
 
     /// 在当前配置未被外部修改时，原子应用路由接管计划。
@@ -456,6 +591,115 @@ experimental_bearer_token = "PROXY_MANAGED"
             fs::read(codex_auth_path_for_home(&home_b)).expect("重读 B 认证"),
             auth_b_before
         );
+        Ok(())
+    }
+
+    /// 官方供应商直连计划只写目标 Home 配置，不得覆盖该 Home 自己的订阅认证。
+    #[test]
+    fn direct_official_provider_plan_preserves_profile_auth() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let auth_path = codex_auth_path_for_home(home.path());
+        fs::write(&config_path, "model = \"before\"\n").expect("写入旧配置");
+        fs::write(
+            &auth_path,
+            b"{\"auth_mode\":\"chatgpt\",\"token\":\"home-token\"}",
+        )
+        .expect("写入 Profile 认证");
+        let auth_before = fs::read(&auth_path).expect("读取 Profile 认证");
+        let mut provider = Provider::with_id(
+            "official".to_string(),
+            "OpenAI Official".to_string(),
+            serde_json::json!({
+                "auth": {"auth_mode": "chatgpt", "token": "provider-token"},
+                "config": "model = \"gpt-official\"\n"
+            }),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_direct_provider_plan(home.path(), &provider)?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        assert_eq!(
+            fs::read(&auth_path).expect("重读 Profile 认证"),
+            auth_before
+        );
+        let config = fs::read_to_string(&config_path).expect("读取直连配置");
+        assert!(config.contains("model = \"gpt-official\""));
+        assert!(!config.contains("127.0.0.1:"));
+        assert!(!config.contains("experimental_bearer_token"));
+        Ok(())
+    }
+
+    /// 第三方供应商直连计划把 API key 投影到 config，同时保留 Profile 认证。
+    #[test]
+    fn direct_third_party_provider_plan_projects_token_into_config() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let auth_path = codex_auth_path_for_home(home.path());
+        fs::write(&config_path, "model = \"before\"\n").expect("写入旧配置");
+        fs::write(&auth_path, b"{\"auth_mode\":\"chatgpt\"}").expect("写入认证");
+        let auth_before = fs::read(&auth_path).expect("读取认证");
+        let provider = Provider::with_id(
+            "third-party".to_string(),
+            "Third Party".to_string(),
+            serde_json::json!({
+                "auth": {"OPENAI_API_KEY": "upstream-token"},
+                "config": "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"Third Party\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+            }),
+            None,
+        );
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_direct_provider_plan(home.path(), &provider)?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        assert_eq!(
+            crate::codex_config::extract_codex_experimental_bearer_token(&config).as_deref(),
+            Some("upstream-token")
+        );
+        assert_eq!(fs::read(auth_path).expect("重读认证"), auth_before);
+        Ok(())
+    }
+
+    /// 直连模型目录必须写入目标 Profile Home，不得写入其他 Home。
+    #[test]
+    fn direct_provider_model_catalog_is_scoped_to_profile_home() -> Result<(), AppError> {
+        let target_home = tempfile::tempdir().expect("目标 Profile Home");
+        let other_home = tempfile::tempdir().expect("其他 Profile Home");
+        let mut provider = Provider::with_id(
+            "native".to_string(),
+            "Native Responses".to_string(),
+            serde_json::json!({
+                "auth": {"OPENAI_API_KEY": "upstream-token"},
+                "config": "model_provider = \"custom\"\n[model_providers.custom]\nname = \"Native\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": {"models": [{"model": "native-model"}]}
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_direct_provider_plan(target_home.path(), &provider)?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        let catalog_path = target_home
+            .path()
+            .join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        assert!(catalog_path.exists());
+        assert!(!other_home
+            .path()
+            .join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+            .exists());
+        let config = fs::read_to_string(codex_config_path_for_home(target_home.path()))
+            .expect("读取目标 Home 配置");
+        assert!(config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
         Ok(())
     }
 

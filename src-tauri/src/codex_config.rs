@@ -110,6 +110,12 @@ pub enum CodexCatalogToolProfile {
     NativeResponses,
 }
 
+/// 供应商配置投影后的 TOML 与可选模型目录，不在准备阶段写入文件。
+pub struct PreparedCodexConfigWithModelCatalog {
+    pub config_text: String,
+    pub model_catalog: Option<Value>,
+}
+
 impl CodexCatalogToolProfile {
     /// Pick the catalog tool profile from a provider's `apiFormat` meta value.
     /// Native (direct) Responses providers must suppress the custom apply_patch
@@ -958,28 +964,42 @@ fn set_codex_native_web_search_field(config_text: &str, disable: bool) -> Result
 
 /// Generate Codex `model_catalog_json` from provider settings and inject/remove
 /// the top-level TOML field that points Codex to the generated file.
+pub fn prepare_codex_config_with_model_catalog(
+    settings: &Value,
+    config_text: &str,
+    profile: CodexCatalogToolProfile,
+) -> Result<PreparedCodexConfigWithModelCatalog, AppError> {
+    if let Some(catalog) = codex_model_catalog_from_settings(settings, config_text, profile)? {
+        let catalog_path = get_codex_model_catalog_path();
+        let config_text = set_codex_model_catalog_json_field(config_text, Some(&catalog_path))?;
+        let disable_web_search = profile == CodexCatalogToolProfile::NativeResponses
+            && codex_native_gateway_rejects_web_search(&config_text);
+        let config_text = set_codex_native_web_search_field(&config_text, disable_web_search)?;
+        Ok(PreparedCodexConfigWithModelCatalog {
+            config_text,
+            model_catalog: Some(catalog),
+        })
+    } else {
+        let config_text = set_codex_model_catalog_json_field(config_text, None)?;
+        Ok(PreparedCodexConfigWithModelCatalog {
+            config_text: set_codex_native_web_search_field(&config_text, false)?,
+            model_catalog: None,
+        })
+    }
+}
+
+/// 生成默认 Codex Home 的模型目录并返回需要落盘的 TOML。
 pub fn prepare_codex_config_text_with_model_catalog(
     settings: &Value,
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    let catalog_path = get_codex_model_catalog_path();
-
-    if let Some(catalog) = codex_model_catalog_from_settings(settings, config_text, profile)? {
-        let config_text = set_codex_model_catalog_json_field(config_text, Some(&catalog_path))?;
-        // Disable web_search only for native gateways on the reject blacklist
-        // (MiMo/LongCat/MiniMax by host or model brand; Qwen3-Coder by model).
-        // Everything else — relays, DouBao, web-search-capable Qwen models,
-        // unknown providers — keeps Codex's default.
-        let disable_web_search = profile == CodexCatalogToolProfile::NativeResponses
-            && codex_native_gateway_rejects_web_search(&config_text);
-        let config_text = set_codex_native_web_search_field(&config_text, disable_web_search)?;
+    let prepared = prepare_codex_config_with_model_catalog(settings, config_text, profile)?;
+    if let Some(catalog) = prepared.model_catalog {
+        let catalog_path = get_codex_model_catalog_path();
         write_json_file(&catalog_path, &catalog)?;
-        Ok(config_text)
-    } else {
-        let config_text = set_codex_model_catalog_json_field(config_text, None)?;
-        set_codex_native_web_search_field(&config_text, false)
     }
+    Ok(prepared.config_text)
 }
 
 /// Reverse of `prepare_codex_config_text_with_model_catalog`: read the

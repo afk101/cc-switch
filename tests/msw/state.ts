@@ -326,6 +326,18 @@ export const setCodexProfileRoute = (
   return true;
 };
 
+/** 切换 Codex Profile 的供应商引用，但保持当前路由开关不变。 */
+export const switchCodexProfileProvider = (
+  profileId: string,
+  providerId: string,
+): boolean => {
+  const state = codexProfileStates[profileId];
+  if (!state?.route) return false;
+  state.route.currentProviderId = providerId;
+  state.route.updatedAt = Date.now();
+  return true;
+};
+
 export const getProviders = (appType: AppId) =>
   cloneProviders(providers)[appType] ?? {};
 
