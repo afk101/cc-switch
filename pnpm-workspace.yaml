@@ -10,6 +10,8 @@ allowBuilds:
 
 # 允许执行 postinstall 构建脚本的依赖白名单（pnpm >= 10 需要显式声明）
 onlyBuiltDependencies:
-  - '@tailwindcss/oxide'
+  - "@tailwindcss/oxide"
   - esbuild
+
+ignoredBuiltDependencies:
   - msw

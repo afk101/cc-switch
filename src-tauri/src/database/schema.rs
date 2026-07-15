@@ -189,6 +189,7 @@ impl Database {
             pricing_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            input_token_semantics INTEGER NOT NULL DEFAULT 0,
             input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
             cache_read_cost_usd TEXT NOT NULL DEFAULT '0', cache_creation_cost_usd TEXT NOT NULL DEFAULT '0',
             total_cost_usd TEXT NOT NULL DEFAULT '0', latency_ms INTEGER NOT NULL, first_token_ms INTEGER,
@@ -276,6 +277,7 @@ impl Database {
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                input_token_semantics INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd TEXT NOT NULL DEFAULT '0',
                 avg_latency_ms INTEGER NOT NULL DEFAULT 0,
                 profile_id TEXT NOT NULL DEFAULT '',
@@ -299,6 +301,7 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         Self::create_codex_profile_tables(conn)?;
+        Self::create_project_profiles_table(conn)?;
 
         // 尝试添加 live_takeover_active 列到 proxy_config 表
         let _ = conn.execute(
@@ -450,17 +453,17 @@ impl Database {
                         Self::set_user_version(conn, 11)?;
                     }
                     11 => {
-                        log::info!("迁移数据库从 v11 到 v12（Codex 多 Home Profile 持久化）");
+                        log::info!("迁移数据库从 v11 到 v12（补齐两类 Profile 持久化）");
                         Self::migrate_v11_to_v12(conn)?;
                         Self::set_user_version(conn, 12)?;
                     }
                     12 => {
-                        log::info!("迁移数据库从 v12 到 v13（Codex Profile 路由 Live 备份归属）");
+                        log::info!("迁移数据库从 v12 到 v13（补齐 Profile 路由与 token 语义）");
                         Self::migrate_v12_to_v13(conn)?;
                         Self::set_user_version(conn, 13)?;
                     }
                     13 => {
-                        log::info!("迁移数据库从 v13 到 v14（Codex Profile 路由隔离错误）");
+                        log::info!("迁移数据库从 v13 到 v14（汇合分叉的 v13 Schema）");
                         Self::migrate_v13_to_v14(conn)?;
                         Self::set_user_version(conn, 14)?;
                     }
@@ -468,6 +471,11 @@ impl Database {
                         log::info!("迁移数据库从 v14 到 v15（Codex Profile 路由补偿记录）");
                         Self::migrate_v14_to_v15(conn)?;
                         Self::set_user_version(conn, 15)?;
+                    }
+                    15 => {
+                        log::info!("迁移数据库从 v15 到 v16（校准合并后的完整 Schema）");
+                        Self::migrate_v15_to_v16(conn)?;
+                        Self::set_user_version(conn, 16)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -641,6 +649,7 @@ impl Database {
             request_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
             cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+            input_token_semantics INTEGER NOT NULL DEFAULT 0,
             input_cost_usd TEXT NOT NULL DEFAULT '0', output_cost_usd TEXT NOT NULL DEFAULT '0',
             cache_read_cost_usd TEXT NOT NULL DEFAULT '0', cache_creation_cost_usd TEXT NOT NULL DEFAULT '0',
             total_cost_usd TEXT NOT NULL DEFAULT '0', latency_ms INTEGER NOT NULL, first_token_ms INTEGER,
@@ -1295,6 +1304,39 @@ impl Database {
         Ok(())
     }
 
+    /// 创建全应用共享的项目 Profile 表，并修复开发版遗留的全局 current 标记。
+    fn create_project_profiles_table(conn: &Connection) -> Result<(), AppError> {
+        // 19. Profiles 表（全应用共享的项目实体，payload 按 app 分槽快照
+        //     供应商/MCP/Skills/Prompt；各应用分组的 current 标记在 settings 表）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                sort_order INTEGER,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建项目 Profiles 表失败: {e}")))?;
+
+        // 修复跑过未发布开发版的库：current 标记曾是全局 key，现按应用分组
+        // （随 v12 定稿为 current_profile_id_<scope>，不单独 bump 版本）
+        if Self::table_exists(conn, "settings")? {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value)
+                 SELECT 'current_profile_id_claude', value FROM settings
+                 WHERE key = 'current_profile_id'",
+                [],
+            )
+            .map_err(|e| AppError::Database(format!("迁移旧 Profile current 标记失败: {e}")))?;
+            conn.execute("DELETE FROM settings WHERE key = 'current_profile_id'", [])
+                .map_err(|e| AppError::Database(format!("清理旧 Profile current 标记失败: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// 创建 Codex Profile 相关表及其查询索引。
     fn create_codex_profile_tables(conn: &Connection) -> Result<(), AppError> {
         conn.execute_batch(
@@ -1344,8 +1386,26 @@ impl Database {
                 PRIMARY KEY (profile_id, skill_id),
                 FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
                 FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_codex_profile_routes_current_provider
+            );",
+        )
+        .map_err(|e| AppError::Database(format!("创建 Codex Profile 表失败: {e}")))?;
+
+        // 兼容开发阶段曾创建但字段不完整的 Profile 表：先补列，再创建依赖列的索引。
+        Self::add_column_if_missing(
+            conn,
+            "codex_profile_routes",
+            "provider_app_type",
+            "TEXT NOT NULL DEFAULT 'codex' CHECK (provider_app_type = 'codex')",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "codex_profile_failovers",
+            "provider_app_type",
+            "TEXT NOT NULL DEFAULT 'codex' CHECK (provider_app_type = 'codex')",
+        )?;
+
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_codex_profile_routes_current_provider
                 ON codex_profile_routes(current_provider_id, provider_app_type);
             CREATE INDEX IF NOT EXISTS idx_codex_profile_routes_enabled
                 ON codex_profile_routes(enabled);
@@ -1358,7 +1418,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_codex_profile_skills_reverse
                 ON codex_profile_skills(skill_id);",
         )
-        .map_err(|e| AppError::Database(format!("创建 Codex Profile 表失败: {e}")))?;
+        .map_err(|e| AppError::Database(format!("创建 Codex Profile 索引失败: {e}")))?;
 
         Self::create_profile_usage_index_if_supported(
             conn,
@@ -1408,8 +1468,29 @@ impl Database {
         Ok(())
     }
 
-    /// v11 -> v12：增加 Codex 多 Home Profile 持久化结构和 Profile 用量归属。
-    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+    /// 为输入 token 补齐缓存语义列。
+    fn ensure_input_token_semantics(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "proxy_request_logs")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_request_logs",
+                "input_token_semantics",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        if Self::table_exists(conn, "usage_daily_rollups")? {
+            Self::add_column_if_missing(
+                conn,
+                "usage_daily_rollups",
+                "input_token_semantics",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 为使用量表补齐 Codex Profile 归属，并让聚合主键包含 Profile。
+    fn ensure_codex_profile_usage_schema(conn: &Connection) -> Result<(), AppError> {
         if Self::table_exists(conn, "proxy_request_logs")? {
             Self::add_column_if_missing(conn, "proxy_request_logs", "profile_id", "TEXT")?;
         }
@@ -1421,7 +1502,7 @@ impl Database {
             && !Self::has_column(conn, "usage_daily_rollups", "profile_id")?
         {
             conn.execute_batch(
-                "ALTER TABLE usage_daily_rollups RENAME TO usage_daily_rollups_v11;
+                "ALTER TABLE usage_daily_rollups RENAME TO usage_daily_rollups_before_profiles;
                  CREATE TABLE usage_daily_rollups (
                      date TEXT NOT NULL,
                      app_type TEXT NOT NULL,
@@ -1435,6 +1516,7 @@ impl Database {
                      output_tokens INTEGER NOT NULL DEFAULT 0,
                      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                     input_token_semantics INTEGER NOT NULL DEFAULT 0,
                      total_cost_usd TEXT NOT NULL DEFAULT '0',
                      avg_latency_ms INTEGER NOT NULL DEFAULT 0,
                      profile_id TEXT NOT NULL DEFAULT '',
@@ -1443,15 +1525,17 @@ impl Database {
                  INSERT INTO usage_daily_rollups
                      (date, app_type, provider_id, model, request_model, pricing_model,
                       request_count, success_count, input_tokens, output_tokens,
-                      cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, profile_id)
+                      cache_read_tokens, cache_creation_tokens, input_token_semantics,
+                      total_cost_usd, avg_latency_ms, profile_id)
                  SELECT date, app_type, provider_id, model, request_model, pricing_model,
                         request_count, success_count, input_tokens, output_tokens,
-                        cache_read_tokens, cache_creation_tokens, total_cost_usd, avg_latency_ms, ''
-                 FROM usage_daily_rollups_v11;
-                 DROP TABLE usage_daily_rollups_v11;",
+                        cache_read_tokens, cache_creation_tokens, input_token_semantics,
+                        total_cost_usd, avg_latency_ms, ''
+                 FROM usage_daily_rollups_before_profiles;
+                 DROP TABLE usage_daily_rollups_before_profiles;",
             )
             .map_err(|e| {
-                AppError::Database(format!("v11 -> v12 重建 usage_daily_rollups 失败: {e}"))
+                AppError::Database(format!("补齐 Profile 用量归属失败: {e}"))
             })?;
         }
 
@@ -1459,28 +1543,42 @@ impl Database {
         Ok(())
     }
 
-    /// v12 -> v13：将 Codex Live 配置备份改为 Profile 路由私有数据。
-    fn migrate_v12_to_v13(conn: &Connection) -> Result<(), AppError> {
+    /// 汇合曾分别占用 v12/v13 的两条 Schema 演进线，幂等补齐全部结构。
+    fn reconcile_profile_schema_branches(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_input_token_semantics(conn)?;
+        Self::ensure_codex_profile_usage_schema(conn)?;
+        Self::create_project_profiles_table(conn)?;
         if Self::table_exists(conn, "codex_profile_routes")? {
             Self::add_column_if_missing(conn, "codex_profile_routes", "live_backup_json", "TEXT")?;
+            Self::add_column_if_missing(conn, "codex_profile_routes", "last_error", "TEXT")?;
+            Self::add_column_if_missing(conn, "codex_profile_routes", "recovery_json", "TEXT")?;
         }
         Ok(())
+    }
+
+    /// v11 -> v12：增加两类 Profile 持久化结构、用量归属和 token 语义。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        Self::reconcile_profile_schema_branches(conn)
+    }
+
+    /// v12 -> v13：兼容两条曾占用 v12 的迁移线并补齐完整结构。
+    fn migrate_v12_to_v13(conn: &Connection) -> Result<(), AppError> {
+        Self::reconcile_profile_schema_branches(conn)
     }
 
     /// v13 -> v14：为各 Profile 路由保存隔离的启动或恢复错误摘要。
     fn migrate_v13_to_v14(conn: &Connection) -> Result<(), AppError> {
-        if Self::table_exists(conn, "codex_profile_routes")? {
-            Self::add_column_if_missing(conn, "codex_profile_routes", "last_error", "TEXT")?;
-        }
-        Ok(())
+        Self::reconcile_profile_schema_branches(conn)
     }
 
     /// v14 -> v15：为可恢复的 Profile 路由变更保存无敏感补偿记录。
     fn migrate_v14_to_v15(conn: &Connection) -> Result<(), AppError> {
-        if Self::table_exists(conn, "codex_profile_routes")? {
-            Self::add_column_if_missing(conn, "codex_profile_routes", "recovery_json", "TEXT")?;
-        }
-        Ok(())
+        Self::reconcile_profile_schema_branches(conn)
+    }
+
+    /// v15 -> v16：最终校准两条历史迁移线，确保任一路径升级结果一致。
+    fn migrate_v15_to_v16(conn: &Connection) -> Result<(), AppError> {
+        Self::reconcile_profile_schema_branches(conn)
     }
 
     /// 插入默认模型定价数据
@@ -1616,6 +1714,25 @@ impl Database {
                 "0.30",
                 "3.75",
             ),
+            // GPT-5.6 系列（Sol / Terra / Luna，2026-06 发布）
+            // 5.6 家族起 cache write 收 1.25× 输入价（此前 GPT 模型写缓存免费，勿回填旧系列）
+            ("gpt-5.6-sol", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            (
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                "2.50",
+                "15",
+                "0.25",
+                "3.125",
+            ),
+            ("gpt-5.6-luna", "GPT-5.6 Luna", "1", "6", "0.10", "1.25"),
+            // 裸名 gpt-5.6 是 sol 的官方别名；effort 后缀对齐 gpt-5.5 系列的记账形态
+            ("gpt-5.6", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            ("gpt-5.6-low", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            ("gpt-5.6-medium", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            ("gpt-5.6-high", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            ("gpt-5.6-xhigh", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
+            ("gpt-5.6-minimal", "GPT-5.6 Sol", "5", "30", "0.50", "6.25"),
             // GPT-5.5 系列
             ("gpt-5.5", "GPT-5.5", "5", "30", "0.50", "0"),
             ("gpt-5.5-low", "GPT-5.5", "5", "30", "0.50", "0"),
@@ -2053,6 +2170,9 @@ impl Database {
                 "0.19",
                 "0",
             ),
+            // 腾讯混元 (Tencent Hunyuan)（官方 CNY 1/4/0.25 按 1 USD ≈ 7.14 折算；Hy3 阶梯计价取最低档）
+            ("hunyuan-hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
+            ("hy3", "Hunyuan Hy3", "0.14", "0.56", "0.035", "0"),
             // MiniMax 系列
             ("minimax-m2.1", "MiniMax M2.1", "0.27", "0.95", "0.03", "0"),
             (
@@ -2348,6 +2468,44 @@ impl Database {
 
     fn repair_current_model_pricing(conn: &Connection) -> Result<(), AppError> {
         let pricing_fixes = [
+            // 2026-07-12 GPT-5.6 家族 cache write=1.25× 输入价（OpenAI 5.6 起的新规），
+            // 修正早期 seed 的 0 值；只匹配未被用户改过的行
+            (
+                "gpt-5.6-sol",
+                "GPT-5.6 Sol",
+                "5",
+                "30",
+                "0.50",
+                "6.25",
+                "5",
+                "30",
+                "0.50",
+                "0",
+            ),
+            (
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                "2.50",
+                "15",
+                "0.25",
+                "3.125",
+                "2.50",
+                "15",
+                "0.25",
+                "0",
+            ),
+            (
+                "gpt-5.6-luna",
+                "GPT-5.6 Luna",
+                "1",
+                "6",
+                "0.10",
+                "1.25",
+                "1",
+                "6",
+                "0.10",
+                "0",
+            ),
             // 2026-06-10 全量核价（厂商官方 list 价；CNY 按 ~7.14 折算）
             // GLM 4.6/4.7：旧值是中转/OpenRouter 折扣价，统一到 Z.ai 官方（与 glm-5/5.1 一致）
             (
@@ -2813,5 +2971,43 @@ impl Database {
             .map_err(|e| AppError::Database(format!("为表 {table} 添加列 {column} 失败: {e}")))?;
         log::info!("已为表 {table} 添加缺失列 {column}");
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_input_token_semantics_adds_columns() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute(
+            "CREATE TABLE proxy_request_logs (request_id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE usage_daily_rollups (date TEXT PRIMARY KEY)",
+            [],
+        )?;
+        Database::ensure_input_token_semantics(&conn)?;
+        assert!(Database::has_column(
+            &conn,
+            "proxy_request_logs",
+            "input_token_semantics"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "usage_daily_rollups",
+            "input_token_semantics"
+        )?);
+        let log_default: i64 = conn.query_row(
+            "SELECT dflt_value = '0' FROM pragma_table_info('proxy_request_logs')
+             WHERE name = 'input_token_semantics'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(log_default, 1);
+
+        Ok(())
     }
 }
