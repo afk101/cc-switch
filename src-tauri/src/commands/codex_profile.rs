@@ -91,19 +91,19 @@ pub async fn update_codex_profile(
     #[allow(non_snake_case)] homePath: String,
     #[allow(non_snake_case)] listenPort: u16,
 ) -> Result<CodexProfile, String> {
-    let runtime_status = state
+    let repository = profile_repository(&state);
+    state
         .codex_route_manager
-        .status(&profileId)
+        .with_profile_metadata_lock(&profileId, |runtime_status| {
+            repository.update_profile(
+                &profileId,
+                &name,
+                Path::new(&homePath),
+                listenPort,
+                runtime_status,
+            )
+        })
         .await
-        .unwrap_or(CodexRuntimeStatus::Stopped);
-    profile_repository(&state)
-        .update_profile(
-            &profileId,
-            &name,
-            Path::new(&homePath),
-            listenPort,
-            runtime_status,
-        )
         .map_err(|error| error.to_string())
 }
 
@@ -114,13 +114,13 @@ pub async fn rebind_codex_profile(
     #[allow(non_snake_case)] profileId: String,
     #[allow(non_snake_case)] homePath: String,
 ) -> Result<CodexProfile, String> {
-    let runtime_status = state
+    let repository = profile_repository(&state);
+    state
         .codex_route_manager
-        .status(&profileId)
+        .with_profile_metadata_lock(&profileId, |runtime_status| {
+            repository.rebind_profile(&profileId, Path::new(&homePath), runtime_status)
+        })
         .await
-        .unwrap_or(CodexRuntimeStatus::Stopped);
-    profile_repository(&state)
-        .rebind_profile(&profileId, Path::new(&homePath), runtime_status)
         .map_err(|error| error.to_string())
 }
 
@@ -131,15 +131,17 @@ pub async fn update_codex_profile_port(
     #[allow(non_snake_case)] profileId: String,
     #[allow(non_snake_case)] listenPort: u16,
 ) -> Result<bool, String> {
-    let runtime_status = state
+    state
         .codex_route_manager
-        .status(&profileId)
+        .with_profile_metadata_lock(&profileId, |runtime_status| {
+            if runtime_status.is_active() {
+                return Err(AppError::InvalidInput(
+                    "运行中的 Codex Profile 不可修改监听端口".to_string(),
+                ));
+            }
+            update_codex_profile_port_internal(&state.db, &profileId, listenPort)
+        })
         .await
-        .unwrap_or(CodexRuntimeStatus::Stopped);
-    if runtime_status.is_active() {
-        return Err("运行中的 Codex Profile 不可修改监听端口".to_string());
-    }
-    update_codex_profile_port_internal(&state.db, &profileId, listenPort)
         .map(|_| true)
         .map_err(|error| error.to_string())
 }
@@ -188,14 +190,23 @@ pub async fn enable_codex_profile_route(
     state: State<'_, AppState>,
     #[allow(non_snake_case)] profileId: String,
     #[allow(non_snake_case)] providerId: String,
-    #[allow(non_snake_case)] failoverIds: Vec<String>,
+    #[allow(non_snake_case)] failoverIds: Option<Vec<String>>,
 ) -> Result<bool, String> {
-    state
-        .codex_route_manager
-        .enable(&profileId, &providerId, failoverIds)
-        .await
-        .map(|_| true)
-        .map_err(|error| error.to_string())
+    let result = match failoverIds {
+        Some(failover_ids) => {
+            state
+                .codex_route_manager
+                .enable(&profileId, &providerId, failover_ids)
+                .await
+        }
+        None => {
+            state
+                .codex_route_manager
+                .enable_preserving_failovers(&profileId, &providerId)
+                .await
+        }
+    };
+    result.map(|_| true).map_err(|error| error.to_string())
 }
 
 /// 为指定运行中 Profile 切换供应商快照。
@@ -204,7 +215,7 @@ pub async fn switch_codex_profile_provider(
     state: State<'_, AppState>,
     #[allow(non_snake_case)] profileId: String,
     #[allow(non_snake_case)] providerId: String,
-    #[allow(non_snake_case)] failoverIds: Vec<String>,
+    #[allow(non_snake_case)] failoverIds: Option<Vec<String>>,
 ) -> Result<bool, String> {
     let mut provider = state
         .db
@@ -218,12 +229,21 @@ pub async fn switch_codex_profile_provider(
             &provider,
         )
         .map_err(|error| error.to_string())?;
-    state
-        .codex_route_manager
-        .switch_provider_with_effective_settings(&profileId, provider, failoverIds)
-        .await
-        .map(|_| true)
-        .map_err(|error| error.to_string())
+    let result = match failoverIds {
+        Some(failover_ids) => {
+            state
+                .codex_route_manager
+                .switch_provider_with_effective_settings(&profileId, provider, failover_ids)
+                .await
+        }
+        None => {
+            state
+                .codex_route_manager
+                .switch_provider_with_effective_settings_preserving_failovers(&profileId, provider)
+                .await
+        }
+    };
+    result.map(|_| true).map_err(|error| error.to_string())
 }
 
 /// 关闭指定 Profile 路由并恢复其 Home 配置。

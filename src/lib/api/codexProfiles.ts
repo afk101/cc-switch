@@ -41,23 +41,23 @@ export const codexProfilesApi = {
   enableRoute: (
     profileId: string,
     providerId: string,
-    failoverIds: string[],
+    failoverIds?: string[],
   ): Promise<boolean> =>
     invoke("enable_codex_profile_route", {
       profileId,
       providerId,
-      failoverIds,
+      ...(failoverIds === undefined ? {} : { failoverIds }),
     }),
   /** 切换指定 Profile 的供应商。 */
   switchProvider: (
     profileId: string,
     providerId: string,
-    failoverIds: string[],
+    failoverIds?: string[],
   ): Promise<boolean> =>
     invoke("switch_codex_profile_provider", {
       profileId,
       providerId,
-      failoverIds,
+      ...(failoverIds === undefined ? {} : { failoverIds }),
     }),
   /** 关闭指定 Profile 的路由。 */
   disableRoute: (profileId: string): Promise<boolean> =>

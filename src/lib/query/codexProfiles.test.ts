@@ -120,7 +120,7 @@ describe("Codex Profile mutations", () => {
       });
     });
 
-    expect(enableRoute).toHaveBeenCalledWith("profile-a", "provider-a", []);
+    expect(enableRoute).toHaveBeenCalledWith("profile-a", "provider-a");
     expect(disableRoute).not.toHaveBeenCalled();
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: codexProfileKeys.state("profile-a"),

@@ -162,16 +162,39 @@ impl CodexRouteManager {
         provider_id: &str,
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
+        self.enable_internal(profile_id, provider_id, Some(failover_ids))
+            .await
+    }
+
+    /// 启用 Profile 路由并保留已经持久化的故障转移策略。
+    pub async fn enable_preserving_failovers(
+        &self,
+        profile_id: &str,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        self.enable_internal(profile_id, provider_id, None).await
+    }
+
+    /// 在 Profile 锁内解析故障转移策略并执行启用流程。
+    async fn enable_internal(
+        &self,
+        profile_id: &str,
+        provider_id: &str,
+        requested_failover_ids: Option<Vec<String>>,
+    ) -> Result<(), AppError> {
         if provider_id.is_empty() {
             return Err(AppError::InvalidInput("Codex 供应商不能为空".to_string()));
         }
         self.validate_route_operation_before_lock(profile_id)?;
-        let _ = self.provider_snapshot(provider_id, &failover_ids)?;
+        if let Some(failover_ids) = requested_failover_ids.as_deref() {
+            let _ = self.provider_snapshot(provider_id, failover_ids)?;
+        }
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         let profile = self.persistence.get_profile(profile_id)?;
         profile.validate_route_operation()?;
         self.recover_pending_locked(profile_id).await?;
+        let failover_ids = self.resolve_failover_ids(profile_id, requested_failover_ids)?;
         let previous = self
             .persistence
             .get_route(profile_id)?
@@ -319,7 +342,17 @@ impl CodexRouteManager {
         provider_id: &str,
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
-        self.switch_provider_internal(profile_id, provider_id, failover_ids, None)
+        self.switch_provider_internal(profile_id, provider_id, Some(failover_ids), None)
+            .await
+    }
+
+    /// 切换供应商但保留 Profile 已持久化的故障转移策略。
+    pub async fn switch_provider_preserving_failovers(
+        &self,
+        profile_id: &str,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        self.switch_provider_internal(profile_id, provider_id, None, None)
             .await
     }
 
@@ -331,7 +364,18 @@ impl CodexRouteManager {
         failover_ids: Vec<String>,
     ) -> Result<(), AppError> {
         let provider_id = provider.id.clone();
-        self.switch_provider_internal(profile_id, &provider_id, failover_ids, Some(provider))
+        self.switch_provider_internal(profile_id, &provider_id, Some(failover_ids), Some(provider))
+            .await
+    }
+
+    /// 使用已合并公共配置的供应商设置切换目标，同时保留现有故障转移策略。
+    pub async fn switch_provider_with_effective_settings_preserving_failovers(
+        &self,
+        profile_id: &str,
+        provider: Provider,
+    ) -> Result<(), AppError> {
+        let provider_id = provider.id.clone();
+        self.switch_provider_internal(profile_id, &provider_id, None, Some(provider))
             .await
     }
 
@@ -340,14 +384,16 @@ impl CodexRouteManager {
         &self,
         profile_id: &str,
         provider_id: &str,
-        failover_ids: Vec<String>,
+        requested_failover_ids: Option<Vec<String>>,
         effective_provider: Option<Provider>,
     ) -> Result<(), AppError> {
         if provider_id.is_empty() {
             return Err(AppError::InvalidInput("Codex 供应商不能为空".to_string()));
         }
         self.validate_route_operation_before_lock(profile_id)?;
-        let _ = self.provider_snapshot(provider_id, &failover_ids)?;
+        if let Some(failover_ids) = requested_failover_ids.as_deref() {
+            let _ = self.provider_snapshot(provider_id, failover_ids)?;
+        }
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         let profile = self.persistence.get_profile(profile_id)?;
@@ -364,6 +410,7 @@ impl CodexRouteManager {
                 "已完成上一次 Codex Profile 路由恢复，请重试供应商切换".to_string(),
             ));
         }
+        let failover_ids = self.resolve_failover_ids(profile_id, requested_failover_ids)?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let route = self
             .persistence
@@ -870,6 +917,45 @@ impl CodexRouteManager {
         Ok(self.runtime(profile_id)?.status().await)
     }
 
+    /// 在同一把 Profile 生命周期锁内读取权威状态并执行元数据修改。
+    pub async fn with_profile_metadata_lock<T, F>(
+        &self,
+        profile_id: &str,
+        mutation: F,
+    ) -> Result<T, AppError>
+    where
+        F: FnOnce(CodexRuntimeStatus) -> Result<T, AppError>,
+    {
+        let lock = self.profile_lock(profile_id)?;
+        let _guard = lock.lock().await;
+        let _ = self.persistence.get_profile(profile_id)?;
+        self.recover_pending_locked(profile_id).await?;
+        let route_enabled = self
+            .persistence
+            .get_route(profile_id)?
+            .is_some_and(|route| route.enabled);
+        let runtime_status = self.runtime_status_or_stopped(profile_id).await?;
+        let effective_status = if route_enabled && !runtime_status.is_active() {
+            CodexRuntimeStatus::Running
+        } else {
+            runtime_status
+        };
+
+        mutation(effective_status)
+    }
+
+    /// 未显式提交新策略时读取 Profile 当前故障转移列表。
+    fn resolve_failover_ids(
+        &self,
+        profile_id: &str,
+        requested_failover_ids: Option<Vec<String>>,
+    ) -> Result<Vec<String>, AppError> {
+        match requested_failover_ids {
+            Some(failover_ids) => Ok(failover_ids),
+            None => self.persistence.list_failovers(profile_id),
+        }
+    }
+
     fn provider_snapshot(
         &self,
         provider_id: &str,
@@ -888,6 +974,23 @@ impl CodexRouteManager {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CodexRouteProviderSnapshot::new(primary, failovers))
+    }
+
+    /// 读取已托管 runtime 的状态；没有 runtime 时返回关闭态，不吞掉锁错误。
+    async fn runtime_status_or_stopped(
+        &self,
+        profile_id: &str,
+    ) -> Result<CodexRuntimeStatus, AppError> {
+        let runtime = self
+            .runtimes
+            .lock()
+            .map_err(|error| AppError::Lock(error.to_string()))?
+            .get(profile_id)
+            .cloned();
+        match runtime {
+            Some(runtime) => Ok(runtime.status().await),
+            None => Ok(CodexRuntimeStatus::Stopped),
+        }
     }
 
     fn profile_lock(&self, profile_id: &str) -> Result<Arc<AsyncMutex<()>>, AppError> {
@@ -1797,6 +1900,15 @@ mod codex_route_manager {
         );
         provider.category = Some("official".to_string());
         db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-failover".to_string(),
+                "Provider Failover".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -1814,6 +1926,7 @@ mod codex_route_manager {
             recovery_json: None,
             updated_at: 1,
         })?;
+        db.replace_codex_profile_failovers("profile-a", &["provider-failover".to_string()])?;
         let token_store = Arc::new(TrackingTokenStore {
             ensured: AtomicUsize::new(0),
             deleted: AtomicUsize::new(0),
@@ -1826,13 +1939,17 @@ mod codex_route_manager {
         );
 
         manager
-            .switch_provider("profile-a", "official", vec![])
+            .switch_provider_with_effective_settings_preserving_failovers("profile-a", provider)
             .await?;
 
         let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
         assert!(!route.enabled);
         assert_eq!(route.current_provider_id.as_deref(), Some("official"));
         assert!(route.live_backup_json.is_none());
+        assert_eq!(
+            db.list_codex_profile_failovers("profile-a")?,
+            vec!["provider-failover".to_string()]
+        );
         assert_eq!(token_store.ensured.load(Ordering::SeqCst), 0);
         assert!(manager.runtimes.lock().expect("运行时锁").is_empty());
         let config =
@@ -1840,6 +1957,56 @@ mod codex_route_manager {
                 .expect("读取直连配置");
         assert!(config.contains("gpt-official"));
         assert!(!config.contains("127.0.0.1:"));
+        Ok(())
+    }
+
+    /// 即使 runtime 尚未恢复，持久化启用态也必须阻止 Profile 元数据修改。
+    #[tokio::test]
+    async fn profile_metadata_lock_treats_enabled_route_as_active_without_runtime(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: "/tmp/profile-a".to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: true,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db,
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let mutation_executed = AtomicBool::new(false);
+
+        let result = manager
+            .with_profile_metadata_lock("profile-a", |runtime_status| {
+                if runtime_status.is_active() {
+                    return Err(AppError::InvalidInput(
+                        "运行中的 Codex Profile 不可修改绑定".to_string(),
+                    ));
+                }
+                mutation_executed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(!mutation_executed.load(Ordering::SeqCst));
         Ok(())
     }
 
@@ -2046,6 +2213,15 @@ experimental_bearer_token = "PROXY_MANAGED"
                 None,
             ),
         )?;
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-failover".to_string(),
+                "Provider Failover".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -2054,6 +2230,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             created_at: 1,
             updated_at: 1,
         })?;
+        db.replace_codex_profile_failovers("profile-a", &["provider-failover".to_string()])?;
         let manager = CodexRouteManager::new(
             db.clone(),
             Arc::new(CodexHomeConfigService::system()),
@@ -2064,13 +2241,19 @@ experimental_bearer_token = "PROXY_MANAGED"
             Arc::new(FakeFactory),
         );
 
-        manager.enable("profile-a", "provider-a", vec![]).await?;
+        manager
+            .enable_preserving_failovers("profile-a", "provider-a")
+            .await?;
 
         let routed_config =
             fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取路由配置");
         assert_eq!(
             extract_codex_experimental_bearer_token(&routed_config).as_deref(),
             Some("test-local-token")
+        );
+        assert_eq!(
+            db.list_codex_profile_failovers("profile-a")?,
+            vec!["provider-failover".to_string()]
         );
 
         manager.disable("profile-a").await?;

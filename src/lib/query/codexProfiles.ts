@@ -40,7 +40,7 @@ function setCodexProfileRouteEnabled({
   if (!providerId) {
     return Promise.reject(new Error("当前 CODEX_HOME 未选择可路由供应商"));
   }
-  return codexProfilesApi.enableRoute(profileId, providerId, []);
+  return codexProfilesApi.enableRoute(profileId, providerId);
 }
 
 /** 获取全部 Codex Profile。 */

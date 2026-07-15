@@ -411,7 +411,7 @@ function App() {
       );
     }
     void codexProfilesApi
-      .switchProvider(selectedCodexProfileId, provider.id, [])
+      .switchProvider(selectedCodexProfileId, provider.id)
       .then(() => {
         void refetchCodexProfileState();
       })
