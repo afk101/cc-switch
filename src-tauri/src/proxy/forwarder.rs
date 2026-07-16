@@ -150,14 +150,25 @@ pub struct RequestForwarder {
     body_dumper: Option<Arc<BodyDumper>>,
 }
 
+fn adapter_supports_silent_media_fallback(adapter_name: &str) -> bool {
+    adapter_name == "Claude"
+}
+
 impl RequestForwarder {
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；其中"启发式模型名单预测"
     /// 再受 `request_media_heuristic` 单独管辖（显式声明 text-only 始终生效）。
     /// 返回被替换的图片块数量（0 = 未触发或开关关闭）。
-    fn apply_media_prevention(&self, body: &mut Value, provider: &Provider) -> usize {
-        if !(self.rectifier_config.enabled && self.rectifier_config.request_media_fallback) {
+    fn apply_media_prevention(
+        &self,
+        adapter_name: &str,
+        body: &mut Value,
+        provider: &Provider,
+    ) -> usize {
+        if !adapter_supports_silent_media_fallback(adapter_name)
+            || !(self.rectifier_config.enabled && self.rectifier_config.request_media_fallback)
+        {
             return 0;
         }
         let replaced_images = super::media_sanitizer::replace_images_for_text_only_model(
@@ -188,7 +199,7 @@ impl RequestForwarder {
         provider_body: &Value,
         error: &ProxyError,
     ) -> bool {
-        matches!(adapter_name, "Claude" | "Codex")
+        adapter_supports_silent_media_fallback(adapter_name)
             && self.rectifier_config.enabled
             && self.rectifier_config.request_media_fallback
             && !already_retried
@@ -1333,7 +1344,7 @@ impl RequestForwarder {
                     provider,
                     api_format,
                 );
-                self.apply_media_prevention(&mut mapped_body, provider);
+                self.apply_media_prevention(adapter.name(), &mut mapped_body, provider);
             }
         }
         let needs_transform = match resolved_claude_api_format.as_deref() {
@@ -1517,7 +1528,7 @@ impl RequestForwarder {
         };
 
         if matches!(app_type, AppType::Codex) {
-            self.apply_media_prevention(&mut request_body, provider);
+            self.apply_media_prevention(adapter.name(), &mut request_body, provider);
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
@@ -4641,10 +4652,22 @@ mod tests {
         let provider = provider_with_settings(json!({}));
         let mut body = body_with_image("deepseek-v4-pro");
 
-        let replaced = fwd.apply_media_prevention(&mut body, &provider);
+        let replaced = fwd.apply_media_prevention("Claude", &mut body, &provider);
 
         assert_eq!(replaced, 1, "默认全开 + 名单内模型应预替换");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+    }
+
+    #[test]
+    fn prevention_skips_codex_and_preserves_image_body() {
+        let fwd = forwarder_with_rectifier(RectifierConfig::default());
+        let provider = provider_with_settings(json!({}));
+        let mut body = body_with_codex_input_image("360-glm-5.2");
+
+        let replaced = fwd.apply_media_prevention("Codex", &mut body, &provider);
+
+        assert_eq!(replaced, 0, "Codex 请求不应静默替换图片");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
     }
 
     #[test]
@@ -4657,7 +4680,7 @@ mod tests {
         let provider = provider_with_settings(json!({}));
         let mut body = body_with_image("deepseek-v4-pro");
 
-        let replaced = fwd.apply_media_prevention(&mut body, &provider);
+        let replaced = fwd.apply_media_prevention("Claude", &mut body, &provider);
 
         assert_eq!(replaced, 0);
         assert_eq!(body["messages"][0]["content"][0]["type"], "image");
@@ -4672,7 +4695,10 @@ mod tests {
         let provider = provider_with_settings(json!({}));
         let mut body = body_with_image("deepseek-v4-pro");
 
-        assert_eq!(fwd.apply_media_prevention(&mut body, &provider), 0);
+        assert_eq!(
+            fwd.apply_media_prevention("Claude", &mut body, &provider),
+            0
+        );
         assert_eq!(body["messages"][0]["content"][0]["type"], "image");
     }
 
@@ -4688,7 +4714,7 @@ mod tests {
         let bare_provider = provider_with_settings(json!({}));
         let mut list_body = body_with_image("deepseek-v4-pro");
         assert_eq!(
-            fwd.apply_media_prevention(&mut list_body, &bare_provider),
+            fwd.apply_media_prevention("Claude", &mut list_body, &bare_provider),
             0,
             "heuristic 关闭后名单模型不应被预替换"
         );
@@ -4700,7 +4726,7 @@ mod tests {
         }));
         let mut declared_body = body_with_image("some-text-model");
         assert_eq!(
-            fwd.apply_media_prevention(&mut declared_body, &declared_provider),
+            fwd.apply_media_prevention("Claude", &mut declared_body, &declared_provider),
             1,
             "显式 text-only 即使关闭 heuristic 也应预替换"
         );
@@ -4715,7 +4741,7 @@ mod tests {
     }
 
     #[test]
-    fn reactive_triggers_for_codex_image_url_deserialize_errors() {
+    fn reactive_skips_codex_image_url_deserialize_errors() {
         let fwd = forwarder_with_rectifier(RectifierConfig::default());
         let body = body_with_codex_input_image("deepseek-v4-flash");
         let error = ProxyError::UpstreamError {
@@ -4726,7 +4752,7 @@ mod tests {
             ),
         };
 
-        assert!(fwd.media_retry_should_trigger("Codex", false, &body, &error));
+        assert!(!fwd.media_retry_should_trigger("Codex", false, &body, &error));
     }
 
     #[test]

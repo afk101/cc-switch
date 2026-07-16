@@ -1,5 +1,7 @@
 use serde_json::Value;
 
+mod constants;
+
 /// Image-input capability shared by Codex catalog generation and proxy request
 /// rectification.
 ///
@@ -68,6 +70,7 @@ pub(crate) fn image_input_capability_from_modalities(
 pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
     let normalized = normalize_model_id(model);
     let tail = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let tail = strip_known_route_model_prefix(tail);
 
     const CONFIRMED_TAILS: &[&str] = &[
         "ark-code-latest",
@@ -102,6 +105,13 @@ pub(crate) fn is_confirmed_text_only_model(model: &str) -> bool {
     ];
 
     CONFIRMED_TAILS.contains(&tail)
+}
+
+fn strip_known_route_model_prefix(model: &str) -> &str {
+    constants::KNOWN_ROUTE_MODEL_PREFIXES
+        .iter()
+        .find_map(|prefix| model.strip_prefix(prefix))
+        .unwrap_or(model)
 }
 
 fn declared_model_image_support(settings: &Value, model: &str) -> Option<bool> {
@@ -224,6 +234,14 @@ mod tests {
         assert!(is_confirmed_text_only_model("MiniMax-M2.7-Highspeed"));
         assert!(is_confirmed_text_only_model("step-3.5-flash-2603"));
         assert!(!is_confirmed_text_only_model("glm-5.2v"));
+    }
+
+    #[test]
+    fn confirmed_text_only_registry_accepts_known_360_route_aliases() {
+        assert!(is_confirmed_text_only_model("360-glm-5.2"));
+        assert!(is_confirmed_text_only_model("360-deepseek-v4-flash"));
+        assert!(!is_confirmed_text_only_model("360-glm-5.2v"));
+        assert!(!is_confirmed_text_only_model("other-glm-5.2"));
     }
 
     #[test]

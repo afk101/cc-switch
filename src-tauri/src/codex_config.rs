@@ -2894,6 +2894,30 @@ base_url = "https://production.api/v1"
                 base_instructions: None,
             },
             CodexCatalogModelSpec {
+                model: "360-glm-5.2".to_string(),
+                display_name: "360 GLM 5.2".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "360-deepseek-v4-flash".to_string(),
+                display_name: "360 DeepSeek V4 Flash".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
+                model: "360-glm-5.2v".to_string(),
+                display_name: "360 GLM 5.2V".to_string(),
+                context_window: 128_000,
+                supports_parallel_tool_calls: None,
+                input_modalities: None,
+                base_instructions: None,
+            },
+            CodexCatalogModelSpec {
                 model: "deepseek/deepseek-v4-pro".to_string(),
                 display_name: "DeepSeek V4 Pro".to_string(),
                 context_window: 128_000,
@@ -2944,6 +2968,9 @@ base_url = "https://production.api/v1"
             };
 
             assert_eq!(modalities("gpt-5.4"), json!(["text", "image"]));
+            assert_eq!(modalities("360-glm-5.2"), json!(["text"]));
+            assert_eq!(modalities("360-deepseek-v4-flash"), json!(["text"]));
+            assert_eq!(modalities("360-glm-5.2v"), json!(["text", "image"]));
             assert_eq!(modalities("deepseek/deepseek-v4-pro"), json!(["text"]));
             assert_eq!(modalities("glm-5.2v"), json!(["text", "image"]));
             assert_eq!(
