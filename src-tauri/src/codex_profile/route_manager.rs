@@ -69,11 +69,15 @@ impl CodexProfileRoutePersistence for Database {
 
 /// manager 所需的本地 token 生命周期最小契约。
 pub trait CodexProfileTokenStore: Send + Sync {
+    fn read_token(&self, profile_id: &str) -> Result<Option<String>, AppError>;
     fn ensure_token(&self, profile_id: &str) -> Result<String, AppError>;
     fn delete_token(&self, profile_id: &str) -> Result<(), AppError>;
 }
 
 impl CodexProfileTokenStore for CodexProfileSecretStore {
+    fn read_token(&self, profile_id: &str) -> Result<Option<String>, AppError> {
+        self.read(profile_id)
+    }
     fn ensure_token(&self, profile_id: &str) -> Result<String, AppError> {
         self.create(profile_id)
     }
@@ -588,6 +592,26 @@ impl CodexRouteManager {
         self.disable_locked(profile_id, &profile, route).await
     }
 
+    /// 使用既有 listener token 收敛关闭中的 Profile Home，不创建新凭证。
+    fn restore_profile_home_for_disable(
+        &self,
+        profile: &CodexProfile,
+        route: &CodexProfileRoute,
+    ) -> Result<(), AppError> {
+        let Some(backup) = route.live_backup_json.as_deref() else {
+            return Ok(());
+        };
+        let listener_token = self.secret_store.read_token(&profile.id)?.ok_or_else(|| {
+            AppError::Config("Codex Profile 本地路由凭证缺失，无法证明 Home 路由所有权".to_string())
+        })?;
+        self.home_config.restore_profile_backup(
+            std::path::Path::new(&profile.canonical_home_path),
+            backup,
+            profile.listen_port,
+            &listener_token,
+        )
+    }
+
     /// 在已持有 Profile 锁时执行可重试的关闭流程。
     async fn disable_locked(
         &self,
@@ -608,19 +632,13 @@ impl CodexRouteManager {
             CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
             None,
         )?;
-        if let Some(backup) = &route.live_backup_json {
-            if let Err(error) = self.home_config.restore_profile_backup(
-                std::path::Path::new(&profile.canonical_home_path),
-                backup,
-                profile.listen_port,
-            ) {
-                self.persist_operation_error(
-                    profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
-                    &error.to_string(),
-                )?;
-                return Err(error);
-            }
+        if let Err(error) = self.restore_profile_home_for_disable(profile, &route) {
+            self.persist_operation_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                &error.to_string(),
+            )?;
+            return Err(error);
         }
         if let Ok(runtime) = self.runtime(profile_id) {
             if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
@@ -1257,20 +1275,14 @@ impl CodexRouteManager {
             return self.persistence.save_route(&recovered);
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
-            if let Some(backup) = route.live_backup_json.as_deref() {
-                let profile = self.persistence.get_profile(profile_id)?;
-                if let Err(error) = self.home_config.restore_profile_backup(
-                    std::path::Path::new(&profile.canonical_home_path),
-                    backup,
-                    profile.listen_port,
-                ) {
-                    self.persist_operation_error(
-                        profile_id,
-                        CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
-                        &error.to_string(),
-                    )?;
-                    return Err(Self::recovery_unconverged_error(error));
-                }
+            let profile = self.persistence.get_profile(profile_id)?;
+            if let Err(error) = self.restore_profile_home_for_disable(&profile, &route) {
+                self.persist_operation_error(
+                    profile_id,
+                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                    &error.to_string(),
+                )?;
+                return Err(Self::recovery_unconverged_error(error));
             }
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
@@ -1791,12 +1803,36 @@ mod codex_route_manager {
     }
 
     impl CodexProfileTokenStore for TrackingTokenStore {
+        fn read_token(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(Some("test-local-token".to_string()))
+        }
+
         fn ensure_token(&self, _: &str) -> Result<String, AppError> {
             self.ensured.fetch_add(1, Ordering::SeqCst);
             Ok("test-local-token".to_string())
         }
         fn delete_token(&self, _: &str) -> Result<(), AppError> {
             self.deleted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// 模拟关闭时读取不到既有凭证，并记录是否错误调用了创建流程。
+    struct MissingReadTokenStore {
+        ensured: AtomicUsize,
+    }
+
+    impl CodexProfileTokenStore for MissingReadTokenStore {
+        fn read_token(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(None)
+        }
+
+        fn ensure_token(&self, _: &str) -> Result<String, AppError> {
+            self.ensured.fetch_add(1, Ordering::SeqCst);
+            Ok("unexpected-new-token".to_string())
+        }
+
+        fn delete_token(&self, _: &str) -> Result<(), AppError> {
             Ok(())
         }
     }
@@ -2261,6 +2297,98 @@ experimental_bearer_token = "PROXY_MANAGED"
             fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取恢复配置"),
             original_config
         );
+        Ok(())
+    }
+
+    /// 关闭时缺少既有 token 必须保留补偿，且不得调用 ensure 创建新凭证。
+    #[tokio::test]
+    async fn disabling_route_with_missing_token_keeps_recovery_without_ensuring(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-missing-token",
+            16_001,
+            "existing-listener-token",
+        )?;
+        let tokens = Arc::new(MissingReadTokenStore {
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            tokens.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .disable("profile-missing-token")
+            .await
+            .expect_err("缺少既有 token 必须拒绝关闭");
+
+        assert!(!error.to_string().contains("existing-listener-token"));
+        let route = db
+            .get_codex_profile_route("profile-missing-token")?
+            .expect("路由存在");
+        assert!(route.enabled);
+        assert!(route.recovery_json.is_some());
+        assert_eq!(tokens.ensured.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// 正常关闭只恢复路由字段，必须保留 Desktop 段与关闭瞬间的模型。
+    #[tokio::test]
+    async fn disabling_route_preserves_desktop_fields_and_latest_model() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-desktop",
+            16_001,
+            "test-local-token",
+        )?;
+        let path = codex_config_path_for_home(home.path());
+        let routed = fs::read_to_string(&path).expect("读取路由配置");
+        fs::write(
+            &path,
+            format!(
+                "model = \"latest-model\"\n{routed}\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.\"computer-use@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\ncommand = \"node_repl\"\n"
+            ),
+        )
+        .expect("模拟 Codex Desktop 写入");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.disable("profile-desktop").await?;
+
+        let restored = fs::read_to_string(path).expect("读取恢复配置");
+        assert!(restored.contains("model = \"latest-model\""));
+        assert!(restored.contains("followUpQueueMode = \"queue\""));
+        assert!(restored.contains("computer-use@openai-bundled"));
+        assert!(restored.contains("mcp_servers.node_repl"));
+        assert!(restored.contains("base_url = \"https://example.com/v1\""));
+        assert!(!restored.contains("http://127.0.0.1:16001/v1"));
+        let route = db
+            .get_codex_profile_route("profile-desktop")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
         Ok(())
     }
 
@@ -2914,6 +3042,10 @@ experimental_bearer_token = "PROXY_MANAGED"
     struct FailingDeleteTokenStore;
 
     impl CodexProfileTokenStore for FailingDeleteTokenStore {
+        fn read_token(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(Some("test-local-token".to_string()))
+        }
+
         fn ensure_token(&self, _: &str) -> Result<String, AppError> {
             Ok("test-local-token".to_string())
         }
