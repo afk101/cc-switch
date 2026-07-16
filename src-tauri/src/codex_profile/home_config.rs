@@ -51,6 +51,26 @@ pub struct CodexDirectProviderConfigPlan {
     model_catalog: Option<CodexAuxiliaryFilePlan>,
 }
 
+/// 单个 Profile Home 的模型目录投影计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexModelCatalogProjectionPlan {
+    home_path: PathBuf,
+    config: Option<CodexRouteConfigPlan>,
+    model_catalog: Option<CodexAuxiliaryFilePlan>,
+}
+
+impl CodexModelCatalogProjectionPlan {
+    /// 返回本次投影是否需要修改 Home 配置。
+    pub fn config_changed(&self) -> bool {
+        self.config.is_some()
+    }
+
+    /// 返回计划所属的显式 Home，不暴露文件正文。
+    pub fn home_path(&self) -> &Path {
+        &self.home_path
+    }
+}
+
 impl CodexRouteConfigPlan {
     /// 返回计划写入后的目标指纹，不暴露目标配置正文。
     pub fn target_fingerprint(&self) -> &str {
@@ -196,8 +216,18 @@ impl CodexHomeConfigService {
         home: &Path,
         route_config: &str,
     ) -> Result<CodexRouteConfigPlan, AppError> {
-        crate::codex_config::validate_config_toml(route_config)?;
         let previous = self.inspect(home)?;
+        self.build_route_plan_from_snapshot(home, previous, route_config)
+    }
+
+    /// 使用同一次 Home 快照构造配置计划，避免准备阶段重复读取覆盖外部变更。
+    fn build_route_plan_from_snapshot(
+        &self,
+        home: &Path,
+        previous: CodexLiveConfigSnapshot,
+        route_config: &str,
+    ) -> Result<CodexRouteConfigPlan, AppError> {
+        crate::codex_config::validate_config_toml(route_config)?;
         let target_content = route_config.as_bytes().to_vec();
         Ok(CodexRouteConfigPlan {
             home_path: home.to_path_buf(),
@@ -206,6 +236,114 @@ impl CodexHomeConfigService {
             previous,
             model_changes: Vec::new(),
         })
+    }
+
+    /// 构造目标 Home 的模型目录投影计划，不在准备阶段写入文件。
+    pub fn build_model_catalog_projection_plan(
+        &self,
+        home: &Path,
+        provider: &Provider,
+    ) -> Result<CodexModelCatalogProjectionPlan, AppError> {
+        let mut settings = provider.settings_config.clone();
+        crate::codex_config::apply_codex_unified_session_bucket_to_settings(
+            provider.category.as_deref(),
+            &mut settings,
+        )?;
+        let source_config = settings
+            .get("config")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let current = self.inspect(home)?;
+        let home_config = current
+            .content
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
+            .unwrap_or("");
+        let catalog_profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
+        let prepared = crate::codex_config::prepare_codex_model_catalog_projection(
+            &settings,
+            source_config,
+            home_config,
+            catalog_profile,
+        )?;
+        let config = if current.content.as_deref() == Some(prepared.config_text.as_bytes()) {
+            None
+        } else {
+            Some(self.build_route_plan_from_snapshot(home, current, &prepared.config_text)?)
+        };
+        let model_catalog = self.build_model_catalog_file_plan(home, prepared.model_catalog)?;
+        Ok(CodexModelCatalogProjectionPlan {
+            home_path: home.to_path_buf(),
+            config,
+            model_catalog,
+        })
+    }
+
+    /// 应用单个 Home 的模型目录投影，失败时恢复已写入的目录文件。
+    pub fn apply_model_catalog_projection_plan(
+        &self,
+        plan: &CodexModelCatalogProjectionPlan,
+    ) -> Result<(), AppError> {
+        if let Some(catalog) = &plan.model_catalog {
+            self.apply_auxiliary_plan(catalog)?;
+        }
+        if let Some(config) = &plan.config {
+            if let Err(error) = self.apply_route_plan(config) {
+                let compensation_error = plan
+                    .model_catalog
+                    .as_ref()
+                    .and_then(|catalog| self.restore_auxiliary_plan(catalog).err());
+                return match compensation_error {
+                    Some(compensation) => Err(AppError::Message(format!(
+                        "应用 Codex 模型目录投影失败: {error}；目录补偿失败: {compensation}"
+                    ))),
+                    None => Err(error),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// 反向恢复单个 Home 的模型目录投影，先恢复配置再恢复目录文件。
+    pub fn restore_model_catalog_projection_plan(
+        &self,
+        plan: &CodexModelCatalogProjectionPlan,
+    ) -> Result<(), AppError> {
+        if let Some(config) = &plan.config {
+            self.restore(config)?;
+        }
+        if let Some(catalog) = &plan.model_catalog {
+            self.restore_auxiliary_plan(catalog)?;
+        }
+        Ok(())
+    }
+
+    /// 为可选模型目录内容构造辅助文件计划。
+    fn build_model_catalog_file_plan(
+        &self,
+        home: &Path,
+        model_catalog: Option<serde_json::Value>,
+    ) -> Result<Option<CodexAuxiliaryFilePlan>, AppError> {
+        model_catalog
+            .map(|catalog| {
+                serde_json::to_vec_pretty(&catalog)
+                    .map_err(|source| AppError::JsonSerialize { source })
+            })
+            .transpose()?
+            .map(|target_content| {
+                let path = home.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+                let previous_content = self.file_ops.read(&path)?;
+                Ok::<CodexAuxiliaryFilePlan, AppError>(CodexAuxiliaryFilePlan {
+                    previous_fingerprint: fingerprint_content(previous_content.as_deref()),
+                    target_fingerprint: fingerprint_content(Some(&target_content)),
+                    path,
+                    previous_content,
+                    target_content,
+                })
+            })
+            .transpose()
     }
 
     /// 从当前 Home 配置构造指定 Profile 端口的接管计划。
@@ -263,25 +401,7 @@ impl CodexHomeConfigService {
             catalog_profile,
         )?;
         let config = self.build_route_plan(home, &prepared.config_text)?;
-        let model_catalog = prepared
-            .model_catalog
-            .map(|catalog| {
-                serde_json::to_vec_pretty(&catalog)
-                    .map_err(|source| AppError::JsonSerialize { source })
-            })
-            .transpose()?
-            .map(|target_content| {
-                let path = home.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
-                let previous_content = self.file_ops.read(&path)?;
-                Ok::<CodexAuxiliaryFilePlan, AppError>(CodexAuxiliaryFilePlan {
-                    previous_fingerprint: fingerprint_content(previous_content.as_deref()),
-                    target_fingerprint: fingerprint_content(Some(&target_content)),
-                    path,
-                    previous_content,
-                    target_content,
-                })
-            })
-            .transpose()?;
+        let model_catalog = self.build_model_catalog_file_plan(home, prepared.model_catalog)?;
         Ok(CodexDirectProviderConfigPlan {
             config,
             model_catalog,
@@ -1022,6 +1142,121 @@ mod codex_home_config {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// 构造包含共享模型目录的测试供应商。
+    fn provider_with_catalog(id: &str, model: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            serde_json::json!({
+                "auth": {"OPENAI_API_KEY": "test-token"},
+                "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": {"models": [{"model": model}]}
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+        provider
+    }
+
+    /// 构造不包含模型目录的测试供应商。
+    fn provider_without_catalog(id: &str) -> Provider {
+        Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            serde_json::json!({"config": "model = \"gpt-official\"\n"}),
+            None,
+        )
+    }
+
+    /// 已有 CC Switch 指针时只需更新模型目录文件，不应重写 Home 配置。
+    #[test]
+    fn existing_pointer_updates_only_catalog_file() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original_config =
+            "model_catalog_json = \"cc-switch-model-catalog.json\"\nkeep = true\n";
+        fs::write(&config_path, original_config).expect("写入已有目录指针");
+        let service = CodexHomeConfigService::system();
+        let provider = provider_with_catalog("shared", "new-model");
+
+        let plan = service.build_model_catalog_projection_plan(home.path(), &provider)?;
+
+        assert!(!plan.config_changed());
+        service.apply_model_catalog_projection_plan(&plan)?;
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("重读 Home 配置"),
+            original_config
+        );
+        assert!(
+            fs::read_to_string(home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
+                .expect("读取更新后的模型目录")
+                .contains("new-model")
+        );
+        Ok(())
+    }
+
+    /// 无模型目录供应商只移除 CC Switch 指针，保留旧目录文件供后续复用。
+    #[test]
+    fn provider_without_catalog_keeps_old_catalog_file() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let catalog_path = home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&catalog_path, b"old catalog").expect("写入旧模型目录");
+        fs::write(
+            codex_config_path_for_home(home.path()),
+            "model_catalog_json = \"cc-switch-model-catalog.json\"\nkeep = true\n",
+        )
+        .expect("写入旧目录指针");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_model_catalog_projection_plan(
+            home.path(),
+            &provider_without_catalog("official"),
+        )?;
+        service.apply_model_catalog_projection_plan(&plan)?;
+
+        assert_eq!(
+            fs::read(&catalog_path).expect("读取旧模型目录"),
+            b"old catalog"
+        );
+        let config = fs::read_to_string(codex_config_path_for_home(home.path()))
+            .expect("读取移除指针后的配置");
+        assert!(!config.contains("model_catalog_json"));
+        assert!(config.contains("keep = true"));
+        Ok(())
+    }
+
+    /// 计划构建后的外部配置修改必须被指纹校验拒绝。
+    #[test]
+    fn model_catalog_projection_plan_rejects_external_config_change() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, "keep = true\n").expect("写入初始配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_model_catalog_projection_plan(
+            home.path(),
+            &provider_with_catalog("shared", "new-model"),
+        )?;
+        fs::write(&config_path, "keep = false\n").expect("模拟外部修改");
+
+        let error = service
+            .apply_model_catalog_projection_plan(&plan)
+            .expect_err("外部修改必须拒绝覆盖");
+
+        assert!(matches!(error, AppError::CodexLiveConfigConflict { .. }));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("重读外部配置"),
+            "keep = false\n"
+        );
+        assert!(!home
+            .path()
+            .join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+            .exists());
+        Ok(())
     }
 
     /// Profile 路由配置必须用 listener token 替换旧全局占位符。
