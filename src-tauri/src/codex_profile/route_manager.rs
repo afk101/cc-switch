@@ -8,9 +8,9 @@ use crate::codex_profile::{
     CodexHomeConfigService, CodexHomeReconcileOwnership, CodexModelCatalogProjectionPlan,
     CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
     CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
-    CodexRuntimeStatus, CODEX_CATALOG_SYNC_COMPENSATION_ERROR,
-    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
-    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
+    CODEX_CATALOG_SYNC_COMPENSATION_ERROR, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
+    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -964,6 +964,64 @@ impl CodexRouteManager {
                 &error.to_string(),
             )?;
             return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 启动时逐个对账所有 Profile 的模型目录；单个文件失败不会阻断后续项。
+    pub async fn reconcile_all_profile_catalogs(&self) -> Result<(), AppError> {
+        let _catalog_guard = self.catalog_sync_lock.lock().await;
+        let mut profiles = self.persistence.list_profiles()?;
+        profiles.sort_by(|left, right| left.id.cmp(&right.id));
+
+        for profile in profiles {
+            let profile_lock = self.profile_lock(&profile.id)?;
+            let _profile_guard = profile_lock.lock().await;
+            let Some(mut route) = self.persistence.get_route(&profile.id)? else {
+                continue;
+            };
+            let Some(provider_id) = route.current_provider_id.as_deref() else {
+                continue;
+            };
+
+            let reconcile_result = (|| {
+                let provider = self.persistence.get_provider(provider_id)?.ok_or_else(|| {
+                    AppError::InvalidInput(format!("Codex 供应商不存在: {provider_id}"))
+                })?;
+                let plan = self.home_config.build_model_catalog_projection_plan(
+                    std::path::Path::new(&profile.canonical_home_path),
+                    &provider,
+                )?;
+                self.home_config.apply_model_catalog_projection_plan(&plan)
+            })();
+
+            match reconcile_result {
+                Ok(()) => {
+                    if route.last_error.as_deref().is_some_and(|error| {
+                        error.starts_with(CODEX_CATALOG_RECONCILE_ERROR_PREFIX)
+                    }) {
+                        route.last_error = None;
+                        if let Err(save_error) = self.persistence.save_route(&route) {
+                            log::warn!(
+                                "清理 Codex Profile {} 模型目录错误失败: {}",
+                                profile.id,
+                                save_error
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    route.last_error =
+                        Some(format!("{CODEX_CATALOG_RECONCILE_ERROR_PREFIX}: {error}"));
+                    if let Err(save_error) = self.persistence.save_route(&route) {
+                        log::warn!(
+                            "记录 Codex Profile {} 模型目录错误失败: {}",
+                            profile.id,
+                            save_error
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2194,6 +2252,11 @@ mod codex_route_manager {
         writes: AtomicUsize,
     }
 
+    /// 只拒绝指定模型目录写入，用于验证启动对账隔离单个 Profile。
+    struct FailCatalogWriteOps {
+        fail_path: std::path::PathBuf,
+    }
+
     impl crate::codex_profile::CodexHomeFileOps for CountingHomeFileOps {
         fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
             if path.exists() {
@@ -2207,6 +2270,32 @@ mod codex_route_manager {
 
         fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
+            crate::config::atomic_write(path, content)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for FailCatalogWriteOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            if path == self.fail_path {
+                return Err(AppError::Config("模拟模型目录写入失败".to_string()));
+            }
             crate::config::atomic_write(path, content)
         }
 
@@ -2658,6 +2747,105 @@ mod codex_route_manager {
             fs::read(home_c.path().join(catalog_name)).expect("读取 C 恢复目录"),
             original_c
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_all_profile_catalogs_repairs_healthy_homes_and_isolates_failure(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_a = tempfile::tempdir().expect("创建 A Home");
+        let home_b = tempfile::tempdir().expect("创建 B Home");
+        let home_c = tempfile::tempdir().expect("创建 C Home");
+        let shared = provider_with_route_catalog("provider-shared", "new-shared");
+        let stale_shared = provider_with_route_catalog("provider-shared", "stale-shared");
+        let failing = provider_with_route_catalog("provider-failing", "failing-model");
+        db.save_provider(AppType::Codex.as_str(), &shared)?;
+        db.save_provider(AppType::Codex.as_str(), &failing)?;
+
+        for (profile_id, home, provider_id, last_error, port) in [
+            (
+                "profile-a",
+                home_a.path(),
+                "provider-shared",
+                Some(format!("{CODEX_CATALOG_RECONCILE_ERROR_PREFIX}: 旧错误")),
+                16_001,
+            ),
+            (
+                "profile-b",
+                home_b.path(),
+                "provider-shared",
+                Some("其他生命周期错误".to_string()),
+                16_002,
+            ),
+            ("profile-c", home_c.path(), "provider-failing", None, 16_003),
+        ] {
+            db.insert_codex_profile(&CodexProfile {
+                id: profile_id.to_string(),
+                name: profile_id.to_string(),
+                canonical_home_path: home.display().to_string(),
+                listen_port: port,
+                created_at: 1,
+                updated_at: 1,
+            })?;
+            db.save_codex_profile_route(&CodexProfileRoute {
+                profile_id: profile_id.to_string(),
+                current_provider_id: Some(provider_id.to_string()),
+                enabled: false,
+                live_backup_json: None,
+                last_error,
+                recovery_json: None,
+                updated_at: 1,
+            })?;
+        }
+        let setup_home_config = CodexHomeConfigService::system();
+        let stale_plan =
+            setup_home_config.build_model_catalog_projection_plan(home_b.path(), &stale_shared)?;
+        setup_home_config.apply_model_catalog_projection_plan(&stale_plan)?;
+        let fail_path = home_c
+            .path()
+            .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(Arc::new(FailCatalogWriteOps {
+                fail_path,
+            }))),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.reconcile_all_profile_catalogs().await?;
+
+        let catalog_name = crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
+        let catalog_a = fs::read_to_string(home_a.path().join(catalog_name)).expect("读取 A 目录");
+        let catalog_b = fs::read_to_string(home_b.path().join(catalog_name)).expect("读取 B 目录");
+        assert!(catalog_a.contains("new-shared"));
+        assert!(catalog_b.contains("new-shared"));
+        assert!(!catalog_b.contains("stale-shared"));
+        assert!(db
+            .get_codex_profile_route("profile-a")?
+            .expect("A 路由")
+            .last_error
+            .is_none());
+        assert_eq!(
+            db.get_codex_profile_route("profile-b")?
+                .expect("B 路由")
+                .last_error
+                .as_deref(),
+            Some("其他生命周期错误")
+        );
+        let error_c = db
+            .get_codex_profile_route("profile-c")?
+            .expect("C 路由")
+            .last_error
+            .expect("C 应记录目录错误");
+        assert!(error_c.starts_with(CODEX_CATALOG_RECONCILE_ERROR_PREFIX));
+        assert!(error_c.contains("模拟模型目录写入失败"));
+        assert!(!home_c.path().join(catalog_name).exists());
+        assert!(manager.runtimes.lock()?.is_empty());
         Ok(())
     }
 

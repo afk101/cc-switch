@@ -1175,6 +1175,13 @@ pub fn run() {
                 if codex_ownership_ready {
                     if let Err(error) = state
                         .codex_route_manager
+                        .reconcile_all_profile_catalogs()
+                        .await
+                    {
+                        log::warn!("Codex Profile 模型目录启动对账失败: {error}");
+                    }
+                    if let Err(error) = state
+                        .codex_route_manager
                         .restore_enabled_profiles()
                         .await
                     {
