@@ -594,6 +594,214 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// Profile 恢复只回写路由字段，必须保留 Codex Desktop 新增配置与最新模型。
+    #[test]
+    fn profile_restore_preserves_current_non_route_fields() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        let original = r#"model_provider = "custom"
+model = "before-model"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://upstream.example/v1"
+wire_api = "chat"
+experimental_bearer_token = "upstream-token"
+
+[features]
+hooks = true
+"#;
+        fs::write(&path, original).expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+
+        let routed = fs::read_to_string(&path).expect("读取接管配置");
+        let current = routed.replace("model = \"before-model\"", "model = \"latest-model\"")
+            + r#"
+[desktop]
+followUpQueueMode = "queue"
+
+[plugins."computer-use@openai-bundled"]
+enabled = true
+
+[mcp_servers.node_repl]
+command = "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl"
+"#;
+        fs::write(&path, current).expect("模拟 Codex Desktop 写入");
+
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+
+        let restored = fs::read_to_string(&path).expect("读取恢复配置");
+        let parsed: toml::Value = toml::from_str(&restored).expect("解析恢复配置");
+        assert_eq!(
+            parsed.get("model").and_then(|value| value.as_str()),
+            Some("latest-model")
+        );
+        assert_eq!(
+            crate::codex_config::extract_codex_base_url(&restored).as_deref(),
+            Some("https://upstream.example/v1")
+        );
+        assert!(restored.contains("computer-use@openai-bundled"));
+        assert!(restored.contains("mcp_servers.node_repl"));
+        Ok(())
+    }
+
+    /// 接管前不存在路由字段时，恢复应只删除路由字段且重复调用保持字节不变。
+    #[test]
+    fn profile_restore_removes_absent_route_fields_and_is_idempotent() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        fs::write(&path, "model = \"before\"\n\n[features]\nhooks = true\n")
+            .expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+        let current = fs::read_to_string(&path).expect("读取接管配置")
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n";
+        fs::write(&path, current).expect("模拟 Desktop 写入");
+
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+        let once = fs::read(&path).expect("读取第一次恢复结果");
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+
+        let restored = fs::read_to_string(&path).expect("读取恢复配置");
+        assert_eq!(fs::read(&path).expect("读取幂等恢复结果"), once);
+        assert!(restored.contains("model = \"before\""));
+        assert!(restored.contains("followUpQueueMode = \"queue\""));
+        assert!(!restored.contains("base_url"));
+        assert!(!restored.contains("wire_api"));
+        assert!(!restored.contains("experimental_bearer_token"));
+        Ok(())
+    }
+
+    /// 三个严格字段任一被外部修改时都必须拒绝恢复，token 错误不得泄漏值。
+    #[test]
+    fn profile_restore_rejects_each_managed_field_conflict_without_token_leak(
+    ) -> Result<(), AppError> {
+        let cases = [
+            (
+                "http://127.0.0.1:15722/v1",
+                "https://external.example/v1",
+                false,
+            ),
+            ("wire_api = \"responses\"", "wire_api = \"chat\"", false),
+            (
+                "experimental_bearer_token = \"profile-listener-token\"",
+                "experimental_bearer_token = \"external-token\"",
+                true,
+            ),
+        ];
+
+        for (from, to, token_case) in cases {
+            let home = tempfile::tempdir().expect("创建临时 Home");
+            let path = codex_config_path_for_home(home.path());
+            let original = r#"model_provider = "custom"
+
+[model_providers.custom]
+name = "Custom"
+base_url = "https://upstream.example/v1"
+wire_api = "chat"
+experimental_bearer_token = "upstream-token"
+"#;
+            fs::write(&path, original).expect("写入接管前配置");
+            let service = CodexHomeConfigService::system();
+            let plan = service.build_profile_route_plan(
+                home.path(),
+                15_722,
+                None,
+                "profile-listener-token",
+            )?;
+            let backup = service.serialize_backup(&plan)?;
+            service.apply_route_plan(&plan)?;
+            let changed = fs::read_to_string(&path)
+                .expect("读取接管配置")
+                .replace(from, to);
+            assert!(changed.contains(to), "测试夹具必须成功修改目标字段");
+            fs::write(&path, &changed).expect("写入外部修改");
+
+            let error = service
+                .restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")
+                .expect_err("外部修改必须拒绝恢复");
+            let message = error.to_string();
+            if token_case {
+                assert!(!message.contains("profile-listener-token"));
+                assert!(!message.contains("external-token"));
+            }
+            assert_eq!(fs::read_to_string(&path).expect("重读外部配置"), changed);
+        }
+        Ok(())
+    }
+
+    /// 无 model_provider 时三个路由字段都应在顶层恢复。
+    #[test]
+    fn profile_restore_handles_top_level_route_fields() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        let original = "model = \"before\"\nbase_url = \"https://upstream.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"upstream-token\"\n";
+        fs::write(&path, original).expect("写入顶层配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+
+        assert_eq!(fs::read_to_string(path).expect("读取恢复配置"), original);
+        Ok(())
+    }
+
+    /// 保留 provider 的 base/wire 与顶层 token 必须按各自路径恢复。
+    #[test]
+    fn profile_restore_handles_split_reserved_provider_paths() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        let original = r#"model_provider = "openai"
+experimental_bearer_token = "upstream-token"
+
+[model_providers.openai]
+name = "OpenAI"
+base_url = "https://upstream.example/v1"
+wire_api = "chat"
+
+[model_providers.other]
+base_url = "https://other.example/v1"
+wire_api = "responses"
+"#;
+        fs::write(&path, original).expect("写入分离路径配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+
+        assert_eq!(fs::read_to_string(path).expect("读取恢复配置"), original);
+        Ok(())
+    }
+
     /// 官方供应商直连计划只写目标 Home 配置，不得覆盖该 Home 自己的订阅认证。
     #[test]
     fn direct_official_provider_plan_preserves_profile_auth() -> Result<(), AppError> {
