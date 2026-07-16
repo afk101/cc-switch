@@ -75,3 +75,8 @@ pub const CODEX_ROUTE_RECOVERY_PHASE_RECONCILE_HOME_APPLIED: &str = "reconcile_h
 /// 生命周期补偿尚未收敛时返回给调用方的安全错误前缀。
 pub const CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR: &str =
     "Codex Profile 路由变更失败，补偿未收敛";
+/// 模型目录批量同步补偿未收敛时使用的安全错误前缀。
+pub const CODEX_CATALOG_SYNC_COMPENSATION_ERROR: &str =
+    "Codex Profile 模型目录同步失败，补偿未收敛";
+/// 启动模型目录对账错误的稳定前缀，仅用于识别并清理本类错误。
+pub const CODEX_CATALOG_RECONCILE_ERROR_PREFIX: &str = "Codex Profile 模型目录对账失败";
