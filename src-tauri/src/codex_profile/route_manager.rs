@@ -1837,6 +1837,43 @@ mod codex_route_manager {
         }
     }
 
+    /// 按 Profile 返回不同 token 并记录读取次数，用于验证关闭隔离。
+    struct ProfileTokenMapStore {
+        tokens: HashMap<String, String>,
+        reads: Mutex<HashMap<String, usize>>,
+    }
+
+    impl ProfileTokenMapStore {
+        /// 返回指定 Profile 的累计读取次数。
+        fn read_count(&self, profile_id: &str) -> usize {
+            self.reads
+                .lock()
+                .expect("token 读取计数锁")
+                .get(profile_id)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    impl CodexProfileTokenStore for ProfileTokenMapStore {
+        fn read_token(&self, profile_id: &str) -> Result<Option<String>, AppError> {
+            let mut reads = self.reads.lock()?;
+            *reads.entry(profile_id.to_string()).or_default() += 1;
+            Ok(self.tokens.get(profile_id).cloned())
+        }
+
+        fn ensure_token(&self, profile_id: &str) -> Result<String, AppError> {
+            self.tokens
+                .get(profile_id)
+                .cloned()
+                .ok_or_else(|| AppError::Config("测试 Profile 缺少预置 listener token".to_string()))
+        }
+
+        fn delete_token(&self, _: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
     /// 记录启动对账的 Home 写入次数，同时复用真实原子文件操作。
     struct CountingHomeFileOps {
         writes: AtomicUsize,
@@ -2392,6 +2429,68 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 关闭 A 只能读取和恢复 A 的 Home/token，不得触碰仍启用的 B。
+    #[tokio::test]
+    async fn disabling_route_isolates_other_profile_home_token_and_state() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home_a = tempfile::tempdir().expect("A Home");
+        let home_b = tempfile::tempdir().expect("B Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home_a.path(),
+            "profile-a",
+            16_001,
+            "token-a",
+        )?;
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home_b.path(),
+            "profile-b",
+            16_002,
+            "token-b",
+        )?;
+        let home_b_before =
+            fs::read(codex_config_path_for_home(home_b.path())).expect("读取 B Home");
+        let tokens = Arc::new(ProfileTokenMapStore {
+            tokens: HashMap::from([
+                ("profile-a".to_string(), "token-a".to_string()),
+                ("profile-b".to_string(), "token-b".to_string()),
+            ]),
+            reads: Mutex::new(HashMap::new()),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            tokens.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager.disable("profile-a").await?;
+
+        assert_eq!(tokens.read_count("profile-a"), 1);
+        assert_eq!(tokens.read_count("profile-b"), 0);
+        assert_eq!(
+            fs::read(codex_config_path_for_home(home_b.path())).expect("重读 B Home"),
+            home_b_before
+        );
+        assert!(
+            !db.get_codex_profile_route("profile-a")?
+                .expect("A 路由")
+                .enabled
+        );
+        assert!(
+            db.get_codex_profile_route("profile-b")?
+                .expect("B 路由")
+                .enabled
+        );
+        Ok(())
+    }
+
     /// 已是当前目标的 Home 启动时不得重复写入，只需恢复对应监听器。
     #[tokio::test]
     async fn restoring_enabled_profile_home_skips_write_when_target_is_current(
@@ -2557,6 +2656,76 @@ experimental_bearer_token = "PROXY_MANAGED"
         let route = db
             .get_codex_profile_route("profile-pending-disable")?
             .expect("路由仍存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
+        Ok(())
+    }
+
+    /// pending 关闭遇到 Desktop 新增段时应字段级恢复并自动收敛。
+    #[tokio::test]
+    async fn pending_disable_preserves_codex_desktop_fields() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-pending-desktop",
+            16_001,
+            "test-local-token",
+        )?;
+        let path = codex_config_path_for_home(home.path());
+        let routed = fs::read_to_string(&path).expect("读取接管配置");
+        fs::write(
+            &path,
+            format!(
+                "js_repl = false\nmodel = \"latest-model\"\n{routed}\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.\"computer-use@openai-bundled\"]\nenabled = true\n\n[mcp_servers.node_repl]\ncommand = \"node_repl\"\n"
+            ),
+        )
+        .expect("模拟 Codex Desktop 写入");
+        let mut route = db
+            .get_codex_profile_route("profile-pending-desktop")?
+            .expect("路由存在");
+        let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+        let mut target = before.clone();
+        target.enabled = false;
+        route.recovery_json = Some(
+            serde_json::to_string(&RouteRecoveryRecord {
+                operation: "disable".to_string(),
+                before,
+                target,
+                phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
+                last_error: Some("旧整文件指纹冲突".to_string()),
+                reconcile: None,
+            })
+            .expect("编码关闭恢复记录"),
+        );
+        db.save_codex_profile_route(&route)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        let restored = fs::read_to_string(path).expect("读取恢复配置");
+        assert!(restored.contains("js_repl = false"));
+        assert!(restored.contains("model = \"latest-model\""));
+        assert!(restored.contains("computer-use@openai-bundled"));
+        assert!(restored.contains("mcp_servers.node_repl"));
+        assert!(restored.contains("base_url = \"https://example.com/v1\""));
+        assert!(!restored.contains("http://127.0.0.1:16001/v1"));
+        let route = db
+            .get_codex_profile_route("profile-pending-desktop")?
+            .expect("路由存在");
         assert!(!route.enabled);
         assert!(route.recovery_json.is_none());
         Ok(())
@@ -4630,7 +4799,8 @@ experimental_bearer_token = "PROXY_MANAGED"
         )
         .expect("写入初始配置");
         let home_config = Arc::new(CodexHomeConfigService::system());
-        let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
+        let plan =
+            home_config.build_profile_route_plan(home.path(), 16_001, None, "test-local-token")?;
         home_config.apply_route_plan(&plan)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
@@ -4685,6 +4855,72 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// Home 已恢复但首次停止失败时，下一次补偿应识别 previous 状态并完成关闭。
+    #[tokio::test]
+    async fn pending_disable_retries_after_home_was_already_restored() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-stop-retry",
+            16_001,
+            "test-local-token",
+        )?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(true),
+            drain_waits: AtomicUsize::new(0),
+            drain_result: true,
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(RecoveryRuntimeFactory {
+                runtime: runtime.clone(),
+            }),
+        );
+        manager.track_runtime("profile-stop-retry".to_string(), runtime.clone())?;
+
+        assert!(manager.disable("profile-stop-retry").await.is_err());
+        let first_restored =
+            fs::read(codex_config_path_for_home(home.path())).expect("读取首次恢复后的 Home");
+        let recovery: RouteRecoveryRecord = serde_json::from_str(
+            &db.get_codex_profile_route("profile-stop-retry")?
+                .expect("路由存在")
+                .recovery_json
+                .expect("停止失败补偿记录"),
+        )
+        .expect("解析停止失败补偿记录");
+        assert_eq!(
+            recovery.phase,
+            CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED
+        );
+
+        runtime.stop_fails.store(false, Ordering::SeqCst);
+        manager.recover_pending_locked("profile-stop-retry").await?;
+
+        assert_eq!(
+            fs::read(codex_config_path_for_home(home.path())).expect("重读恢复后的 Home"),
+            first_restored
+        );
+        let route = db
+            .get_codex_profile_route("profile-stop-retry")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
+        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
     /// 关闭时 Home 恢复失败必须进入专用阶段，修复后恢复会重试 Home 并完成排空关闭。
     #[tokio::test]
     async fn disabling_home_restore_failure_retries_home_before_recovery_shutdown(
@@ -4699,7 +4935,8 @@ experimental_bearer_token = "PROXY_MANAGED"
             fail_writes: AtomicBool::new(false),
         });
         let home_config = Arc::new(CodexHomeConfigService::new(file_ops.clone()));
-        let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
+        let plan =
+            home_config.build_profile_route_plan(home.path(), 16_001, None, "test-local-token")?;
         home_config.apply_route_plan(&plan)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
@@ -4772,7 +5009,8 @@ experimental_bearer_token = "PROXY_MANAGED"
         let config_path = codex_config_path_for_home(home.path());
         fs::write(&config_path, "model = \"before\"\n").expect("写入初始配置");
         let home_config = Arc::new(CodexHomeConfigService::system());
-        let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
+        let plan =
+            home_config.build_profile_route_plan(home.path(), 16_001, None, "test-local-token")?;
         home_config.apply_route_plan(&plan)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
