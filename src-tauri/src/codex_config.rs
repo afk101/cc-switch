@@ -974,6 +974,27 @@ fn set_codex_model_catalog_json_field(
     Ok(doc.to_string())
 }
 
+/// 根据供应商配置生成模型目录，并且只投影目标 Home 的目录指针。
+pub fn prepare_codex_model_catalog_projection(
+    settings: &Value,
+    catalog_source_config: &str,
+    home_config: &str,
+    profile: CodexCatalogToolProfile,
+) -> Result<PreparedCodexConfigWithModelCatalog, AppError> {
+    let model_catalog =
+        codex_model_catalog_from_settings(settings, catalog_source_config, profile)?;
+    let config_text = set_codex_model_catalog_json_field(
+        home_config,
+        model_catalog
+            .as_ref()
+            .map(|_| Path::new(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)),
+    )?;
+    Ok(PreparedCodexConfigWithModelCatalog {
+        config_text,
+        model_catalog,
+    })
+}
+
 /// Pure toggle for the top-level `web_search` field that turns Codex's built-in
 /// web-search tool off. When `disable` is true we write `web_search = "disabled"`
 /// (the catalog's `supports_search_tool` does NOT gate this — the request-time
@@ -3018,6 +3039,99 @@ name = "any"
                 .and_then(|value| value.get("model_catalog_json"))
                 .is_none(),
             "model_catalog_json should stay top-level"
+        );
+    }
+
+    #[test]
+    fn catalog_projection_uses_provider_config_but_only_mutates_home_pointer() {
+        let settings = json!({
+            "modelCatalog": { "models": [{ "model": "native-model" }] }
+        });
+        let provider_config = r#"model_context_window = 222222
+model = "provider-model"
+"#;
+        let home_config = r#"model = "home-model"
+approval_policy = "never"
+"#;
+
+        let prepared = prepare_codex_model_catalog_projection(
+            &settings,
+            provider_config,
+            home_config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("模型目录投影应成功");
+        let parsed: toml::Value = toml::from_str(&prepared.config_text).unwrap();
+
+        assert_eq!(
+            prepared.model_catalog.as_ref().unwrap()["models"][0]["context_window"],
+            json!(222222),
+            "模型目录内容必须从供应商配置读取上下文窗口"
+        );
+        assert_eq!(
+            parsed.get("model").and_then(|value| value.as_str()),
+            Some("home-model"),
+            "目标 Home 的其他配置必须保持不变"
+        );
+        assert_eq!(
+            parsed
+                .get("approval_policy")
+                .and_then(|value| value.as_str()),
+            Some("never")
+        );
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(|value| value.as_str()),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        );
+    }
+
+    #[test]
+    fn empty_catalog_removes_only_cc_switch_pointer() {
+        let settings = json!({ "modelCatalog": { "models": [] } });
+        let home_config = r#"model = "home-model"
+model_catalog_json = "cc-switch-model-catalog.json"
+"#;
+
+        let prepared = prepare_codex_model_catalog_projection(
+            &settings,
+            "model = \"provider-model\"\n",
+            home_config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("空模型目录投影应成功");
+        let parsed: toml::Value = toml::from_str(&prepared.config_text).unwrap();
+
+        assert!(prepared.model_catalog.is_none());
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed.get("model").and_then(|value| value.as_str()),
+            Some("home-model")
+        );
+    }
+
+    #[test]
+    fn empty_catalog_preserves_user_managed_pointer() {
+        let settings = json!({ "modelCatalog": { "models": [] } });
+        let home_config = r#"model_catalog_json = "/Users/me/custom-models.json"
+"#;
+
+        let prepared = prepare_codex_model_catalog_projection(
+            &settings,
+            "",
+            home_config,
+            CodexCatalogToolProfile::NativeResponses,
+        )
+        .expect("用户模型目录指针投影应成功");
+        let parsed: toml::Value = toml::from_str(&prepared.config_text).unwrap();
+
+        assert!(prepared.model_catalog.is_none());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(|value| value.as_str()),
+            Some("/Users/me/custom-models.json")
         );
     }
 
