@@ -12,6 +12,20 @@ pub const FIRST_CUSTOM_CODEX_ROUTE_PORT: u16 = 15_722;
 pub const MIN_CODEX_ROUTE_PORT: u16 = 1;
 /// Codex 本地路由仅允许监听 loopback 地址。
 pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
+/// Codex 当前模型供应商字段。
+pub const CODEX_MODEL_PROVIDER_FIELD: &str = "model_provider";
+/// Codex 模型供应商配置父表。
+pub const CODEX_MODEL_PROVIDERS_TABLE: &str = "model_providers";
+/// Codex Profile 路由接管的服务地址字段。
+pub const CODEX_ROUTE_FIELD_BASE_URL: &str = "base_url";
+/// Codex Profile 路由接管的协议字段。
+pub const CODEX_ROUTE_FIELD_WIRE_API: &str = "wire_api";
+/// Codex Profile 路由接管的本地凭证字段。
+pub const CODEX_ROUTE_FIELD_BEARER_TOKEN: &str = "experimental_bearer_token";
+/// Codex Profile 本地路由接收的固定 wire API。
+pub const CODEX_ROUTE_WIRE_API_RESPONSES: &str = "responses";
+/// listener token 缺失或不匹配时使用的脱敏描述。
+pub const CODEX_ROUTE_TOKEN_MISMATCH_DETAIL: &str = "本地路由凭证缺失或不匹配";
 /// Profile 排空已进入请求的最长等待时间，超时后仍停止监听器。
 pub const CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS: u64 = 15;
 /// 每个本地监听凭证使用的随机字节数。

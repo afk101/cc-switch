@@ -1,6 +1,11 @@
 use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
+use crate::codex_profile::{
+    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_ROUTE_FIELD_BASE_URL,
+    CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API, CODEX_ROUTE_LISTEN_HOST,
+    CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
+};
 use crate::error::AppError;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
@@ -8,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use toml_edit::{DocumentMut, Item};
 
 /// Codex Home 配置文件的当前快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +80,55 @@ struct CodexRouteBackup {
     previous_content: Option<Vec<u8>>,
     previous_fingerprint: String,
     target_fingerprint: String,
+}
+
+/// 单个严格路由字段在 Codex TOML 中的准确位置。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexRouteFieldPath {
+    TopLevel(&'static str),
+    Provider {
+        provider_id: String,
+        field: &'static str,
+    },
+}
+
+/// 严格路由字段的缺失状态或原始 TOML Item。
+#[derive(Clone)]
+enum CodexRouteFieldState {
+    Missing,
+    Present(Item),
+}
+
+impl PartialEq for CodexRouteFieldState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Missing, Self::Missing) => true,
+            (Self::Present(left), Self::Present(right)) => left.to_string() == right.to_string(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CodexRouteFieldState {}
+
+/// 三个严格路由字段在单个文档中的状态。
+#[derive(Clone, PartialEq, Eq)]
+struct CodexManagedRouteState {
+    base_url: CodexRouteFieldState,
+    wire_api: CodexRouteFieldState,
+    bearer_token: CodexRouteFieldState,
+}
+
+/// 从接管前配置推导出的字段路径、状态和临时表信息。
+#[derive(Clone)]
+struct CodexManagedRouteProjection {
+    base_url_path: CodexRouteFieldPath,
+    wire_api_path: CodexRouteFieldPath,
+    bearer_token_path: CodexRouteFieldPath,
+    previous: CodexManagedRouteState,
+    target: CodexManagedRouteState,
+    created_provider_tables: Vec<String>,
+    created_model_providers_table: bool,
 }
 
 /// 读写单个 Home 的 `config.toml`，使原子替换失败可被行为测试注入。
@@ -327,15 +382,66 @@ impl CodexHomeConfigService {
         self.restore_decoded_backup(home, backup, None)
     }
 
-    /// 关闭 Profile 时兼容同端口的旧全局占位配置，其他外部修改仍拒绝覆盖。
+    /// 关闭 Profile 时只验证并恢复三个严格路由字段，保留其他当前配置。
     pub fn restore_profile_backup(
         &self,
         home: &Path,
         backup_json: &str,
         listen_port: u16,
+        listener_token: &str,
     ) -> Result<(), AppError> {
         let backup = Self::decode_route_backup(backup_json)?;
-        self.restore_decoded_backup(home, backup, Some(listen_port))
+        self.restore_profile_decoded_backup(home, backup, listen_port, listener_token)
+    }
+
+    /// 对已解码 Profile 备份执行字段级幂等恢复。
+    fn restore_profile_decoded_backup(
+        &self,
+        home: &Path,
+        backup: CodexRouteBackup,
+        listen_port: u16,
+        listener_token: &str,
+    ) -> Result<(), AppError> {
+        let projection = build_managed_route_projection(
+            backup.previous_content.as_deref(),
+            listen_port,
+            listener_token,
+        )?;
+        let current = self.inspect(home)?;
+        let Some(current_content) = current.content.as_deref() else {
+            return if backup.previous_content.is_none() {
+                Ok(())
+            } else {
+                Err(AppError::Config(
+                    "Codex config.toml 已在 Profile 路由恢复前被删除".to_string(),
+                ))
+            };
+        };
+        let mut current_document = parse_codex_document(current_content, "当前")?;
+        let current_state = read_managed_route_state(&current_document, &projection);
+        if current_state == projection.previous {
+            return Ok(());
+        }
+        ensure_managed_route_owned(&current_state, &projection.target, listen_port)?;
+        apply_previous_managed_route_state(&mut current_document, &projection)?;
+        let merged_content = current_document.to_string().into_bytes();
+
+        let latest = self.file_ops.read(&current.config_path)?;
+        ensure_fingerprint(
+            &current.fingerprint,
+            &fingerprint_content(latest.as_deref()),
+        )?;
+        if backup.previous_content.is_none()
+            && std::str::from_utf8(&merged_content)
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        {
+            self.file_ops.remove_file(&current.config_path)
+        } else {
+            self.file_ops
+                .write_atomic(&current.config_path, &merged_content)
+        }
     }
 
     /// 按指纹和可选旧占位所有权证明恢复已解码备份。
@@ -414,15 +520,359 @@ impl CodexHomeConfigService {
         let Some(content) = content.and_then(|bytes| std::str::from_utf8(bytes).ok()) else {
             return false;
         };
-        let expected_base_url = format!(
-            "http://{}:{listen_port}/v1",
-            crate::codex_profile::CODEX_ROUTE_LISTEN_HOST
-        );
+        let expected_base_url = format!("http://{}:{listen_port}/v1", CODEX_ROUTE_LISTEN_HOST);
         crate::codex_config::extract_codex_experimental_bearer_token(content).as_deref()
-            == Some(crate::codex_profile::LEGACY_PROXY_MANAGED_TOKEN)
+            == Some(LEGACY_PROXY_MANAGED_TOKEN)
             && crate::codex_config::extract_codex_base_url(content).as_deref()
                 == Some(expected_base_url.as_str())
+            && extract_active_codex_route_string(content, CODEX_ROUTE_FIELD_WIRE_API).as_deref()
+                == Some(CODEX_ROUTE_WIRE_API_RESPONSES)
     }
+}
+
+/// 将指定字节解析为保留格式的 Codex TOML 文档。
+fn parse_codex_document(content: &[u8], context: &str) -> Result<DocumentMut, AppError> {
+    let text = std::str::from_utf8(content).map_err(|error| {
+        AppError::Config(format!("{context} Codex config.toml 不是 UTF-8: {error}"))
+    })?;
+    text.parse::<DocumentMut>()
+        .map_err(|error| AppError::Config(format!("{context} Codex config.toml 无效: {error}")))
+}
+
+/// 返回文档中当前活动 provider 标识。
+fn active_codex_provider_id(document: &DocumentMut) -> Option<String> {
+    document
+        .get(CODEX_MODEL_PROVIDER_FIELD)
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .map(str::to_string)
+}
+
+/// 从准确路径读取字段 Item。
+fn route_field_item<'a>(document: &'a DocumentMut, path: &CodexRouteFieldPath) -> Option<&'a Item> {
+    match path {
+        CodexRouteFieldPath::TopLevel(field) => document.get(field),
+        CodexRouteFieldPath::Provider { provider_id, field } => document
+            .get(CODEX_MODEL_PROVIDERS_TABLE)
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(provider_id))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get(field)),
+    }
+}
+
+/// 在 target 中定位由现有构造器写入的字符串字段。
+fn locate_route_field_path(
+    target: &DocumentMut,
+    field: &'static str,
+    expected: &str,
+) -> Result<CodexRouteFieldPath, AppError> {
+    if let Some(provider_id) = active_codex_provider_id(target) {
+        let path = CodexRouteFieldPath::Provider { provider_id, field };
+        if route_field_item(target, &path).and_then(Item::as_str) == Some(expected) {
+            return Ok(path);
+        }
+    }
+
+    let path = CodexRouteFieldPath::TopLevel(field);
+    if route_field_item(target, &path).and_then(Item::as_str) == Some(expected) {
+        return Ok(path);
+    }
+    Err(AppError::Config(format!(
+        "无法定位 Codex Profile 路由字段 {field}"
+    )))
+}
+
+/// 从指定路径读取字段的缺失状态或原始 Item。
+fn read_route_field_state(
+    document: &DocumentMut,
+    path: &CodexRouteFieldPath,
+) -> CodexRouteFieldState {
+    route_field_item(document, path)
+        .cloned()
+        .map(CodexRouteFieldState::Present)
+        .unwrap_or(CodexRouteFieldState::Missing)
+}
+
+/// 按 projection 中三个独立路径读取严格路由状态。
+fn read_managed_route_state(
+    document: &DocumentMut,
+    projection: &CodexManagedRouteProjection,
+) -> CodexManagedRouteState {
+    CodexManagedRouteState {
+        base_url: read_route_field_state(document, &projection.base_url_path),
+        wire_api: read_route_field_state(document, &projection.wire_api_path),
+        bearer_token: read_route_field_state(document, &projection.bearer_token_path),
+    }
+}
+
+/// 记录 target 相比 previous 新建的 provider 表。
+fn created_provider_tables(previous: &DocumentMut, target: &DocumentMut) -> Vec<String> {
+    let previous_providers = previous
+        .get(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table);
+    target
+        .get(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table)
+        .map(|providers| {
+            providers
+                .iter()
+                .filter(|(provider_id, item)| {
+                    item.as_table().is_some()
+                        && previous_providers
+                            .map(|previous| !previous.contains_key(provider_id))
+                            .unwrap_or(true)
+                })
+                .map(|(provider_id, _)| provider_id.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从接管前正文纯构造 target，并投影三个严格字段。
+fn build_managed_route_projection(
+    previous_content: Option<&[u8]>,
+    listen_port: u16,
+    listener_token: &str,
+) -> Result<CodexManagedRouteProjection, AppError> {
+    let previous_document = match previous_content {
+        Some(content) => parse_codex_document(content, "接管前")?,
+        None => DocumentMut::new(),
+    };
+    let previous_text = previous_document.to_string();
+    let target_text =
+        build_codex_profile_route_toml(&previous_text, listen_port, None, listener_token);
+    let target_document = parse_codex_document(target_text.as_bytes(), "路由目标")?;
+    let expected_base_url = format!("http://{CODEX_ROUTE_LISTEN_HOST}:{listen_port}/v1");
+    let base_url_path = locate_route_field_path(
+        &target_document,
+        CODEX_ROUTE_FIELD_BASE_URL,
+        &expected_base_url,
+    )?;
+    let wire_api_path = locate_route_field_path(
+        &target_document,
+        CODEX_ROUTE_FIELD_WIRE_API,
+        CODEX_ROUTE_WIRE_API_RESPONSES,
+    )?;
+    let bearer_token_path = locate_route_field_path(
+        &target_document,
+        CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        listener_token,
+    )?;
+    let created_provider_tables = created_provider_tables(&previous_document, &target_document);
+    let created_model_providers_table =
+        previous_document.get(CODEX_MODEL_PROVIDERS_TABLE).is_none()
+            && target_document
+                .get(CODEX_MODEL_PROVIDERS_TABLE)
+                .and_then(Item::as_table)
+                .is_some();
+    let previous = CodexManagedRouteState {
+        base_url: read_route_field_state(&previous_document, &base_url_path),
+        wire_api: read_route_field_state(&previous_document, &wire_api_path),
+        bearer_token: read_route_field_state(&previous_document, &bearer_token_path),
+    };
+    let target = CodexManagedRouteState {
+        base_url: read_route_field_state(&target_document, &base_url_path),
+        wire_api: read_route_field_state(&target_document, &wire_api_path),
+        bearer_token: read_route_field_state(&target_document, &bearer_token_path),
+    };
+
+    Ok(CodexManagedRouteProjection {
+        base_url_path,
+        wire_api_path,
+        bearer_token_path,
+        previous,
+        target,
+        created_provider_tables,
+        created_model_providers_table,
+    })
+}
+
+/// 返回严格字段的字符串值，非字符串与缺失均不转换。
+fn route_field_state_string(state: &CodexRouteFieldState) -> Option<&str> {
+    match state {
+        CodexRouteFieldState::Missing => None,
+        CodexRouteFieldState::Present(item) => item.as_str(),
+    }
+}
+
+/// 为可公开的字段生成冲突详情。
+fn describe_public_route_field_state(state: &CodexRouteFieldState) -> String {
+    match state {
+        CodexRouteFieldState::Missing => "缺失".to_string(),
+        CodexRouteFieldState::Present(item) => item
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| "非字符串值".to_string()),
+    }
+}
+
+/// 校验单个可公开字段仍等于路由目标。
+fn ensure_public_route_field_owned(
+    field: &str,
+    current: &CodexRouteFieldState,
+    expected: &str,
+) -> Result<(), AppError> {
+    if route_field_state_string(current) == Some(expected) {
+        return Ok(());
+    }
+    Err(AppError::Config(format!(
+        "Codex Profile 路由字段 {field} 冲突，期望 {expected}，实际 {}",
+        describe_public_route_field_state(current)
+    )))
+}
+
+/// 校验 current 三字段仍由指定 Profile 路由持有。
+fn ensure_managed_route_owned(
+    current: &CodexManagedRouteState,
+    target: &CodexManagedRouteState,
+    listen_port: u16,
+) -> Result<(), AppError> {
+    let expected_base_url = format!("http://{CODEX_ROUTE_LISTEN_HOST}:{listen_port}/v1");
+    if route_field_state_string(&target.base_url) != Some(expected_base_url.as_str())
+        || route_field_state_string(&target.wire_api) != Some(CODEX_ROUTE_WIRE_API_RESPONSES)
+        || route_field_state_string(&target.bearer_token).is_none()
+    {
+        return Err(AppError::Config(
+            "Codex Profile 路由目标缺少严格字段".to_string(),
+        ));
+    }
+    ensure_public_route_field_owned(
+        CODEX_ROUTE_FIELD_BASE_URL,
+        &current.base_url,
+        &expected_base_url,
+    )?;
+    ensure_public_route_field_owned(
+        CODEX_ROUTE_FIELD_WIRE_API,
+        &current.wire_api,
+        CODEX_ROUTE_WIRE_API_RESPONSES,
+    )?;
+
+    let expected_token = route_field_state_string(&target.bearer_token)
+        .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
+    let current_token = route_field_state_string(&current.bearer_token);
+    if current_token == Some(expected_token) || current_token == Some(LEGACY_PROXY_MANAGED_TOKEN) {
+        return Ok(());
+    }
+    Err(AppError::Config(format!(
+        "Codex Profile 路由字段 {CODEX_ROUTE_FIELD_BEARER_TOKEN} 冲突：{CODEX_ROUTE_TOKEN_MISMATCH_DETAIL}"
+    )))
+}
+
+/// 将单个严格字段设置为接管前 Item 或删除。
+fn apply_route_field_state(
+    document: &mut DocumentMut,
+    path: &CodexRouteFieldPath,
+    previous: &CodexRouteFieldState,
+) -> Result<(), AppError> {
+    match path {
+        CodexRouteFieldPath::TopLevel(field) => match previous {
+            CodexRouteFieldState::Missing => {
+                document.as_table_mut().remove(field);
+            }
+            CodexRouteFieldState::Present(item) => {
+                document.as_table_mut().insert(field, item.clone());
+            }
+        },
+        CodexRouteFieldPath::Provider { provider_id, field } => {
+            let provider = document
+                .get_mut(CODEX_MODEL_PROVIDERS_TABLE)
+                .and_then(Item::as_table_mut)
+                .and_then(|providers| providers.get_mut(provider_id))
+                .and_then(Item::as_table_mut)
+                .ok_or_else(|| {
+                    AppError::Config(format!(
+                        "Codex Profile 路由字段 {field} 的 provider 表不存在"
+                    ))
+                })?;
+            match previous {
+                CodexRouteFieldState::Missing => {
+                    provider.remove(field);
+                }
+                CodexRouteFieldState::Present(item) => {
+                    provider.insert(field, item.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 只清理由本次路由构造新建且恢复后仍为空的表。
+fn cleanup_created_provider_tables(
+    document: &mut DocumentMut,
+    projection: &CodexManagedRouteProjection,
+) {
+    if let Some(providers) = document
+        .get_mut(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table_mut)
+    {
+        for provider_id in &projection.created_provider_tables {
+            let should_remove = providers
+                .get(provider_id)
+                .and_then(Item::as_table)
+                .map(toml_edit::Table::is_empty)
+                .unwrap_or(false);
+            if should_remove {
+                providers.remove(provider_id);
+            }
+        }
+    }
+    let should_remove_parent = projection.created_model_providers_table
+        && document
+            .get(CODEX_MODEL_PROVIDERS_TABLE)
+            .and_then(Item::as_table)
+            .map(toml_edit::Table::is_empty)
+            .unwrap_or(false);
+    if should_remove_parent {
+        document.as_table_mut().remove(CODEX_MODEL_PROVIDERS_TABLE);
+    }
+}
+
+/// 将三个严格路由字段恢复为接管前状态。
+fn apply_previous_managed_route_state(
+    current: &mut DocumentMut,
+    projection: &CodexManagedRouteProjection,
+) -> Result<(), AppError> {
+    apply_route_field_state(
+        current,
+        &projection.base_url_path,
+        &projection.previous.base_url,
+    )?;
+    apply_route_field_state(
+        current,
+        &projection.wire_api_path,
+        &projection.previous.wire_api,
+    )?;
+    apply_route_field_state(
+        current,
+        &projection.bearer_token_path,
+        &projection.previous.bearer_token,
+    )?;
+    cleanup_created_provider_tables(current, projection);
+    Ok(())
+}
+
+/// 读取活动 provider 中的字符串字段，缺失时回退顶层。
+fn extract_active_codex_route_string(content: &str, field: &str) -> Option<String> {
+    let document = content.parse::<DocumentMut>().ok()?;
+    if let Some(provider_id) = active_codex_provider_id(&document) {
+        if let Some(value) = document
+            .get(CODEX_MODEL_PROVIDERS_TABLE)
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(&provider_id))
+            .and_then(Item::as_table)
+            .and_then(|provider| provider.get(field))
+            .and_then(Item::as_str)
+        {
+            return Some(value.to_string());
+        }
+    }
+    document
+        .get(field)
+        .and_then(Item::as_str)
+        .map(str::to_string)
 }
 
 /// 根据指定 Profile 的本地端口构造纯 Codex 路由配置，不读取全局代理配置。
@@ -443,12 +893,19 @@ pub(crate) fn build_codex_route_toml_base(
     listen_port: u16,
     provider: Option<&Provider>,
 ) -> String {
-    let proxy_url = format!("http://127.0.0.1:{listen_port}/v1");
-    let updated = crate::codex_config::update_codex_toml_field(toml_str, "base_url", &proxy_url)
-        .unwrap_or_else(|_| toml_str.to_string());
-    let mut updated =
-        crate::codex_config::update_codex_toml_field(&updated, "wire_api", "responses")
-            .unwrap_or(updated);
+    let proxy_url = format!("http://{CODEX_ROUTE_LISTEN_HOST}:{listen_port}/v1");
+    let updated = crate::codex_config::update_codex_toml_field(
+        toml_str,
+        CODEX_ROUTE_FIELD_BASE_URL,
+        &proxy_url,
+    )
+    .unwrap_or_else(|_| toml_str.to_string());
+    let mut updated = crate::codex_config::update_codex_toml_field(
+        &updated,
+        CODEX_ROUTE_FIELD_WIRE_API,
+        CODEX_ROUTE_WIRE_API_RESPONSES,
+    )
+    .unwrap_or(updated);
 
     if let Some(upstream_model) =
         provider.and_then(crate::proxy::providers::codex_provider_upstream_model)
@@ -499,9 +956,11 @@ mod codex_home_config {
     use super::*;
     use crate::codex_config::{codex_auth_path_for_home, codex_config_path_for_home};
     use crate::error::AppError;
+    use std::collections::VecDeque;
     use std::fs;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// 通过拒绝原子替换模拟同目录 rename 失败。
     struct FailingRenameFileOps;
@@ -525,6 +984,42 @@ mod codex_home_config {
         }
 
         fn remove_file(&self, _path: &Path) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 在两次读取之间返回不同内容，用于模拟恢复窗口中的并发写入。
+    struct ChangingReadFileOps {
+        reads: Mutex<VecDeque<Option<Vec<u8>>>>,
+        writes: AtomicUsize,
+    }
+
+    impl ChangingReadFileOps {
+        /// 按给定顺序构造读取结果。
+        fn new(reads: Vec<Option<Vec<u8>>>) -> Self {
+            Self {
+                reads: Mutex::new(reads.into()),
+                writes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl CodexHomeFileOps for ChangingReadFileOps {
+        fn read(&self, _path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            self.reads
+                .lock()
+                .map_err(|error| AppError::Lock(error.to_string()))?
+                .pop_front()
+                .ok_or_else(|| AppError::Message("测试读取序列已耗尽".to_string()))
+        }
+
+        fn write_atomic(&self, _path: &Path, _content: &[u8]) -> Result<(), AppError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn remove_file(&self, _path: &Path) -> Result<(), AppError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -802,6 +1297,169 @@ wire_api = "responses"
         Ok(())
     }
 
+    /// 接管前和当前文件都不存在时可幂等成功，只有当前被删除时必须拒绝恢复。
+    #[test]
+    fn profile_restore_distinguishes_absent_original_from_external_deletion() -> Result<(), AppError>
+    {
+        let absent_home = tempfile::tempdir().expect("创建空 Home");
+        let service = CodexHomeConfigService::system();
+        let absent_plan = service.build_profile_route_plan(
+            absent_home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let absent_backup = service.serialize_backup(&absent_plan)?;
+        service.restore_profile_backup(
+            absent_home.path(),
+            &absent_backup,
+            15_722,
+            "profile-listener-token",
+        )?;
+        assert!(!codex_config_path_for_home(absent_home.path()).exists());
+
+        let deleted_home = tempfile::tempdir().expect("创建有配置的 Home");
+        let deleted_path = codex_config_path_for_home(deleted_home.path());
+        fs::write(&deleted_path, "model = \"before\"\n").expect("写入接管前配置");
+        let deleted_plan = service.build_profile_route_plan(
+            deleted_home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let deleted_backup = service.serialize_backup(&deleted_plan)?;
+        fs::remove_file(&deleted_path).expect("模拟外部删除配置");
+
+        assert!(service
+            .restore_profile_backup(
+                deleted_home.path(),
+                &deleted_backup,
+                15_722,
+                "profile-listener-token",
+            )
+            .is_err());
+        assert!(!deleted_path.exists());
+        Ok(())
+    }
+
+    /// 非字符串严格字段不能被当作缺失，接管前 Item 应按原类型恢复。
+    #[test]
+    fn profile_restore_preserves_item_types_and_rejects_non_string_current_values(
+    ) -> Result<(), AppError> {
+        for (from, to) in [
+            ("base_url = \"http://127.0.0.1:15722/v1\"", "base_url = 42"),
+            ("wire_api = \"responses\"", "wire_api = [\"responses\"]"),
+            (
+                "experimental_bearer_token = \"profile-listener-token\"",
+                "experimental_bearer_token = 42",
+            ),
+        ] {
+            let home = tempfile::tempdir().expect("创建临时 Home");
+            let path = codex_config_path_for_home(home.path());
+            fs::write(&path, "model = \"before\"\n").expect("写入接管前配置");
+            let service = CodexHomeConfigService::system();
+            let plan = service.build_profile_route_plan(
+                home.path(),
+                15_722,
+                None,
+                "profile-listener-token",
+            )?;
+            let backup = service.serialize_backup(&plan)?;
+            service.apply_route_plan(&plan)?;
+            let changed = fs::read_to_string(&path)
+                .expect("读取接管配置")
+                .replace(from, to);
+            assert!(changed.contains(to), "测试夹具必须成功改写字段类型");
+            fs::write(&path, &changed).expect("写入异常类型配置");
+
+            assert!(service
+                .restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token",)
+                .is_err());
+            assert_eq!(fs::read_to_string(&path).expect("重读配置"), changed);
+        }
+
+        let home = tempfile::tempdir().expect("创建原始 Item Home");
+        let path = codex_config_path_for_home(home.path());
+        fs::write(
+            &path,
+            "base_url = 7\nwire_api = \"chat\"\nexperimental_bearer_token = \"upstream-token\"\n",
+        )
+        .expect("写入非字符串原始 Item");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+        service.restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token")?;
+        let restored: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).expect("读取原始 Item 恢复结果"))
+                .expect("解析恢复结果");
+        assert_eq!(
+            restored
+                .get("base_url")
+                .and_then(|value| value.as_integer()),
+            Some(7)
+        );
+        Ok(())
+    }
+
+    /// 恢复校验后文件再次变化时必须拒绝写入。
+    #[test]
+    fn profile_restore_rejects_change_between_validation_and_write() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        fs::write(&path, "model = \"before\"\n").expect("写入接管前配置");
+        let system_service = CodexHomeConfigService::system();
+        let plan = system_service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = system_service.serialize_backup(&plan)?;
+        system_service.apply_route_plan(&plan)?;
+        let current = fs::read(&path).expect("读取接管配置");
+        let mut changed = current.clone();
+        changed.extend_from_slice(b"\n[desktop]\nfollowUpQueueMode = \"queue\"\n");
+        let file_ops = Arc::new(ChangingReadFileOps::new(vec![Some(current), Some(changed)]));
+        let service = CodexHomeConfigService::new(file_ops.clone());
+
+        assert!(service
+            .restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token",)
+            .is_err());
+        assert_eq!(file_ops.writes.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// 字段级合并的原子替换失败时必须保留当前路由配置。
+    #[test]
+    fn profile_restore_preserves_current_config_on_atomic_write_failure() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let path = codex_config_path_for_home(home.path());
+        fs::write(&path, "model = \"before\"\n").expect("写入接管前配置");
+        let system_service = CodexHomeConfigService::system();
+        let plan = system_service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "profile-listener-token",
+        )?;
+        let backup = system_service.serialize_backup(&plan)?;
+        system_service.apply_route_plan(&plan)?;
+        let current = fs::read(&path).expect("读取接管配置");
+        let service = CodexHomeConfigService::new(Arc::new(FailingRenameFileOps));
+
+        assert!(service
+            .restore_profile_backup(home.path(), &backup, 15_722, "profile-listener-token",)
+            .is_err());
+        assert_eq!(fs::read(&path).expect("重读当前配置"), current);
+        Ok(())
+    }
+
     /// 官方供应商直连计划只写目标 Home 配置，不得覆盖该 Home 自己的订阅认证。
     #[test]
     fn direct_official_provider_plan_preserves_profile_auth() -> Result<(), AppError> {
@@ -989,7 +1647,7 @@ wire_api = "responses"
             .classify_profile_reconcile(&external_plan, &backup, 15_722)
             .is_err());
         assert!(service
-            .restore_profile_backup(home.path(), &backup, 15_722)
+            .restore_profile_backup(home.path(), &backup, 15_722, "new-token")
             .is_err());
         assert_eq!(
             fs::read_to_string(&config_path).expect("重读外部配置"),
