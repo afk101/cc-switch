@@ -268,7 +268,9 @@ impl CodexHomeConfigService {
             home_config,
             catalog_profile,
         )?;
-        let config = if current.content.as_deref() == Some(prepared.config_text.as_bytes()) {
+        let config_unchanged = current.content.as_deref() == Some(prepared.config_text.as_bytes())
+            || (current.content.is_none() && prepared.config_text.is_empty());
+        let config = if config_unchanged {
             None
         } else {
             Some(self.build_route_plan_from_snapshot(home, current, &prepared.config_text)?)

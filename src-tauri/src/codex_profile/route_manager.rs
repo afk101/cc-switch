@@ -2,11 +2,11 @@
 
 use crate::app_config::AppType;
 use crate::codex_profile::{
-    CodexHomeConfigService, CodexHomeReconcileOwnership, CodexProfile, CodexProfileRoute,
-    CodexProfileScope, CodexProfileSecretStore, CodexRouteConfigPlan, CodexRouteProviderSnapshot,
-    CodexRouteRuntime, CodexRouteRuntimeFactory, CodexRuntimeStatus,
-    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
-    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CodexHomeConfigService, CodexHomeReconcileOwnership, CodexModelCatalogProjectionPlan,
+    CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
+    CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
+    CodexRuntimeStatus, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
+    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -94,6 +94,7 @@ pub struct CodexRouteManager {
     runtime_factory: Arc<dyn CodexRouteRuntimeFactory>,
     runtimes: Mutex<HashMap<String, Arc<dyn CodexRouteRuntime>>>,
     locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    catalog_sync_lock: AsyncMutex<()>,
 }
 
 /// 补偿记录只保存路由标识与开关状态，避免把 Home 正文或凭证写入数据库。
@@ -141,6 +142,7 @@ impl CodexRouteManager {
             runtime_factory,
             runtimes: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            catalog_sync_lock: AsyncMutex::new(()),
         }
     }
 
@@ -193,6 +195,7 @@ impl CodexRouteManager {
         if let Some(failover_ids) = requested_failover_ids.as_deref() {
             let _ = self.provider_snapshot(provider_id, failover_ids)?;
         }
+        let _catalog_guard = self.catalog_sync_lock.lock().await;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         let profile = self.persistence.get_profile(profile_id)?;
@@ -203,14 +206,16 @@ impl CodexRouteManager {
             .persistence
             .get_route(profile_id)?
             .unwrap_or_else(|| Self::empty_route(&profile.id));
+        let selected_provider = self
+            .persistence
+            .get_provider(provider_id)?
+            .ok_or_else(|| AppError::InvalidInput("Codex 供应商不存在".to_string()))?;
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let token = self.secret_store.ensure_token(profile_id)?;
-        let plan = self.home_config.build_profile_route_plan(
-            std::path::Path::new(&profile.canonical_home_path),
-            profile.listen_port,
-            self.persistence.get_provider(provider_id)?.as_ref(),
-            &token,
-        )?;
+        let home = std::path::Path::new(&profile.canonical_home_path);
+        let catalog_plan = self
+            .home_config
+            .build_model_catalog_projection_plan(home, &selected_provider)?;
         let target_snapshot = RouteRecoverySnapshot {
             current_provider_id: Some(provider_id.to_string()),
             enabled: true,
@@ -227,10 +232,34 @@ impl CodexRouteManager {
             CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
             None,
         )?;
+        self.home_config
+            .apply_model_catalog_projection_plan(&catalog_plan)?;
+        let plan = match self.home_config.build_profile_route_plan(
+            home,
+            profile.listen_port,
+            Some(&selected_provider),
+            &token,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let compensation_error = self
+                    .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
+                    .await;
+                let _ = self.persist_enable_recovery_error(
+                    profile_id,
+                    CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+                    &error,
+                );
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
+        };
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
                 profile_id: profile.id.clone(),
-                home_path: profile.canonical_home_path.into(),
+                home_path: profile.canonical_home_path.clone().into(),
                 port: profile.listen_port,
             },
             token,
@@ -238,73 +267,115 @@ impl CodexRouteManager {
         );
 
         if let Err(error) = runtime.start().await {
-            self.persist_operation_error(profile_id, CODEX_ROUTE_RECOVERY_PHASE_PREPARED, &error)?;
-            return Err(AppError::Message(error));
+            let operation_error = AppError::Message(error);
+            let compensation_error = self
+                .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
+                .await;
+            self.persist_enable_recovery_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+                &operation_error,
+            )?;
+            return Err(Self::compensation_failure_error(
+                &operation_error,
+                compensation_error.as_ref(),
+            ));
         }
         if let Err(error) =
             self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED, None)
         {
-            let stop_error = runtime.stop().await.err();
-            if let Some(stop_error) = stop_error {
-                self.track_runtime(profile.id.clone(), runtime.clone())?;
-                let _ = self.persist_operation_error(
-                    profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
-                    &stop_error,
-                );
-            }
-            return Err(error);
-        }
-        if !runtime.health_check().await {
-            let error = "Codex Profile 路由健康检查失败";
-            let stop_error = runtime.stop().await.err();
-            if stop_error.is_some() {
-                self.track_runtime(profile.id.clone(), runtime.clone())?;
-            }
-            self.persist_operation_error(
-                profile_id,
-                CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
-                &stop_error.unwrap_or_else(|| error.to_string()),
-            )?;
-            return Err(AppError::Message(
-                "Codex Profile 路由健康检查失败".to_string(),
+            let compensation_error = self
+                .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
+                .await;
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
             ));
         }
-        let backup = self.home_config.serialize_backup(&plan)?;
-        if let Err(error) = self.persist_enable_backup(profile_id, backup.clone()) {
-            if runtime.stop().await.is_err() {
-                self.track_runtime(profile.id.clone(), runtime)?;
-            }
-            return Err(error);
-        }
-        if let Err(error) = self.home_config.apply_route_plan(&plan) {
-            let stop_error = runtime.stop().await.err();
-            if stop_error.is_some() {
-                self.track_runtime(profile.id.clone(), runtime)?;
-            }
-            self.persist_operation_error(
+        if !runtime.health_check().await {
+            let error = AppError::Message("Codex Profile 路由健康检查失败".to_string());
+            let mut compensation_errors = self
+                .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(persist_error) = self.persist_enable_recovery_error(
                 profile_id,
                 CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
-                &stop_error.unwrap_or_else(|| error.to_string()),
-            )?;
-            return Err(error);
+                &error,
+            ) {
+                compensation_errors.push(persist_error);
+            }
+            let compensation_error = Self::combine_compensation_errors(compensation_errors);
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
+        let backup = match self.home_config.serialize_backup(&plan) {
+            Ok(backup) => backup,
+            Err(error) => {
+                let compensation_error = self
+                    .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
+                    .await;
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
+        };
+        if let Err(error) = self.persist_enable_backup(profile_id, backup.clone()) {
+            let compensation_error = self
+                .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
+                .await;
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
+        if let Err(error) = self.home_config.apply_route_plan(&plan) {
+            let mut compensation_errors = self
+                .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(persist_error) = self.persist_enable_recovery_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED,
+                &error,
+            ) {
+                compensation_errors.push(persist_error);
+            }
+            let compensation_error = Self::combine_compensation_errors(compensation_errors);
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
         }
         if let Err(error) = self.advance_operation(
             profile_id,
             CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
             None,
         ) {
-            let restore_error = self.home_config.restore(&plan).err();
-            let stop_error = runtime.stop().await.err();
-            let compensation_error = restore_error.map(|error| error.to_string()).or(stop_error);
-            if let Some(compensation_error) = compensation_error {
+            let compensation_error = self
+                .compensate_enable_side_effects(
+                    profile_id,
+                    Some(&runtime),
+                    Some(&plan),
+                    &catalog_plan,
+                )
+                .await;
+            if let Some(compensation_error) = &compensation_error {
                 let _ = self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED,
-                    &compensation_error,
+                    &compensation_error.to_string(),
                 );
             }
-            return Err(error);
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
         }
         let route = crate::codex_profile::CodexProfileRoute {
             profile_id: profile.id.clone(),
@@ -316,22 +387,27 @@ impl CodexRouteManager {
             updated_at: Utc::now().timestamp_millis(),
         };
         if let Err(error) = self.persistence.save_route(&route) {
-            let restore_error = self.home_config.restore(&plan).err();
-            let stop_error = runtime.stop().await.err();
-            let cleanup_failed = restore_error.is_some() || stop_error.is_some();
-            let persistence_error = self
-                .persist_operation_error(
+            let mut compensation_errors = self
+                .compensate_enable_side_effects(
                     profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED,
-                    "启用路由持久化失败，拒绝继续变更",
+                    Some(&runtime),
+                    Some(&plan),
+                    &catalog_plan,
                 )
-                .err();
-            if cleanup_failed {
-                self.track_runtime(profile.id.clone(), runtime)?;
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(persistence_error) = self.persist_operation_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_ENABLE_PERSIST_FAILED,
+                "启用路由持久化失败，拒绝继续变更",
+            ) {
+                compensation_errors.push(persistence_error);
             }
+            let compensation_error = Self::combine_compensation_errors(compensation_errors);
             return Err(Self::compensation_failure_error(
                 &error,
-                persistence_error.as_ref(),
+                compensation_error.as_ref(),
             ));
         }
         self.clear_operation(&route)?;
@@ -398,6 +474,7 @@ impl CodexRouteManager {
         if let Some(failover_ids) = requested_failover_ids.as_deref() {
             let _ = self.provider_snapshot(provider_id, failover_ids)?;
         }
+        let _catalog_guard = self.catalog_sync_lock.lock().await;
         let lock = self.profile_lock(profile_id)?;
         let _guard = lock.lock().await;
         let profile = self.persistence.get_profile(profile_id)?;
@@ -464,7 +541,22 @@ impl CodexRouteManager {
             reconcile: None,
         };
         let prepared = self.route_with_recovery(route.clone(), &recovery)?;
-        self.persistence.save_route(&prepared)?;
+        let catalog_plan = self.home_config.build_model_catalog_projection_plan(
+            std::path::Path::new(&profile.canonical_home_path),
+            &selected_provider,
+        )?;
+        self.home_config
+            .apply_model_catalog_projection_plan(&catalog_plan)?;
+        if let Err(error) = self.persistence.save_route(&prepared) {
+            let compensation_error = self
+                .home_config
+                .restore_model_catalog_projection_plan(&catalog_plan)
+                .err();
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
         runtime.swap_provider_snapshot(snapshot).await;
         if let Err(error) = self.advance_operation(
             profile_id,
@@ -472,9 +564,14 @@ impl CodexRouteManager {
             None,
         ) {
             let compensation_error = self
-                .restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot)
-                .await
-                .err();
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &route,
+                    &old_failovers,
+                    old_snapshot,
+                    &catalog_plan,
+                )
+                .await;
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
@@ -486,37 +583,75 @@ impl CodexRouteManager {
         };
         if let Err(error) = self.persistence.save_route(&changing) {
             let compensation_error = self
-                .restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot)
-                .await
-                .err();
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &route,
+                    &old_failovers,
+                    old_snapshot,
+                    &catalog_plan,
+                )
+                .await;
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
             ));
         }
-        self.advance_operation(
+        if let Err(error) = self.advance_operation(
             profile_id,
             CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED,
             None,
-        )?;
+        ) {
+            let compensation_error = self
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &route,
+                    &old_failovers,
+                    old_snapshot,
+                    &catalog_plan,
+                )
+                .await;
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
         if let Err(error) = self
             .persistence
             .replace_failovers(profile_id, &failover_ids)
         {
             let compensation_error = self
-                .restore_switch_locked(profile_id, &route, &old_failovers, old_snapshot)
-                .await
-                .err();
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &route,
+                    &old_failovers,
+                    old_snapshot,
+                    &catalog_plan,
+                )
+                .await;
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
             ));
         }
-        self.advance_operation(
+        if let Err(error) = self.advance_operation(
             profile_id,
             CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED,
             None,
-        )?;
+        ) {
+            let compensation_error = self
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &route,
+                    &old_failovers,
+                    old_snapshot,
+                    &catalog_plan,
+                )
+                .await;
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
         if let Err(error) = self.clear_operation(&changed) {
             let persistence_error = self
                 .persist_operation_error(
@@ -1090,6 +1225,77 @@ impl CodexRouteManager {
             )),
             None => AppError::Message(operation_error.to_string()),
         }
+    }
+
+    /// 合并多个补偿失败，同时保留所有已执行补偿的脱敏错误。
+    fn combine_compensation_errors(errors: Vec<AppError>) -> Option<AppError> {
+        if errors.is_empty() {
+            None
+        } else {
+            Some(AppError::Message(
+                errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("；"),
+            ))
+        }
+    }
+
+    /// 恢复启用流程已经产生的 Home、目录与运行时副作用。
+    async fn compensate_enable_side_effects(
+        &self,
+        profile_id: &str,
+        runtime: Option<&Arc<dyn CodexRouteRuntime>>,
+        route_plan: Option<&CodexRouteConfigPlan>,
+        catalog_plan: &CodexModelCatalogProjectionPlan,
+    ) -> Option<AppError> {
+        let mut errors = Vec::new();
+        if let Some(route_plan) = route_plan {
+            if let Err(error) = self.home_config.restore(route_plan) {
+                errors.push(error);
+            }
+        }
+        if let Err(error) = self
+            .home_config
+            .restore_model_catalog_projection_plan(catalog_plan)
+        {
+            errors.push(error);
+        }
+        if let Some(runtime) = runtime {
+            if let Err(error) = runtime.stop().await {
+                errors.push(AppError::Message(error));
+                if let Err(error) = self.track_runtime(profile_id.to_string(), runtime.clone()) {
+                    errors.push(error);
+                }
+            }
+        }
+        Self::combine_compensation_errors(errors)
+    }
+
+    /// 同时恢复已启用切换的运行时/数据库状态和目标 Home 模型目录。
+    async fn restore_switch_and_catalog_locked(
+        &self,
+        profile_id: &str,
+        route: &CodexProfileRoute,
+        failovers: &[String],
+        old_snapshot: CodexRouteProviderSnapshot,
+        catalog_plan: &CodexModelCatalogProjectionPlan,
+    ) -> Option<AppError> {
+        let mut errors = Vec::new();
+        if let Err(error) = self
+            .restore_switch_locked(profile_id, route, failovers, old_snapshot)
+            .await
+        {
+            errors.push(error);
+        }
+        if let Err(error) = self
+            .home_config
+            .restore_model_catalog_projection_plan(catalog_plan)
+        {
+            errors.push(error);
+        }
+        Self::combine_compensation_errors(errors)
     }
 
     /// 将恢复前置条件失败标记为未收敛，禁止调用方继续新的生命周期变更。
@@ -1955,6 +2161,230 @@ mod codex_route_manager {
             updated_at: 1,
         })?;
         Ok(plan)
+    }
+
+    /// 构造包含路由模型目录的测试供应商。
+    fn provider_with_route_catalog(id: &str, model: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            id.to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "test-token"},
+                "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": {"models": [{"model": model}]}
+            }),
+            None,
+        );
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        provider
+    }
+
+    /// 直接准备带模型目录的已启用 Profile，避免依赖待测启用流程。
+    fn prepare_enabled_catalog_profile(
+        db: &Database,
+        home_config: &CodexHomeConfigService,
+        home: &Path,
+        profile_id: &str,
+        listen_port: u16,
+        provider: &Provider,
+    ) -> Result<(), AppError> {
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.display().to_string(),
+            listen_port,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let catalog_plan = home_config.build_model_catalog_projection_plan(home, provider)?;
+        home_config.apply_model_catalog_projection_plan(&catalog_plan)?;
+        let route_plan = home_config.build_profile_route_plan(
+            home,
+            listen_port,
+            Some(provider),
+            "test-local-token",
+        )?;
+        let backup = home_config.serialize_backup(&route_plan)?;
+        home_config.apply_route_plan(&route_plan)?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(provider.id.clone()),
+            enabled: true,
+            live_backup_json: Some(backup),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enable_route_creates_missing_catalog_in_profile_home() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let provider = provider_with_route_catalog("provider-a", "model-a");
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db,
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-a", vec![]).await?;
+
+        let catalog = fs::read_to_string(
+            home.path()
+                .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .expect("读取 Profile 模型目录");
+        let config =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取 Profile 配置");
+        assert!(catalog.contains("model-a"));
+        assert!(config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enabled_switch_replaces_only_selected_profile_catalog() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_a = tempfile::tempdir().expect("创建 A Home");
+        let home_b = tempfile::tempdir().expect("创建 B Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let provider_a = provider_with_route_catalog("provider-a", "model-a");
+        let provider_b = provider_with_route_catalog("provider-b", "model-b");
+        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
+        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        prepare_enabled_catalog_profile(
+            &db,
+            &home_config,
+            home_a.path(),
+            "profile-a",
+            16_001,
+            &provider_a,
+        )?;
+        prepare_enabled_catalog_profile(
+            &db,
+            &home_config,
+            home_b.path(),
+            "profile-b",
+            16_002,
+            &provider_a,
+        )?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        for profile_id in ["profile-a", "profile-b"] {
+            manager.runtimes.lock()?.insert(
+                profile_id.to_string(),
+                Arc::new(FakeRuntime {
+                    provider: AsyncMutex::new("provider-a".to_string()),
+                    port: if profile_id == "profile-a" {
+                        16_001
+                    } else {
+                        16_002
+                    },
+                }),
+            );
+        }
+
+        manager
+            .switch_provider("profile-a", "provider-b", vec![])
+            .await?;
+
+        let catalog_name = crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
+        let catalog_a = fs::read_to_string(home_a.path().join(catalog_name)).expect("读取 A 目录");
+        let catalog_b = fs::read_to_string(home_b.path().join(catalog_name)).expect("读取 B 目录");
+        assert!(catalog_a.contains("model-b"));
+        assert!(!catalog_a.contains("model-a"));
+        assert!(catalog_b.contains("model-a"));
+        assert!(!catalog_b.contains("model-b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enabled_switch_persistence_failure_restores_profile_catalog() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let provider_a = provider_with_route_catalog("provider-a", "model-a");
+        let provider_b = provider_with_route_catalog("provider-b", "model-b");
+        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
+        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        prepare_enabled_catalog_profile(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-a",
+            16_001,
+            &provider_a,
+        )?;
+        let catalog_path = home
+            .path()
+            .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let original_catalog = fs::read(&catalog_path).expect("读取初始模型目录");
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db,
+                save_count: AtomicUsize::new(0),
+                fail_on_save: 2,
+                fail_replace: false,
+            }),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.runtimes.lock()?.insert(
+            "profile-a".to_string(),
+            Arc::new(FakeRuntime {
+                provider: AsyncMutex::new("provider-a".to_string()),
+                port: 16_001,
+            }),
+        );
+
+        assert!(manager
+            .switch_provider("profile-a", "provider-b", vec![])
+            .await
+            .is_err());
+
+        assert_eq!(
+            fs::read(&catalog_path).expect("重读补偿后的模型目录"),
+            original_catalog
+        );
+        Ok(())
     }
 
     /// 关闭态选择供应商只更新目标 Home 与供应商引用，不得创建 token 或启动路由。
