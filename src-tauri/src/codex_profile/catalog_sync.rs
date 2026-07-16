@@ -22,8 +22,7 @@ pub(crate) fn apply_catalog_projection_batch(
     home_config: &CodexHomeConfigService,
     entries: Vec<CodexCatalogProjectionEntry>,
 ) -> Result<AppliedCodexCatalogProjectionBatch, AppError> {
-    let mut applied = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for entry in &entries {
         if entry.plan.home_path() != entry.home_path {
             return Err(AppError::InvalidInput(format!(
                 "Codex Profile {} ({}) 的模型目录计划与 Home 不一致: {}",
@@ -32,6 +31,10 @@ pub(crate) fn apply_catalog_projection_batch(
                 entry.home_path.display()
             )));
         }
+    }
+
+    let mut applied = Vec::with_capacity(entries.len());
+    for entry in entries {
         if let Err(primary) = home_config.apply_model_catalog_projection_plan(&entry.plan) {
             let applied_refs = applied.iter().collect::<Vec<_>>();
             let compensation =
@@ -306,5 +309,26 @@ mod tests {
 
         assert_eq!(fs::read(&path_a).expect("读取 A 恢复目录"), b"old-a");
         assert_eq!(fs::read(&path_b).expect("读取 B 恢复目录"), b"old-b");
+    }
+
+    #[test]
+    fn invalid_second_entry_is_rejected_before_first_home_changes() {
+        let home_a = tempfile::tempdir().expect("创建 A Home");
+        let home_b = tempfile::tempdir().expect("创建 B Home");
+        let unrelated_home = tempfile::tempdir().expect("创建无关 Home");
+        let path_a = home_a.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let path_b = home_b.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&path_a, b"old-a").expect("写入 A 旧目录");
+        fs::write(&path_b, b"old-b").expect("写入 B 旧目录");
+        let home_config = CodexHomeConfigService::system();
+        let mut entries = projection_entries(&home_config, home_a.path(), home_b.path());
+        entries[1].home_path = unrelated_home.path().to_path_buf();
+
+        let error = apply_catalog_projection_batch(&home_config, entries)
+            .expect_err("不一致的 Home 身份必须在写入前被拒绝");
+
+        assert!(error.to_string().contains("计划与 Home 不一致"));
+        assert_eq!(fs::read(&path_a).expect("读取 A 未变目录"), b"old-a");
+        assert_eq!(fs::read(&path_b).expect("读取 B 未变目录"), b"old-b");
     }
 }
