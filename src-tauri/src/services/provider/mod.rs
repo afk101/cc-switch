@@ -703,6 +703,72 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_update_preflight_does_not_write_database() {
+        with_test_home(|state, _| {
+            let original = Provider::with_id(
+                "codex-preflight".to_string(),
+                "Before".to_string(),
+                codex_settings("https://before.example/v1", "test-before"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &original)
+                .expect("保存原供应商");
+            let incoming = Provider::with_id(
+                "codex-preflight".to_string(),
+                "After".to_string(),
+                codex_settings("https://after.example/v1", "test-after"),
+                None,
+            );
+
+            let prepared = ProviderService::prepare_codex_provider_update(
+                state,
+                Some("codex-preflight"),
+                incoming,
+            )
+            .expect("Codex 供应商预检应成功");
+
+            assert_eq!(prepared.name, "After");
+            let stored = state
+                .db
+                .get_provider_by_id("codex-preflight", AppType::Codex.as_str())
+                .expect("读取供应商")
+                .expect("供应商存在");
+            assert_eq!(stored.name, "Before");
+            assert_eq!(stored.settings_config, original.settings_config);
+        });
+    }
+
+    #[test]
+    fn codex_provider_update_preflight_rejects_id_change_before_write() {
+        with_test_home(|state, _| {
+            let incoming = Provider::with_id(
+                "codex-new-id".to_string(),
+                "Codex".to_string(),
+                codex_settings("https://example.com/v1", "test-token"),
+                None,
+            );
+
+            let error = ProviderService::prepare_codex_provider_update(
+                state,
+                Some("codex-old-id"),
+                incoming,
+            )
+            .expect_err("Codex 供应商不允许修改 ID");
+
+            assert!(error
+                .to_string()
+                .contains("Only additive-mode providers support changing provider key"));
+            assert!(state
+                .db
+                .get_provider_by_id("codex-new-id", AppType::Codex.as_str())
+                .expect("查询新 ID")
+                .is_none());
+        });
+    }
+
+    #[test]
     fn extract_claude_common_config_strips_all_credentials_keeps_shareable() {
         // env 混入多种凭据（Anthropic/OpenRouter/Google/OpenAI/Gemini + AWS/Vertex）
         // 与可共享配置；顶层混入非标准的 apiKey/api_key 凭据与正常设置。
@@ -2134,6 +2200,28 @@ impl ProviderService {
         Ok(true)
     }
 
+    /// 无副作用地校验并规范化待更新的 Codex 供应商。
+    pub(crate) fn prepare_codex_provider_update(
+        state: &AppState,
+        original_id: Option<&str>,
+        mut provider: Provider,
+    ) -> Result<Provider, AppError> {
+        let original_id = original_id.unwrap_or(provider.id.as_str());
+        if original_id != provider.id {
+            return Err(AppError::Message(
+                "Only additive-mode providers support changing provider key".to_string(),
+            ));
+        }
+        Self::validate_provider_settings(&AppType::Codex, &provider)?;
+        normalize_provider_common_config_for_storage(
+            state.db.as_ref(),
+            &AppType::Codex,
+            &mut provider,
+        )?;
+        Self::normalize_usage_script_credential_overrides(&AppType::Codex, &mut provider);
+        Ok(provider)
+    }
+
     /// Update a provider
     pub fn update(
         state: &AppState,
@@ -2141,17 +2229,27 @@ impl ProviderService {
         original_id: Option<&str>,
         provider: Provider,
     ) -> Result<bool, AppError> {
-        let mut provider = provider;
+        let mut provider = if app_type == AppType::Codex {
+            Self::prepare_codex_provider_update(state, original_id, provider)?
+        } else {
+            provider
+        };
         let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
         let provider_id_changed = original_id != provider.id;
         let existing_provider = state
             .db
             .get_provider_by_id(&original_id, app_type.as_str())?;
-        // Normalize Claude model keys
-        Self::normalize_provider_if_claude(&app_type, &mut provider);
-        Self::validate_provider_settings(&app_type, &provider)?;
-        normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
-        Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+        if app_type != AppType::Codex {
+            // Normalize Claude model keys
+            Self::normalize_provider_if_claude(&app_type, &mut provider);
+            Self::validate_provider_settings(&app_type, &provider)?;
+            normalize_provider_common_config_for_storage(
+                state.db.as_ref(),
+                &app_type,
+                &mut provider,
+            )?;
+            Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+        }
 
         if provider_id_changed {
             if !app_type.is_additive_mode() {

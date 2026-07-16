@@ -1,12 +1,16 @@
 //! Codex Profile 独立路由生命周期编排。
 
 use crate::app_config::AppType;
+use crate::codex_profile::catalog_sync::{
+    apply_catalog_projection_batch, restore_catalog_projection_batch, CodexCatalogProjectionEntry,
+};
 use crate::codex_profile::{
     CodexHomeConfigService, CodexHomeReconcileOwnership, CodexModelCatalogProjectionPlan,
     CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
     CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
-    CodexRuntimeStatus, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
-    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CodexRuntimeStatus, CODEX_CATALOG_SYNC_COMPENSATION_ERROR,
+    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
+    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -36,6 +40,11 @@ pub trait CodexProfileRoutePersistence: Send + Sync {
     fn list_failovers(&self, profile_id: &str) -> Result<Vec<String>, AppError>;
     fn replace_failovers(&self, profile_id: &str, provider_ids: &[String]) -> Result<(), AppError>;
     fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError>;
+    fn save_provider_snapshot(&self, _provider: &Provider) -> Result<(), AppError> {
+        Err(AppError::InvalidInput(
+            "当前 Codex Profile 持久化适配器不支持供应商快照恢复".to_string(),
+        ))
+    }
     fn delete_profile(&self, profile_id: &str) -> Result<(), AppError>;
 }
 
@@ -61,6 +70,9 @@ impl CodexProfileRoutePersistence for Database {
     }
     fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
         self.get_provider_by_id(provider_id, AppType::Codex.as_str())
+    }
+    fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
+        self.save_provider(AppType::Codex.as_str(), provider)
     }
     fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
         self.delete_codex_profile(profile_id)
@@ -159,6 +171,103 @@ impl CodexRouteManager {
             }
         }
         Ok(false)
+    }
+
+    /// 返回主供应商引用匹配的 Profile，故障转移引用不参与目录扇出。
+    fn profiles_using_primary_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<CodexProfile>, AppError> {
+        let mut profiles = Vec::new();
+        for profile in self.persistence.list_profiles()? {
+            let route = self.persistence.get_route(&profile.id)?;
+            if route
+                .as_ref()
+                .and_then(|route| route.current_provider_id.as_deref())
+                == Some(provider_id)
+            {
+                profiles.push(profile);
+            }
+        }
+        profiles.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(profiles)
+    }
+
+    /// 在共享供应商提交前同步所有主引用 Home，并在提交失败时恢复双方状态。
+    pub async fn with_provider_catalog_update<T, F>(
+        &self,
+        provider: &Provider,
+        commit: F,
+    ) -> Result<T, AppError>
+    where
+        F: FnOnce() -> Result<T, AppError>,
+    {
+        let _catalog_guard = self.catalog_sync_lock.lock().await;
+        let profiles = self.profiles_using_primary_provider(&provider.id)?;
+        let locks = profiles
+            .iter()
+            .map(|profile| self.profile_lock(&profile.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut _guards = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            _guards.push(lock.lock().await);
+        }
+
+        let original = self
+            .persistence
+            .get_provider(&provider.id)?
+            .ok_or_else(|| {
+                AppError::InvalidInput(format!("Codex 供应商不存在: {}", provider.id))
+            })?;
+        let entries = profiles
+            .iter()
+            .map(|profile| {
+                let home_path = std::path::PathBuf::from(&profile.canonical_home_path);
+                Ok(CodexCatalogProjectionEntry {
+                    profile_id: profile.id.clone(),
+                    profile_name: profile.name.clone(),
+                    plan: self
+                        .home_config
+                        .build_model_catalog_projection_plan(&home_path, provider)?,
+                    home_path,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let applied = apply_catalog_projection_batch(self.home_config.as_ref(), entries)?;
+
+        match commit() {
+            Ok(value) => Ok(value),
+            Err(primary) => {
+                let provider_restore = self.persistence.save_provider_snapshot(&original).err();
+                let home_restore =
+                    restore_catalog_projection_batch(self.home_config.as_ref(), &applied).err();
+                Err(Self::catalog_update_compensation_error(
+                    primary,
+                    provider_restore,
+                    home_restore,
+                ))
+            }
+        }
+    }
+
+    /// 汇总供应商提交失败与双侧补偿结果，不包含供应商设置正文。
+    fn catalog_update_compensation_error(
+        primary: AppError,
+        provider_restore: Option<AppError>,
+        home_restore: Option<AppError>,
+    ) -> AppError {
+        match (provider_restore, home_restore) {
+            (None, None) => primary,
+            (provider_restore, home_restore) => AppError::Message(format!(
+                "{CODEX_CATALOG_SYNC_COMPENSATION_ERROR}: {primary}; 供应商恢复: {}; Home 恢复: {}",
+                provider_restore
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "成功".to_string()),
+                home_restore
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "成功".to_string()),
+            )),
+        }
     }
 
     /// 启动指定 Profile 的独立监听器并原子接管其 Home 配置。
@@ -2383,6 +2492,171 @@ mod codex_route_manager {
         assert_eq!(
             fs::read(&catalog_path).expect("重读补偿后的模型目录"),
             original_catalog
+        );
+        Ok(())
+    }
+
+    /// 准备共享供应商扇出测试的 Profile、主引用和初始模型目录。
+    fn prepare_catalog_reference_profile(
+        db: &Database,
+        home_config: &CodexHomeConfigService,
+        home: &Path,
+        profile_id: &str,
+        listen_port: u16,
+        primary_provider: &Provider,
+        failover_ids: &[String],
+    ) -> Result<(), AppError> {
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.display().to_string(),
+            listen_port,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(primary_provider.id.clone()),
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        db.replace_codex_profile_failovers(profile_id, failover_ids)?;
+        let plan = home_config.build_model_catalog_projection_plan(home, primary_provider)?;
+        home_config.apply_model_catalog_projection_plan(&plan)
+    }
+
+    #[tokio::test]
+    async fn shared_provider_catalog_update_only_projects_primary_references(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_a = tempfile::tempdir().expect("创建 A Home");
+        let home_b = tempfile::tempdir().expect("创建 B Home");
+        let home_c = tempfile::tempdir().expect("创建 C Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let old_shared = provider_with_route_catalog("provider-shared", "old-shared");
+        let new_shared = provider_with_route_catalog("provider-shared", "new-shared");
+        let other = provider_with_route_catalog("provider-other", "other-model");
+        db.save_provider(AppType::Codex.as_str(), &old_shared)?;
+        db.save_provider(AppType::Codex.as_str(), &other)?;
+        prepare_catalog_reference_profile(
+            &db,
+            &home_config,
+            home_a.path(),
+            "profile-a",
+            16_001,
+            &old_shared,
+            &[],
+        )?;
+        prepare_catalog_reference_profile(
+            &db,
+            &home_config,
+            home_b.path(),
+            "profile-b",
+            16_002,
+            &other,
+            &["provider-shared".to_string()],
+        )?;
+        prepare_catalog_reference_profile(
+            &db,
+            &home_config,
+            home_c.path(),
+            "profile-c",
+            16_003,
+            &old_shared,
+            &[],
+        )?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .with_provider_catalog_update(&new_shared, || {
+                db.save_provider(AppType::Codex.as_str(), &new_shared)
+            })
+            .await?;
+
+        let catalog_name = crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
+        let catalog_a = fs::read_to_string(home_a.path().join(catalog_name)).expect("读取 A 目录");
+        let catalog_b = fs::read_to_string(home_b.path().join(catalog_name)).expect("读取 B 目录");
+        let catalog_c = fs::read_to_string(home_c.path().join(catalog_name)).expect("读取 C 目录");
+        assert!(catalog_a.contains("new-shared"));
+        assert!(catalog_c.contains("new-shared"));
+        assert!(catalog_b.contains("other-model"));
+        assert!(!catalog_b.contains("new-shared"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_commit_failure_restores_provider_and_homes() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_a = tempfile::tempdir().expect("创建 A Home");
+        let home_c = tempfile::tempdir().expect("创建 C Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let old_shared = provider_with_route_catalog("provider-shared", "old-shared");
+        let new_shared = provider_with_route_catalog("provider-shared", "new-shared");
+        db.save_provider(AppType::Codex.as_str(), &old_shared)?;
+        prepare_catalog_reference_profile(
+            &db,
+            &home_config,
+            home_a.path(),
+            "profile-a",
+            16_001,
+            &old_shared,
+            &[],
+        )?;
+        prepare_catalog_reference_profile(
+            &db,
+            &home_config,
+            home_c.path(),
+            "profile-c",
+            16_003,
+            &old_shared,
+            &[],
+        )?;
+        let catalog_name = crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
+        let original_a = fs::read(home_a.path().join(catalog_name)).expect("读取 A 原目录");
+        let original_c = fs::read(home_c.path().join(catalog_name)).expect("读取 C 原目录");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .with_provider_catalog_update(&new_shared, || {
+                db.save_provider(AppType::Codex.as_str(), &new_shared)?;
+                Err::<(), AppError>(AppError::Message("模拟供应商提交失败".to_string()))
+            })
+            .await
+            .expect_err("供应商提交失败必须回滚");
+
+        assert!(error.to_string().contains("模拟供应商提交失败"));
+        assert_eq!(
+            db.get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+                .expect("供应商已恢复")
+                .settings_config,
+            old_shared.settings_config
+        );
+        assert_eq!(
+            fs::read(home_a.path().join(catalog_name)).expect("读取 A 恢复目录"),
+            original_a
+        );
+        assert_eq!(
+            fs::read(home_c.path().join(catalog_name)).expect("读取 C 恢复目录"),
+            original_c
         );
         Ok(())
     }

@@ -62,15 +62,38 @@ pub fn add_provider(
 }
 
 #[tauri::command]
-pub fn update_provider(
+pub async fn update_provider(
     state: State<'_, AppState>,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
-        .map_err(|e| e.to_string())
+    update_provider_for_app(state.inner(), app_type, provider, originalId.as_deref())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// 按应用类型执行供应商更新，Codex 更新额外同步所有主引用 Home。
+async fn update_provider_for_app(
+    state: &AppState,
+    app_type: AppType,
+    provider: Provider,
+    original_id: Option<&str>,
+) -> Result<bool, AppError> {
+    if app_type != AppType::Codex {
+        return ProviderService::update(state, app_type, original_id, provider);
+    }
+
+    let prepared_provider =
+        ProviderService::prepare_codex_provider_update(state, original_id, provider)?;
+    let projection_provider = prepared_provider.clone();
+    state
+        .codex_route_manager
+        .with_provider_catalog_update(&projection_provider, || {
+            ProviderService::update(state, AppType::Codex, original_id, prepared_provider)
+        })
+        .await
 }
 
 #[tauri::command]
@@ -94,7 +117,36 @@ pub fn delete_provider(
 
 #[cfg(test)]
 mod tests {
-    use crate::codex_profile::CodexProfileRef;
+    use crate::app_config::AppType;
+    use crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
+    use crate::codex_profile::{
+        CodexHomeConfigService, CodexProfile, CodexProfileRef, CodexProfileRoute,
+    };
+    use crate::database::Database;
+    use crate::provider::{Provider, ProviderMeta};
+    use crate::store::AppState;
+    use serde_json::json;
+    use std::fs;
+    use std::sync::Arc;
+
+    /// 构造命令层目录同步测试供应商。
+    fn codex_catalog_provider(model: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            "provider-shared".to_string(),
+            "Shared".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "test-token"},
+                "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n",
+                "modelCatalog": {"models": [{"model": model}]}
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+        provider
+    }
 
     #[test]
     fn provider_delete_is_allowed_without_codex_profile_references() {
@@ -112,6 +164,62 @@ mod tests {
             result,
             Err("Codex 供应商仍被以下 Profile 引用: 工作实例 (work)".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn codex_provider_update_command_syncs_referenced_home_catalog() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let home_config = CodexHomeConfigService::system();
+        let old_provider = codex_catalog_provider("old-model");
+        let new_provider = codex_catalog_provider("new-model");
+        db.save_provider(AppType::Codex.as_str(), &old_provider)
+            .expect("保存旧供应商");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("保存 Profile");
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: Some("provider-shared".to_string()),
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })
+        .expect("保存路由");
+        let old_plan = home_config
+            .build_model_catalog_projection_plan(home.path(), &old_provider)
+            .expect("构造旧目录计划");
+        home_config
+            .apply_model_catalog_projection_plan(&old_plan)
+            .expect("应用旧目录");
+
+        super::update_provider_for_app(
+            &state,
+            AppType::Codex,
+            new_provider,
+            Some("provider-shared"),
+        )
+        .await
+        .expect("命令内部更新应成功");
+
+        let catalog = fs::read_to_string(home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
+            .expect("读取同步后的目录");
+        assert!(catalog.contains("new-model"));
+        assert!(!catalog.contains("old-model"));
+        let stored = db
+            .get_provider_by_id("provider-shared", AppType::Codex.as_str())
+            .expect("读取供应商")
+            .expect("供应商存在");
+        assert_eq!(stored.name, "Shared");
     }
 }
 
