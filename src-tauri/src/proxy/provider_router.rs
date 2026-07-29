@@ -148,6 +148,12 @@ impl ProviderRouter {
         &self,
         providers: Vec<Provider>,
     ) -> Result<Vec<Provider>, AppError> {
+        match providers.len() {
+            0 => return Err(AppError::NoProvidersConfigured),
+            1 => return Ok(providers),
+            _ => {}
+        }
+
         let total_providers = providers.len();
         let mut result = Vec::with_capacity(total_providers);
         let mut circuit_open_count = 0usize;

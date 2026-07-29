@@ -339,6 +339,82 @@ mod tests {
         assert_eq!(runtime_b.select_provider_ids().await, vec![primary_b.id]);
     }
 
+    /// 未配置备用供应商时，历史失败不能阻止后续请求继续尝试主供应商。
+    #[tokio::test]
+    async fn single_provider_profile_bypasses_circuit_breaker_after_failure() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let primary = Provider::with_id("primary".to_string(), "主".to_string(), json!({}), None);
+        let runtime = RouteRuntime::for_test(
+            db,
+            CodexRouteProviderSnapshot::new(primary.clone(), Vec::new()),
+        );
+
+        runtime.record_provider_failure(&primary.id).await;
+
+        assert_eq!(runtime.select_provider_ids().await, vec![primary.id]);
+    }
+
+    /// 配置备用供应商时，主供应商熔断后仍应只选择备用供应商。
+    #[tokio::test]
+    async fn multi_provider_profile_still_filters_open_circuit() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let primary = Provider::with_id("primary".to_string(), "主".to_string(), json!({}), None);
+        let fallback = Provider::with_id("fallback".to_string(), "备".to_string(), json!({}), None);
+        let runtime = RouteRuntime::for_test(
+            db,
+            CodexRouteProviderSnapshot::new(primary.clone(), vec![fallback.clone()]),
+        );
+
+        runtime.record_provider_failure(&primary.id).await;
+
+        assert_eq!(runtime.select_provider_ids().await, vec![fallback.id]);
+    }
+
+    /// 切换为单供应商快照后，目标供应商既有的 Open 状态不应阻止新请求。
+    #[tokio::test]
+    async fn switching_to_single_provider_ignores_existing_open_state() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let primary = Provider::with_id("primary".to_string(), "主".to_string(), json!({}), None);
+        let fallback = Provider::with_id("fallback".to_string(), "备".to_string(), json!({}), None);
+        let runtime = RouteRuntime::for_test(
+            db,
+            CodexRouteProviderSnapshot::new(primary.clone(), vec![fallback]),
+        );
+        runtime.record_provider_failure(&primary.id).await;
+
+        runtime
+            .swap_provider_snapshot(CodexRouteProviderSnapshot::new(primary.clone(), Vec::new()))
+            .await;
+
+        assert_eq!(runtime.select_provider_ids().await, vec![primary.id]);
+    }
+
+    /// 多供应商均进入 Open 后，仍应保留“所有供应商已熔断”的故障转移语义。
+    #[tokio::test]
+    async fn multi_provider_profile_reports_all_circuits_open() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let primary = Provider::with_id("primary".to_string(), "主".to_string(), json!({}), None);
+        let fallback = Provider::with_id("fallback".to_string(), "备".to_string(), json!({}), None);
+        let runtime = RouteRuntime::for_test(
+            db,
+            CodexRouteProviderSnapshot::new(primary.clone(), vec![fallback.clone()]),
+        );
+        runtime.record_provider_failure(&primary.id).await;
+        runtime.record_provider_failure(&fallback.id).await;
+
+        let error = runtime
+            .server
+            .provider_router()
+            .select_providers("codex")
+            .await
+            .expect_err("所有候选 Open 时应返回熔断错误");
+
+        assert!(matches!(
+            error,
+            crate::error::AppError::AllProvidersCircuitOpen
+        ));
+    }
+
     /// 相同 response/call 标识在不同 Profile 只能恢复各自的 tool-call 历史。
     #[tokio::test]
     async fn route_runtimes_isolate_codex_chat_history_for_identical_ids() {
