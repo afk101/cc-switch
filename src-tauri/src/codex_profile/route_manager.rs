@@ -821,7 +821,7 @@ impl CodexRouteManager {
         Ok(())
     }
 
-    /// 先恢复 Home，再拒绝新请求并排空、停止监听器，最后持久化关闭状态。
+    /// 先恢复 Home，再立即拒绝新请求并停止监听器，最后持久化关闭状态。
     pub async fn disable(&self, profile_id: &str) -> Result<(), AppError> {
         self.validate_route_operation_before_lock(profile_id)?;
         let lock = self.profile_lock(profile_id)?;
@@ -885,7 +885,7 @@ impl CodexRouteManager {
             return Err(error);
         }
         if let Ok(runtime) = self.runtime(profile_id) {
-            if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
+            if let Err(error) = Self::reject_new_requests_and_stop_runtime(runtime).await {
                 self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -1223,7 +1223,9 @@ impl CodexRouteManager {
         );
         runtime.start().await.map_err(AppError::Message)?;
         if !runtime.health_check().await {
-            let stop_failed = runtime.stop().await.is_err();
+            let stop_failed = Self::reject_new_requests_and_stop_runtime(runtime.clone())
+                .await
+                .is_err();
             self.persist_error_summary(&profile.id, "恢复健康检查失败", stop_failed)?;
             return Err(AppError::Message(
                 "Codex Profile 路由健康检查失败".to_string(),
@@ -1371,14 +1373,16 @@ impl CodexRouteManager {
         Ok(())
     }
 
-    /// 停止监听器前先拒绝新请求并等待在途请求排空，超时状态会写入停止错误以便观测。
-    async fn drain_and_stop_runtime(runtime: Arc<dyn CodexRouteRuntime>) -> Result<(), String> {
-        runtime.begin_draining().await;
-        let drained = runtime.wait_for_drain().await;
-        runtime
-            .stop()
-            .await
-            .map_err(|error| format!("{error}（已排空: {drained}）"))
+    /// 立即拒绝新请求并停止监听器，不等待也不取消在途路由请求。
+    ///
+    /// 历史实现会等待在途请求排空至多 15 秒，并在超时后继续停止；用户显式关闭、
+    /// 恢复和补偿现在统一采用即时停接。
+    // 历史说明：停止监听器前先拒绝新请求并等待在途请求排空，超时状态会写入停止错误以便观测。
+    async fn reject_new_requests_and_stop_runtime(
+        runtime: Arc<dyn CodexRouteRuntime>,
+    ) -> Result<(), String> {
+        runtime.reject_new_requests().await;
+        runtime.stop().await
     }
 
     /// 返回原始失败及补偿失败，避免调用方将未收敛状态误判为普通业务失败。
@@ -1430,7 +1434,7 @@ impl CodexRouteManager {
             errors.push(error);
         }
         if let Some(runtime) = runtime {
-            if let Err(error) = runtime.stop().await {
+            if let Err(error) = Self::reject_new_requests_and_stop_runtime(runtime.clone()).await {
                 errors.push(AppError::Message(error));
                 if let Err(error) = self.track_runtime(profile_id.to_string(), runtime.clone()) {
                     errors.push(error);
@@ -1660,7 +1664,7 @@ impl CodexRouteManager {
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             if let Ok(runtime) = self.runtime(profile_id) {
-                if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
+                if let Err(error) = Self::reject_new_requests_and_stop_runtime(runtime).await {
                     self.persist_operation_error(
                         profile_id,
                         CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -1777,7 +1781,7 @@ impl CodexRouteManager {
             }
         }
         if let Ok(runtime) = self.runtime(profile_id) {
-            if let Err(error) = Self::drain_and_stop_runtime(runtime).await {
+            if let Err(error) = Self::reject_new_requests_and_stop_runtime(runtime).await {
                 self.persist_enable_recovery_error(
                     profile_id,
                     &recovery.phase,
@@ -1952,6 +1956,111 @@ mod codex_route_manager {
         provider: AsyncMutex<String>,
         port: u16,
     }
+
+    /// 模拟仍有请求在途的运行时，用于证明关闭不会等待请求完成。
+    struct InFlightRequestRuntime {
+        stop_called: AtomicBool,
+    }
+
+    impl CodexRouteRuntime for InFlightRequestRuntime {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+
+        fn swap_provider_snapshot(
+            &self,
+            _: CodexRouteProviderSnapshot,
+        ) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                self.stop_called.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+            Box::pin(async { CodexRuntimeStatus::Running })
+        }
+    }
+
+    /// 在关闭边界观察 Home、数据库状态和生命周期事件顺序的运行时替身。
+    struct CloseOrderRuntime {
+        db: Arc<Database>,
+        profile_id: String,
+        home_path: std::path::PathBuf,
+        events: Mutex<Vec<&'static str>>,
+        in_flight_request_active: AtomicBool,
+    }
+
+    impl CodexRouteRuntime for CloseOrderRuntime {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async { true })
+        }
+
+        fn swap_provider_snapshot(
+            &self,
+            _: CodexRouteProviderSnapshot,
+        ) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async move {
+                let config = fs::read_to_string(crate::codex_config::codex_config_path_for_home(
+                    &self.home_path,
+                ))
+                .expect("停接前读取已恢复配置");
+                assert!(config.contains("base_url = \"https://example.com/v1\""));
+                assert!(!config.contains("http://127.0.0.1:16001/v1"));
+                assert!(config.contains("[features]"));
+                assert!(
+                    self.db
+                        .get_codex_profile_route(&self.profile_id)
+                        .expect("停接前读取路由")
+                        .expect("停接前路由存在")
+                        .enabled
+                );
+                self.events.lock().expect("关闭事件锁").push("拒绝新请求");
+            })
+        }
+
+        fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async move {
+                assert!(self.in_flight_request_active.load(Ordering::SeqCst));
+                assert!(
+                    self.db
+                        .get_codex_profile_route(&self.profile_id)
+                        .expect("停止前读取路由")
+                        .expect("停止前路由存在")
+                        .enabled
+                );
+                let mut events = self.events.lock().expect("关闭事件锁");
+                assert_eq!(events.as_slice(), ["拒绝新请求"]);
+                events.push("停止监听器");
+                Ok(())
+            })
+        }
+
+        fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+            Box::pin(async { CodexRuntimeStatus::Running })
+        }
+    }
+
     impl CodexRouteRuntime for FakeRuntime {
         fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async { Ok(()) })
@@ -1967,11 +2076,8 @@ mod codex_route_manager {
                 *self.provider.lock().await = snapshot.providers()[0].id.clone();
             })
         }
-        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
-        }
-        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
-            Box::pin(async { true })
         }
         fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async { Ok(()) })
@@ -3229,6 +3335,77 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 用户显式关闭必须立即停接，不得等待永不结束的在途路由请求。
+    #[tokio::test]
+    async fn disabling_route_does_not_wait_for_in_flight_request() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-immediate-close",
+            16_001,
+            "test-local-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let routed_config = fs::read_to_string(&config_path).expect("读取接管配置");
+        fs::write(
+            &config_path,
+            format!("{routed_config}\n[features]\njs_repl = true\n"),
+        )
+        .expect("模拟关闭前的非路由配置修改");
+        let auth_path = home.path().join("auth.json");
+        fs::write(&auth_path, "{\"auth\":\"unchanged\"}\n").expect("写入认证文件");
+        let runtime = Arc::new(CloseOrderRuntime {
+            db: db.clone(),
+            profile_id: "profile-immediate-close".to_string(),
+            home_path: home.path().to_path_buf(),
+            events: Mutex::new(Vec::new()),
+            in_flight_request_active: AtomicBool::new(true),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-immediate-close".to_string(), runtime.clone())?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.disable("profile-immediate-close"),
+        )
+        .await
+        .expect("显式关闭不应等待在途路由请求")?;
+
+        assert_eq!(
+            runtime.events.lock().expect("关闭事件锁").as_slice(),
+            ["拒绝新请求", "停止监听器"]
+        );
+        assert!(runtime.in_flight_request_active.load(Ordering::SeqCst));
+        let restored = fs::read_to_string(config_path).expect("读取恢复配置");
+        assert!(restored.contains("base_url = \"https://example.com/v1\""));
+        assert!(!restored.contains("http://127.0.0.1:16001/v1"));
+        assert!(restored.contains("[features]"));
+        assert_eq!(
+            fs::read_to_string(auth_path).expect("读取认证文件"),
+            "{\"auth\":\"unchanged\"}\n"
+        );
+        let route = db
+            .get_codex_profile_route("profile-immediate-close")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
+        Ok(())
+    }
+
     /// 关闭时缺少既有 token 必须保留补偿，且不得调用 ensure 创建新凭证。
     #[tokio::test]
     async fn disabling_route_with_missing_token_keeps_recovery_without_ensuring(
@@ -3906,11 +4083,8 @@ experimental_bearer_token = "PROXY_MANAGED"
         ) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
         }
-        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
-        }
-        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
-            Box::pin(async { true })
         }
         fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async { Err("模拟停止失败".to_string()) })
@@ -3999,11 +4173,8 @@ experimental_bearer_token = "PROXY_MANAGED"
         ) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
         }
-        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
-        }
-        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
-            Box::pin(async { true })
         }
         fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async move {
@@ -4039,12 +4210,12 @@ experimental_bearer_token = "PROXY_MANAGED"
         }
     }
 
-    /// 可切换停止结果并记录排空过程的运行时替身。
+    /// 可切换停止结果并记录停接动作的运行时替身。
+    // 历史说明：该替身原本用于记录排空过程。
     struct RecoveryRuntime {
         healthy: bool,
         stop_fails: AtomicBool,
-        drain_waits: AtomicUsize,
-        drain_result: bool,
+        reject_new_requests_calls: AtomicUsize,
     }
 
     impl CodexRouteRuntime for RecoveryRuntime {
@@ -4060,13 +4231,10 @@ experimental_bearer_token = "PROXY_MANAGED"
         ) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async {})
         }
-        fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
-            Box::pin(async {})
-        }
-        fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
             Box::pin(async move {
-                self.drain_waits.fetch_add(1, Ordering::SeqCst);
-                self.drain_result
+                self.reject_new_requests_calls
+                    .fetch_add(1, Ordering::SeqCst);
             })
         }
         fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
@@ -5019,7 +5187,8 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
-    /// 启动阶段记录写入失败且停止失败后，恢复必须排空并移除被托管的运行时。
+    /// 启动阶段记录写入失败且停止失败后，恢复必须停接并移除被托管的运行时。
+    // 历史说明：该场景原本要求恢复先排空再移除被托管的运行时。
     #[tokio::test]
     async fn enabling_started_persistence_failure_tracks_runtime_until_recovery_stops_it(
     ) -> Result<(), AppError> {
@@ -5040,8 +5209,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let runtime = Arc::new(RecoveryRuntime {
             healthy: true,
             stop_fails: AtomicBool::new(true),
-            drain_waits: AtomicUsize::new(0),
-            drain_result: true,
+            reject_new_requests_calls: AtomicUsize::new(0),
         });
         let manager = CodexRouteManager::new(
             Arc::new(SaveFailingPersistence {
@@ -5072,14 +5240,15 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         manager.recover_pending_locked("profile-a").await?;
 
-        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 2);
         assert!(manager.status("profile-a").await.is_err());
         Ok(())
     }
 
-    /// 健康检查失败且停止失败后，恢复必须继续托管运行时并采用完整排空关闭流程。
+    /// 健康检查失败且停止失败后，恢复必须继续托管运行时并采用即时停接关闭流程。
+    // 历史说明：该测试原本采用完整排空关闭流程。
     #[tokio::test]
-    async fn enabling_health_failure_tracks_runtime_until_recovery_drains_and_stops(
+    async fn enabling_health_failure_tracks_runtime_until_recovery_rejects_and_stops(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
@@ -5098,8 +5267,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let runtime = Arc::new(RecoveryRuntime {
             healthy: false,
             stop_fails: AtomicBool::new(true),
-            drain_waits: AtomicUsize::new(0),
-            drain_result: true,
+            reject_new_requests_calls: AtomicUsize::new(0),
         });
         let manager = CodexRouteManager::new(
             db.clone(),
@@ -5125,15 +5293,86 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         manager.recover_pending_locked("profile-a").await?;
 
-        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 2);
         assert!(manager.status("profile-a").await.is_err());
         Ok(())
     }
 
-    /// 恢复关闭即使排空超时也必须调用等待，并在停止失败时返回可观测的排空状态。
+    /// 启用残留补偿必须立即停接，不得等待在途路由请求。
     #[tokio::test]
-    async fn recovering_enable_residue_reports_drain_timeout_when_stop_still_fails(
-    ) -> Result<(), AppError> {
+    async fn recovering_enable_residue_does_not_wait_for_in_flight_request() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-enable-residue".to_string(),
+            name: "Enable Residue".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery = RouteRecoveryRecord {
+            operation: "enable".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: None,
+                enabled: false,
+                failover_ids: vec![],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-a".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_ENABLE_STARTED.to_string(),
+            last_error: None,
+            reconcile: None,
+        };
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-enable-residue".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: Some(serde_json::to_string(&recovery).expect("编码恢复记录")),
+            updated_at: 1,
+        })?;
+        let runtime = Arc::new(InFlightRequestRuntime {
+            stop_called: AtomicBool::new(false),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-enable-residue".to_string(), runtime.clone())?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.recover_pending_locked("profile-enable-residue"),
+        )
+        .await
+        .expect("启用残留补偿不应等待在途路由请求")?;
+
+        assert!(runtime.stop_called.load(Ordering::SeqCst));
+        assert!(manager.status("profile-enable-residue").await.is_err());
+        let route = db
+            .get_codex_profile_route("profile-enable-residue")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
+        Ok(())
+    }
+
+    /// 历史排空超时会记录排空状态；即时停接后，停止失败仍必须保留恢复记录并返回错误。
+    // 历史说明：恢复关闭即使排空超时也会调用等待，并在停止失败时返回可观测的排空状态。
+    #[tokio::test]
+    async fn recovering_enable_residue_keeps_recovery_when_stop_still_fails() -> Result<(), AppError>
+    {
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.insert_codex_profile(&CodexProfile {
@@ -5172,8 +5411,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let runtime = Arc::new(RecoveryRuntime {
             healthy: true,
             stop_fails: AtomicBool::new(true),
-            drain_waits: AtomicUsize::new(0),
-            drain_result: false,
+            reject_new_requests_calls: AtomicUsize::new(0),
         });
         let manager = CodexRouteManager::new(
             db.clone(),
@@ -5191,8 +5429,8 @@ experimental_bearer_token = "PROXY_MANAGED"
             .await
             .expect_err("停止失败时恢复记录不得被清除");
 
-        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
-        assert!(error.to_string().contains("已排空: false"));
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("模拟停止失败"));
         assert!(db
             .get_codex_profile_route("profile-a")?
             .expect("路由记录")
@@ -5766,8 +6004,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let runtime = Arc::new(RecoveryRuntime {
             healthy: true,
             stop_fails: AtomicBool::new(true),
-            drain_waits: AtomicUsize::new(0),
-            drain_result: true,
+            reject_new_requests_calls: AtomicUsize::new(0),
         });
         let manager = CodexRouteManager::new(
             db.clone(),
@@ -5809,11 +6046,78 @@ experimental_bearer_token = "PROXY_MANAGED"
             .expect("路由存在");
         assert!(!route.enabled);
         assert!(route.recovery_json.is_none());
-        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
-    /// 关闭时 Home 恢复失败必须进入专用阶段，修复后恢复会重试 Home 并完成排空关闭。
+    /// 未完成关闭的恢复同样必须立即停接，不得等待在途路由请求。
+    #[tokio::test]
+    async fn recovering_pending_disable_does_not_wait_for_in_flight_request() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-pending-immediate-close",
+            16_001,
+            "test-local-token",
+        )?;
+        let mut route = db
+            .get_codex_profile_route("profile-pending-immediate-close")?
+            .expect("路由存在");
+        let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+        let mut target = before.clone();
+        target.enabled = false;
+        route.recovery_json = Some(
+            serde_json::to_string(&RouteRecoveryRecord {
+                operation: "disable".to_string(),
+                before,
+                target,
+                phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(),
+                last_error: None,
+                reconcile: None,
+            })
+            .expect("编码关闭恢复记录"),
+        );
+        db.save_codex_profile_route(&route)?;
+        let runtime = Arc::new(InFlightRequestRuntime {
+            stop_called: AtomicBool::new(false),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime(
+            "profile-pending-immediate-close".to_string(),
+            runtime.clone(),
+        )?;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            manager.recover_pending_locked("profile-pending-immediate-close"),
+        )
+        .await
+        .expect("未完成关闭恢复不应等待在途路由请求")?;
+
+        assert!(runtime.stop_called.load(Ordering::SeqCst));
+        let route = db
+            .get_codex_profile_route("profile-pending-immediate-close")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert!(route.recovery_json.is_none());
+        Ok(())
+    }
+
+    /// 关闭时 Home 恢复失败必须进入专用阶段，修复后恢复会重试 Home 并完成即时停接关闭。
+    // 历史说明：该恢复流程原本在 Home 修复后完成排空关闭。
     #[tokio::test]
     async fn disabling_home_restore_failure_retries_home_before_recovery_shutdown(
     ) -> Result<(), AppError> {
@@ -5850,8 +6154,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let runtime = Arc::new(RecoveryRuntime {
             healthy: true,
             stop_fails: AtomicBool::new(false),
-            drain_waits: AtomicUsize::new(0),
-            drain_result: true,
+            reject_new_requests_calls: AtomicUsize::new(0),
         });
         let manager = CodexRouteManager::new(
             db.clone(),
@@ -5882,7 +6185,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             fs::read_to_string(config_path).expect("读取恢复配置"),
             "model = \"before\"\n"
         );
-        assert_eq!(runtime.drain_waits.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 1);
         assert!(manager.status("profile-a").await.is_err());
         let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
         assert!(!route.enabled);

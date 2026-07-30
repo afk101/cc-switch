@@ -26,8 +26,8 @@ pub const CODEX_ROUTE_FIELD_BEARER_TOKEN: &str = "experimental_bearer_token";
 pub const CODEX_ROUTE_WIRE_API_RESPONSES: &str = "responses";
 /// listener token 缺失或不匹配时使用的脱敏描述。
 pub const CODEX_ROUTE_TOKEN_MISMATCH_DETAIL: &str = "本地路由凭证缺失或不匹配";
-/// Profile 排空已进入请求的最长等待时间，超时后仍停止监听器。
-pub const CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS: u64 = 15;
+// 历史说明：Profile 排空已进入请求的最长等待时间，超时后仍停止监听器。
+// Profile 路由关闭不再设置请求排空超时；用户决策会立即停接，仅保留监听器停止确认。
 /// 每个本地监听凭证使用的随机字节数。
 pub const LOCAL_TOKEN_BYTES: usize = 32;
 /// CC Switch 私有密钥根目录下的通用 secrets 目录名。

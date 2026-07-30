@@ -3,7 +3,6 @@
 //! 此模块不复用全局代理的监听器、路由器或会话历史，避免不同 `CODEX_HOME`
 //! 之间因相同 response / tool call 标识而串话。
 
-use crate::codex_profile::CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS;
 use crate::codex_profile::{CodexProfileScope, CodexRuntimeStatus};
 use crate::database::Database;
 use crate::provider::Provider;
@@ -26,8 +25,7 @@ pub trait CodexRouteRuntime: Send + Sync {
         &self,
         snapshot: CodexRouteProviderSnapshot,
     ) -> CodexRouteRuntimeFuture<'_, ()>;
-    fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()>;
-    fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool>;
+    fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()>;
     fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>>;
     fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus>;
 }
@@ -157,24 +155,17 @@ impl RouteRuntime {
             .await;
     }
 
-    /// 拒绝新请求并保留已进入转发链路的请求完成。
-    pub async fn begin_draining(&self) {
-        self.server.begin_profile_draining();
+    /// 立即拒绝新请求，已经进入转发链路的请求仍可自行完成。
+    // 历史说明：原 begin_draining 负责拒绝新请求并保留已进入转发链路的请求完成。
+    // 历史说明：原 wait_for_drain 等待该 Profile 已进入转发链路的请求结束，超时后返回 false。
+    pub async fn reject_new_requests(&self) {
+        self.server.reject_new_profile_requests();
         *self.status.write().await = CodexRuntimeStatus::Stopping;
         log::info!(
-            "[CodexRouteRuntime] Profile {} 开始排空端口 {}",
+            "[CodexRouteRuntime] Profile {} 停止接收新请求并开始关闭端口 {}",
             self.scope.profile_id,
             self.scope.port
         );
-    }
-
-    /// 等待该 Profile 已进入转发链路的请求结束，超时后返回 false。
-    pub async fn wait_for_drain(&self) -> bool {
-        self.server
-            .wait_for_profile_drain(std::time::Duration::from_secs(
-                CODEX_ROUTE_DRAIN_TIMEOUT_SECONDS,
-            ))
-            .await
     }
 
     /// 停止该 Profile 专属监听器。
@@ -276,12 +267,8 @@ impl CodexRouteRuntime for RouteRuntime {
         Box::pin(async move { RouteRuntime::swap_provider_snapshot(self, snapshot).await })
     }
 
-    fn begin_draining(&self) -> CodexRouteRuntimeFuture<'_, ()> {
-        Box::pin(async move { RouteRuntime::begin_draining(self).await })
-    }
-
-    fn wait_for_drain(&self) -> CodexRouteRuntimeFuture<'_, bool> {
-        Box::pin(async move { RouteRuntime::wait_for_drain(self).await })
+    fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+        Box::pin(async move { RouteRuntime::reject_new_requests(self).await })
     }
 
     fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {

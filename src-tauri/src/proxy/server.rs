@@ -30,10 +30,10 @@ use axum::{
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 /// Profile 监听器停止流程的可观察状态。
@@ -68,12 +68,11 @@ pub struct ProxyState {
     pub codex_profile_scope: Option<CodexProfileScope>,
     /// Profile 监听器本地认证凭证；只用于入站校验，绝不写入日志或转发上游。
     pub(crate) local_codex_token: Option<Arc<str>>,
-    /// Profile 进入排空阶段后拒绝新请求，已有请求仍由其独立 in-flight 计数完成。
-    pub(crate) route_draining: Arc<AtomicBool>,
-    /// Profile 已通过认证并进入处理链路的请求数。
-    pub(crate) profile_in_flight: Arc<AtomicUsize>,
-    /// 请求完成时唤醒排空等待者。
-    pub(crate) profile_drain_notify: Arc<Notify>,
+    /// Profile 路由关闭开始后拒绝新请求，已进入转发链路的请求不受影响。
+    // 历史说明：旧 route_draining 门禁配合独立 in-flight 计数完成排空。
+    // 历史说明：旧 profile_in_flight 记录已通过认证并进入处理链路的请求数。
+    // 历史说明：旧 profile_drain_notify 在请求完成时唤醒排空等待者。
+    pub(crate) profile_rejecting_new_requests: Arc<AtomicBool>,
 }
 
 /// 代理HTTP服务器
@@ -111,9 +110,7 @@ impl ProxyServer {
             failover_manager,
             codex_profile_scope: None,
             local_codex_token: None,
-            route_draining: Arc::new(AtomicBool::new(false)),
-            profile_in_flight: Arc::new(AtomicUsize::new(0)),
-            profile_drain_notify: Arc::new(Notify::new()),
+            profile_rejecting_new_requests: Arc::new(AtomicBool::new(false)),
         };
 
         Self {
@@ -128,7 +125,8 @@ impl ProxyServer {
     /// 创建只服务一个 Codex Profile 的代理服务器。
     ///
     /// 此构造器不影响 `ProxyServer::new` 的全局单例语义。每次调用都会新建
-    /// ProviderRouter、Codex history、状态容器和 in-flight 计数载体。
+    /// ProviderRouter、Codex history、状态容器和请求停接门禁。
+    // 历史说明：这里原本还会新建 in-flight 计数载体。
     pub(crate) fn new_for_codex_profile(
         db: Arc<Database>,
         scope: CodexProfileScope,
@@ -157,9 +155,7 @@ impl ProxyServer {
             failover_manager,
             codex_profile_scope: Some(scope),
             local_codex_token: Some(Arc::<str>::from(local_token)),
-            route_draining: Arc::new(AtomicBool::new(false)),
-            profile_in_flight: Arc::new(AtomicUsize::new(0)),
-            profile_drain_notify: Arc::new(Notify::new()),
+            profile_rejecting_new_requests: Arc::new(AtomicBool::new(false)),
         };
 
         Self {
@@ -527,7 +523,7 @@ impl ProxyServer {
             )
             .route_layer(axum::middleware::from_fn_with_state(
                 self.state.clone(),
-                track_profile_request,
+                reject_new_profile_request_after_auth,
             ))
             .route_layer(axum::middleware::from_fn_with_state(
                 self.state.clone(),
@@ -584,24 +580,14 @@ impl ProxyServer {
             .await;
     }
 
-    /// 进入排空阶段，仅拒绝该 Profile 后续进入的请求。
-    pub(crate) fn begin_profile_draining(&self) {
-        self.state.route_draining.store(true, Ordering::Release);
-    }
-
-    /// 等待已进入 Profile 转发链路的请求完成，超时交由调用方继续关闭监听器。
-    pub(crate) async fn wait_for_profile_drain(&self, timeout: std::time::Duration) -> bool {
-        let wait = async {
-            loop {
-                // 先注册 waiter 再读取计数，避免最后一个请求在两者之间完成而漏掉通知。
-                let notified = self.state.profile_drain_notify.notified();
-                if self.state.profile_in_flight.load(Ordering::Acquire) == 0 {
-                    return;
-                }
-                notified.await;
-            }
-        };
-        tokio::time::timeout(timeout, wait).await.is_ok()
+    /// 立即拒绝该 Profile 后续进入的请求，不等待也不取消已经进入转发链路的请求。
+    // 历史说明：旧 begin_profile_draining 仅拒绝该 Profile 后续进入的请求。
+    // 历史说明：旧 wait_for_profile_drain 等待已进入转发链路的请求完成，超时后由调用方继续关闭监听器。
+    // 历史说明：等待实现先注册 waiter 再读取计数，避免最后一个请求在两者之间完成而漏掉通知。
+    pub(crate) fn reject_new_profile_requests(&self) {
+        self.state
+            .profile_rejecting_new_requests
+            .store(true, Ordering::Release);
     }
 
     /// 返回此服务器独占的 ProviderRouter。
@@ -628,7 +614,7 @@ async fn validate_profile_local_token(
     mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if state.route_draining.load(Ordering::Acquire) {
+    if state.profile_rejecting_new_requests.load(Ordering::Acquire) {
         return ProxyError::NotRunning.into_response();
     }
 
@@ -643,22 +629,17 @@ async fn validate_profile_local_token(
     next.run(request).await
 }
 
-/// 仅在本地凭证校验通过后计入 Profile 请求，并在响应完成后通知排空等待者。
-async fn track_profile_request(
+/// 在认证后再次检查停接门禁，封闭认证检查与进入 handler 之间的并发窗口。
+// 历史说明：旧中间件仅在本地凭证校验通过后计入 Profile 请求，并在响应完成后通知排空等待者。
+async fn reject_new_profile_request_after_auth(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    state.profile_in_flight.fetch_add(1, Ordering::AcqRel);
-    if state.route_draining.load(Ordering::Acquire) {
-        state.profile_in_flight.fetch_sub(1, Ordering::AcqRel);
-        state.profile_drain_notify.notify_waiters();
+    if state.profile_rejecting_new_requests.load(Ordering::Acquire) {
         return ProxyError::NotRunning.into_response();
     }
-    let response = next.run(request).await;
-    state.profile_in_flight.fetch_sub(1, Ordering::AcqRel);
-    state.profile_drain_notify.notify_waiters();
-    response
+    next.run(request).await
 }
 
 /// 校验并剥离 Profile 本地凭证，使后续 Provider adapter 接管上游认证。
@@ -678,68 +659,51 @@ fn validate_and_strip_profile_token(headers: &mut axum::http::HeaderMap, token: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tokio::sync::Notify;
+    use tower::Service;
 
-    /// 排空必须等待已进入链路的 Profile 请求结束。
-    #[tokio::test]
-    async fn profile_drain_waits_for_in_flight_request_completion() {
-        let server = ProxyServer::new(
-            ProxyConfig::default(),
-            Arc::new(Database::memory().expect("内存数据库")),
-            None,
-        );
-        server.state.profile_in_flight.store(1, Ordering::Release);
-        let in_flight = server.state.profile_in_flight.clone();
-        let notify = server.state.profile_drain_notify.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            in_flight.fetch_sub(1, Ordering::AcqRel);
-            notify.notify_waiters();
-        });
-
-        assert!(
-            server
-                .wait_for_profile_drain(std::time::Duration::from_millis(100))
-                .await
-        );
+    /// 为 Profile 模型端点构造携带本地凭证的请求。
+    fn profile_models_request() -> Request<Body> {
+        Request::builder()
+            .uri("/models")
+            .header(AUTHORIZATION, "Bearer local-listener-token")
+            .body(Body::empty())
+            .expect("构造 Profile 模型请求")
     }
 
-    /// 最后一个请求在 waiter 注册前完成时，排空检查不得等待超时通知。
+    /// 历史排空测试覆盖等待完成、通知竞争与超时；即时停接改为验证关闭边界拒绝新请求。
+    // 历史说明：排空必须等待已进入链路的 Profile 请求结束。
+    // 历史说明：最后一个请求在 waiter 注册前完成时，排空检查不得等待超时通知。
+    // 历史说明：排空超时后必须返回 false，调用方据此继续停止监听器。
     #[tokio::test]
-    async fn profile_drain_succeeds_when_last_request_finishes_before_waiter_registration() {
-        let server = ProxyServer::new(
-            ProxyConfig::default(),
+    async fn profile_route_rejects_new_requests_after_close_starts() {
+        let server = ProxyServer::new_for_codex_profile(
             Arc::new(Database::memory().expect("内存数据库")),
-            None,
+            CodexProfileScope {
+                profile_id: "profile-a".to_string(),
+                home_path: std::path::PathBuf::from("/tmp/profile-a"),
+                port: 16_001,
+            },
+            "local-listener-token".to_string(),
+            vec![],
         );
-        server.state.profile_in_flight.store(1, Ordering::Release);
-        server
-            .state
-            .profile_in_flight
-            .fetch_sub(1, Ordering::AcqRel);
-        server.state.profile_drain_notify.notify_waiters();
+        let mut router = server.build_codex_profile_router();
 
-        assert!(
-            server
-                .wait_for_profile_drain(std::time::Duration::ZERO)
-                .await
-        );
-    }
+        let before_close = router
+            .call(profile_models_request())
+            .await
+            .expect("关闭前请求");
+        assert_eq!(before_close.status(), StatusCode::OK);
 
-    /// 排空超时后必须返回 false，调用方据此继续停止监听器。
-    #[tokio::test]
-    async fn profile_drain_returns_false_after_timeout() {
-        let server = ProxyServer::new(
-            ProxyConfig::default(),
-            Arc::new(Database::memory().expect("内存数据库")),
-            None,
-        );
-        server.state.profile_in_flight.store(1, Ordering::Release);
+        server.reject_new_profile_requests();
 
-        assert!(
-            !server
-                .wait_for_profile_drain(std::time::Duration::from_millis(10))
-                .await
-        );
+        let after_close = router
+            .call(profile_models_request())
+            .await
+            .expect("关闭后请求");
+        assert_eq!(after_close.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// 停止超时后必须保留同一 join handle，第二次停止可完成。

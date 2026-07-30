@@ -1078,9 +1078,7 @@ mod tests {
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             codex_profile_scope: None,
             local_codex_token: None,
-            route_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            profile_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            profile_drain_notify: Arc::new(tokio::sync::Notify::new()),
+            profile_rejecting_new_requests: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
