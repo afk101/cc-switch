@@ -2,11 +2,13 @@
 //!
 //! 除 `home_config` 外，本模块的持久化域代码不读写 Home 配置文件，也不控制监听器运行时。
 
+#[cfg(test)]
 pub(crate) mod catalog_sync;
 mod constants;
 mod home_config;
 mod migration;
 mod model;
+pub(crate) mod provider_sync;
 mod repository;
 mod route_manager;
 mod route_runtime;

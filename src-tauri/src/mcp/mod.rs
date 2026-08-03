@@ -24,6 +24,7 @@ pub use claude::{
     import_from_claude, remove_server_from_claude, sync_enabled_to_claude,
     sync_single_server_to_claude,
 };
+pub(crate) use codex::project_enabled_servers_to_codex_config;
 pub use codex::{
     import_from_codex, remove_server_from_codex, sync_enabled_to_codex, sync_single_server_to_codex,
 };

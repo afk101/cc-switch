@@ -74,7 +74,7 @@ pub async fn update_provider(
         .map_err(|error| error.to_string())
 }
 
-/// 按应用类型执行供应商更新，Codex 更新额外同步所有主引用 Home。
+/// 按应用类型执行供应商更新，Codex 更新委托给 Profile 路由模块统一编排。
 async fn update_provider_for_app(
     state: &AppState,
     app_type: AppType,
@@ -85,14 +85,9 @@ async fn update_provider_for_app(
         return ProviderService::update(state, app_type, original_id, provider);
     }
 
-    let prepared_provider =
-        ProviderService::prepare_codex_provider_update(state, original_id, provider)?;
-    let projection_provider = prepared_provider.clone();
     state
         .codex_route_manager
-        .with_provider_catalog_update(&projection_provider, || {
-            ProviderService::update(state, AppType::Codex, original_id, prepared_provider)
-        })
+        .update_shared_provider(state, provider, original_id)
         .await
 }
 
@@ -117,7 +112,7 @@ pub fn delete_provider(
 
 #[cfg(test)]
 mod tests {
-    use crate::app_config::AppType;
+    use crate::app_config::{AppType, McpApps, McpServer};
     use crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME;
     use crate::codex_profile::{
         CodexHomeConfigService, CodexProfile, CodexProfileRef, CodexProfileRoute,
@@ -167,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_provider_update_command_syncs_referenced_home_catalog() {
+    async fn shared_provider_save_syncs_referenced_home_catalog() {
         let db = Arc::new(Database::memory().expect("创建内存数据库"));
         let state = AppState::new(db.clone());
         let home = tempfile::tempdir().expect("创建临时 Home");
@@ -202,14 +197,11 @@ mod tests {
             .apply_model_catalog_projection_plan(&old_plan)
             .expect("应用旧目录");
 
-        super::update_provider_for_app(
-            &state,
-            AppType::Codex,
-            new_provider,
-            Some("provider-shared"),
-        )
-        .await
-        .expect("命令内部更新应成功");
+        state
+            .codex_route_manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await
+            .expect("共享供应商保存应成功");
 
         let catalog = fs::read_to_string(home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
             .expect("读取同步后的目录");
@@ -220,6 +212,203 @@ mod tests {
             .expect("读取供应商")
             .expect("供应商存在");
         assert_eq!(stored.name, "Shared");
+    }
+
+    #[tokio::test]
+    async fn shared_provider_save_updates_disabled_primary_profile_direct_config() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let state = AppState::new(db.clone());
+        let home_a = tempfile::tempdir().expect("创建临时 Home A");
+        let home_b = tempfile::tempdir().expect("创建临时 Home B");
+        let unrelated_home = tempfile::tempdir().expect("创建无关临时 Home");
+        let home_config = CodexHomeConfigService::system();
+        let old_provider = codex_catalog_provider("old-model");
+        let mut new_provider = codex_catalog_provider("new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        new_provider.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+        db.save_provider(AppType::Codex.as_str(), &old_provider)
+            .expect("保存旧供应商");
+        let unrelated_provider = Provider::with_id(
+            "provider-unrelated".to_string(),
+            "Unrelated".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "unrelated-token"},
+                "config": "base_url = \"https://unrelated.example.com/v1\"\n"
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &unrelated_provider)
+            .expect("保存无关供应商");
+        db.set_config_snippet(
+            AppType::Codex.as_str(),
+            Some("[features]\nweb_search = true\n".to_string()),
+        )
+        .expect("保存 Codex 通用配置");
+        for (profile_id, home, provider_id, port) in [
+            ("profile-a", home_a.path(), "provider-shared", 16_001),
+            ("profile-b", home_b.path(), "provider-shared", 16_002),
+            (
+                "profile-unrelated",
+                unrelated_home.path(),
+                "provider-unrelated",
+                16_003,
+            ),
+        ] {
+            db.insert_codex_profile(&CodexProfile {
+                id: profile_id.to_string(),
+                name: profile_id.to_string(),
+                canonical_home_path: home.display().to_string(),
+                listen_port: port,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .expect("保存 Profile");
+            db.save_codex_profile_route(&CodexProfileRoute {
+                profile_id: profile_id.to_string(),
+                current_provider_id: Some(provider_id.to_string()),
+                enabled: false,
+                live_backup_json: None,
+                last_error: None,
+                recovery_json: None,
+                updated_at: 1,
+            })
+            .expect("保存路由");
+        }
+        for home in [home_a.path(), home_b.path()] {
+            let old_plan = home_config
+                .build_direct_provider_plan(home, &old_provider)
+                .expect("构造旧直连配置计划");
+            home_config
+                .apply_direct_provider_plan(&old_plan)
+                .expect("应用旧直连配置");
+        }
+        let unrelated_plan = home_config
+            .build_direct_provider_plan(unrelated_home.path(), &unrelated_provider)
+            .expect("构造无关直连配置计划");
+        home_config
+            .apply_direct_provider_plan(&unrelated_plan)
+            .expect("应用无关直连配置");
+        let unrelated_before = fs::read(crate::codex_config::codex_config_path_for_home(
+            unrelated_home.path(),
+        ))
+        .expect("读取无关 Home 原配置");
+        let auth_bytes = br#"{"tokens":["profile-private-token"]}"#;
+        let session_bytes = b"private-session-history";
+        fs::write(home_a.path().join("auth.json"), auth_bytes).expect("写入 Profile 私有认证");
+        fs::create_dir_all(home_a.path().join("sessions")).expect("创建会话目录");
+        fs::write(home_a.path().join("sessions/history.jsonl"), session_bytes)
+            .expect("写入 Profile 私有会话");
+
+        state
+            .codex_route_manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await
+            .expect("共享供应商保存应成功");
+
+        for home in [home_a.path(), home_b.path()] {
+            let config = fs::read_to_string(crate::codex_config::codex_config_path_for_home(home))
+                .expect("读取同步后的直连配置");
+            assert!(config.contains("https://updated.example.com/v1"));
+            assert!(!config.contains("https://example.com/v1"));
+            assert!(config.contains("[features]"));
+            assert!(config.contains("web_search = true"));
+            let catalog = fs::read_to_string(home.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
+                .expect("读取同步后的模型目录");
+            assert!(catalog.contains("new-model"));
+            assert!(!catalog.contains("old-model"));
+        }
+        assert_eq!(
+            fs::read(crate::codex_config::codex_config_path_for_home(
+                unrelated_home.path()
+            ))
+            .expect("读取无关 Home 新配置"),
+            unrelated_before
+        );
+        assert_eq!(
+            fs::read(home_a.path().join("auth.json")).expect("读取 Profile 私有认证"),
+            auth_bytes
+        );
+        assert_eq!(
+            fs::read(home_a.path().join("sessions/history.jsonl")).expect("读取 Profile 私有会话"),
+            session_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_provider_save_preserves_database_managed_mcp_in_disabled_profile() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("创建临时 Profile Home");
+        let home_config = CodexHomeConfigService::system();
+        let old_provider = codex_catalog_provider("old-model");
+        let mut new_provider = codex_catalog_provider("new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)
+            .expect("保存旧供应商");
+        db.save_mcp_server(&McpServer {
+            id: "playwright".to_string(),
+            name: "Playwright".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": "npx",
+                "args": ["@playwright/mcp"]
+            }),
+            apps: McpApps {
+                codex: true,
+                ..Default::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        })
+        .expect("保存 Codex MCP");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-mcp".to_string(),
+            name: "Profile MCP".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("保存 Profile");
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-mcp".to_string(),
+            current_provider_id: Some(old_provider.id.clone()),
+            enabled: false,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })
+        .expect("保存关闭态路由");
+        let old_plan = home_config
+            .build_direct_provider_plan(home.path(), &old_provider)
+            .expect("构造旧直连计划");
+        home_config
+            .apply_direct_provider_plan(&old_plan)
+            .expect("应用旧直连计划");
+
+        state
+            .codex_route_manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await
+            .expect("供应商保存应保留 MCP");
+
+        let config =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取 Profile 配置");
+        assert!(config.contains("https://updated.example.com/v1"));
+        assert!(config.contains("[mcp_servers.playwright]"));
+        assert!(config.contains("command = \"npx\""));
     }
 }
 

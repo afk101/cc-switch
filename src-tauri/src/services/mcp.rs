@@ -2,14 +2,53 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 
 use crate::app_config::{AppType, McpServer};
+use crate::database::Database;
 use crate::error::AppError;
 use crate::mcp;
 use crate::store::AppState;
+use serde_json::Value;
 
 /// MCP 相关业务逻辑（v3.7.0 统一结构）
 pub struct McpService;
 
 impl McpService {
+    /// 读取数据库中仅对 Codex 启用的 MCP 服务器规范。
+    fn enabled_codex_server_specs(db: &Database) -> Result<HashMap<String, Value>, AppError> {
+        Ok(db
+            .get_all_mcp_servers()?
+            .into_iter()
+            .filter(|(_, server)| server.apps.is_enabled_for(&AppType::Codex))
+            .map(|(id, server)| (id, server.server))
+            .collect())
+    }
+
+    /// 将数据库中启用的 Codex MCP 投影到给定 TOML 文本。
+    pub(crate) fn project_enabled_codex_servers_to_config(
+        db: &Database,
+        base_text: &str,
+    ) -> Result<String, AppError> {
+        let enabled = Self::enabled_codex_server_specs(db)?;
+        mcp::project_enabled_servers_to_codex_config(base_text, &enabled)
+    }
+
+    /// 将数据库中启用的 Codex MCP 投影到一份供应商设置副本。
+    pub(crate) fn project_enabled_codex_servers_to_settings(
+        db: &Database,
+        settings: &Value,
+    ) -> Result<Value, AppError> {
+        let base_text = settings
+            .get("config")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let projected = Self::project_enabled_codex_servers_to_config(db, base_text)?;
+        let mut result = settings.clone();
+        let object = result.as_object_mut().ok_or_else(|| {
+            AppError::InvalidInput("Codex 供应商设置必须是 JSON 对象".to_string())
+        })?;
+        object.insert("config".to_string(), Value::String(projected));
+        Ok(result)
+    }
+
     /// 获取所有 MCP 服务器（统一结构）
     pub fn get_all_servers(state: &AppState) -> Result<IndexMap<String, McpServer>, AppError> {
         state.db.get_all_mcp_servers()

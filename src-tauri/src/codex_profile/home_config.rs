@@ -51,6 +51,13 @@ pub struct CodexDirectProviderConfigPlan {
     model_catalog: Option<CodexAuxiliaryFilePlan>,
 }
 
+impl CodexDirectProviderConfigPlan {
+    /// 返回计划所属的显式 Home，不暴露文件正文。
+    pub fn home_path(&self) -> &Path {
+        &self.config.home_path
+    }
+}
+
 /// 单个 Profile Home 的模型目录投影计划。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexModelCatalogProjectionPlan {
@@ -356,6 +363,27 @@ impl CodexHomeConfigService {
         provider: Option<&Provider>,
         listener_token: &str,
     ) -> Result<CodexRouteConfigPlan, AppError> {
+        self.build_profile_route_plan_with_base_transform(
+            home,
+            listen_port,
+            provider,
+            listener_token,
+            |current_toml| Ok(current_toml.to_string()),
+        )
+    }
+
+    /// 从同一次 Home 快照变换基础 TOML 后构造 Profile 路由计划。
+    pub(crate) fn build_profile_route_plan_with_base_transform<F>(
+        &self,
+        home: &Path,
+        listen_port: u16,
+        provider: Option<&Provider>,
+        listener_token: &str,
+        transform: F,
+    ) -> Result<CodexRouteConfigPlan, AppError>
+    where
+        F: FnOnce(&str) -> Result<String, AppError>,
+    {
         let current = self.inspect(home)?;
         let current_toml = current
             .content
@@ -364,9 +392,11 @@ impl CodexHomeConfigService {
             .transpose()
             .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
             .unwrap_or("");
-        self.build_route_plan(
+        let base_toml = transform(current_toml)?;
+        self.build_route_plan_from_snapshot(
             home,
-            &build_codex_profile_route_toml(current_toml, listen_port, provider, listener_token),
+            current,
+            &build_codex_profile_route_toml(&base_toml, listen_port, provider, listener_token),
         )
     }
 

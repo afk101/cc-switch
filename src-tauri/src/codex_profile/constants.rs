@@ -80,3 +80,5 @@ pub const CODEX_CATALOG_SYNC_COMPENSATION_ERROR: &str =
     "Codex Profile 模型目录同步失败，补偿未收敛";
 /// 启动模型目录对账错误的稳定前缀，仅用于识别并清理本类错误。
 pub const CODEX_CATALOG_RECONCILE_ERROR_PREFIX: &str = "Codex Profile 模型目录对账失败";
+/// 启动完整派生状态对账错误的稳定前缀，仅用于识别并清理本类错误。
+pub const CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX: &str = "Codex Profile 派生状态对账失败";

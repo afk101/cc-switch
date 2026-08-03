@@ -42,6 +42,60 @@ fn collect_enabled_servers(cfg: &McpConfig) -> HashMap<String, Value> {
     out
 }
 
+/// 把启用的 MCP 服务器投影到给定 Codex TOML，并保留其它配置段。
+pub(crate) fn project_enabled_servers_to_codex_config(
+    base_text: &str,
+    enabled: &HashMap<String, Value>,
+) -> Result<String, AppError> {
+    use toml_edit::{Item, Table};
+
+    // 3) 使用 toml_edit 解析（允许空文件）
+    let mut doc = if base_text.trim().is_empty() {
+        toml_edit::DocumentMut::default()
+    } else {
+        base_text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| AppError::McpValidation(format!("解析 config.toml 失败: {e}")))?
+    };
+
+    // 4) 清理可能存在的错误格式 [mcp.servers]
+    if let Some(mcp_item) = doc.get_mut("mcp") {
+        if let Some(tbl) = mcp_item.as_table_like_mut() {
+            if tbl.contains_key("servers") {
+                log::warn!("检测到错误的 MCP 格式 [mcp.servers]，正在清理并迁移到 [mcp_servers]");
+                tbl.remove("servers");
+            }
+        }
+    }
+
+    // 5) 构造目标 servers 表（稳定的键顺序）
+    if enabled.is_empty() {
+        // 无启用项：移除 mcp_servers 表
+        doc.as_table_mut().remove("mcp_servers");
+    } else {
+        // 构建 servers 表
+        let mut servers_tbl = Table::new();
+        let mut ids: Vec<_> = enabled.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            let spec = enabled.get(&id).expect("spec must exist");
+            // 复用通用转换函数（已包含扩展字段支持）
+            match json_server_to_toml_table(spec) {
+                Ok(table) => {
+                    servers_tbl[&id[..]] = Item::Table(table);
+                }
+                Err(err) => {
+                    log::error!("跳过无效的 MCP 服务器 '{id}': {err}");
+                }
+            }
+        }
+        // 使用唯一正确的格式：[mcp_servers]
+        doc["mcp_servers"] = Item::Table(servers_tbl);
+    }
+
+    Ok(doc.to_string())
+}
+
 /// 从 ~/.codex/config.toml 导入 MCP 到统一结构（v3.7.0+）
 ///
 /// 格式支持：
@@ -287,7 +341,6 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
     if !should_sync_codex_mcp() {
         return Ok(());
     }
-    use toml_edit::{Item, Table};
 
     // 1) 收集启用项（Codex 维度）
     let enabled = collect_enabled_servers(&config.mcp.codex);
@@ -295,52 +348,8 @@ pub fn sync_enabled_to_codex(config: &MultiAppConfig) -> Result<(), AppError> {
     // 2) 读取现有 config.toml 文本；保持无效 TOML 的错误返回（不覆盖文件）
     let base_text = crate::codex_config::read_and_validate_codex_config_text()?;
 
-    // 3) 使用 toml_edit 解析（允许空文件）
-    let mut doc = if base_text.trim().is_empty() {
-        toml_edit::DocumentMut::default()
-    } else {
-        base_text
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| AppError::McpValidation(format!("解析 config.toml 失败: {e}")))?
-    };
-
-    // 4) 清理可能存在的错误格式 [mcp.servers]
-    if let Some(mcp_item) = doc.get_mut("mcp") {
-        if let Some(tbl) = mcp_item.as_table_like_mut() {
-            if tbl.contains_key("servers") {
-                log::warn!("检测到错误的 MCP 格式 [mcp.servers]，正在清理并迁移到 [mcp_servers]");
-                tbl.remove("servers");
-            }
-        }
-    }
-
-    // 5) 构造目标 servers 表（稳定的键顺序）
-    if enabled.is_empty() {
-        // 无启用项：移除 mcp_servers 表
-        doc.as_table_mut().remove("mcp_servers");
-    } else {
-        // 构建 servers 表
-        let mut servers_tbl = Table::new();
-        let mut ids: Vec<_> = enabled.keys().cloned().collect();
-        ids.sort();
-        for id in ids {
-            let spec = enabled.get(&id).expect("spec must exist");
-            // 复用通用转换函数（已包含扩展字段支持）
-            match json_server_to_toml_table(spec) {
-                Ok(table) => {
-                    servers_tbl[&id[..]] = Item::Table(table);
-                }
-                Err(err) => {
-                    log::error!("跳过无效的 MCP 服务器 '{id}': {err}");
-                }
-            }
-        }
-        // 使用唯一正确的格式：[mcp_servers]
-        doc["mcp_servers"] = Item::Table(servers_tbl);
-    }
-
     // 6) 写回（仅改 TOML，不触碰 auth.json）；toml_edit 会尽量保留未改区域的注释/空白/顺序
-    let new_text = doc.to_string();
+    let new_text = project_enabled_servers_to_codex_config(&base_text, &enabled)?;
     let path = crate::codex_config::get_codex_config_path();
     crate::config::write_text_file(&path, &new_text)?;
     Ok(())
@@ -682,6 +691,30 @@ pub(super) fn json_server_to_toml_table(spec: &Value) -> Result<toml_edit::Table
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_server_projection_preserves_other_codex_config_sections() {
+        let base = "model = \"gpt-test\"\n[features]\nweb_search = true\n[mcp.servers.legacy]\ncommand = \"legacy\"\n";
+        let enabled = HashMap::from([(
+            "playwright".to_string(),
+            json!({
+                "type": "stdio",
+                "command": "npx",
+                "args": ["@playwright/mcp"]
+            }),
+        )]);
+
+        let projected =
+            project_enabled_servers_to_codex_config(base, &enabled).expect("MCP 投影应成功");
+
+        assert!(projected.contains("model = \"gpt-test\""));
+        assert!(projected.contains("[features]"));
+        assert!(projected.contains("web_search = true"));
+        assert!(projected.contains("[mcp_servers.playwright]"));
+        assert!(projected.contains("command = \"npx\""));
+        assert!(!projected.contains("mcp.servers"));
+        assert!(!projected.contains("legacy"));
+    }
 
     #[test]
     fn http_headers_are_only_written_to_codex_http_headers() {

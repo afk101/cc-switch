@@ -741,6 +741,54 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn prepared_codex_provider_commit_does_not_rewrite_global_live_config() {
+        with_test_home(|state, home| {
+            let original = Provider::with_id(
+                "codex-commit".to_string(),
+                "Before".to_string(),
+                codex_settings("https://before.example/v1", "test-before"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &original)
+                .expect("保存原供应商");
+            let codex_home = home.join(".codex");
+            fs::create_dir_all(&codex_home).expect("创建 Codex Home");
+            let live_path = codex_home.join("config.toml");
+            let routed_live = "model_provider = \"cc-switch-profile\"\n";
+            fs::write(&live_path, routed_live).expect("写入已接管 Live");
+            let incoming = Provider::with_id(
+                "codex-commit".to_string(),
+                "After".to_string(),
+                codex_settings("https://after.example/v1", "test-after"),
+                None,
+            );
+            let prepared = ProviderService::prepare_codex_provider_update(
+                state,
+                Some("codex-commit"),
+                incoming,
+            )
+            .expect("预检应成功");
+
+            ProviderService::commit_prepared_codex_provider_update(state, &prepared)
+                .expect("数据库提交应成功");
+
+            assert_eq!(
+                fs::read_to_string(&live_path).expect("读取已接管 Live"),
+                routed_live
+            );
+            let stored = state
+                .db
+                .get_provider_by_id("codex-commit", AppType::Codex.as_str())
+                .expect("读取已提交供应商")
+                .expect("供应商存在");
+            assert_eq!(stored.name, "After");
+        });
+    }
+
+    #[test]
     fn codex_provider_update_preflight_rejects_id_change_before_write() {
         with_test_home(|state, _| {
             let incoming = Provider::with_id(
@@ -2220,6 +2268,15 @@ impl ProviderService {
         )?;
         Self::normalize_usage_script_credential_overrides(&AppType::Codex, &mut provider);
         Ok(provider)
+    }
+
+    /// 只提交已校验的 Codex 供应商，不触发全局 Live 或备份写入。
+    pub(crate) fn commit_prepared_codex_provider_update(
+        state: &AppState,
+        provider: &Provider,
+    ) -> Result<bool, AppError> {
+        state.db.save_provider(AppType::Codex.as_str(), provider)?;
+        Ok(true)
     }
 
     /// Update a provider

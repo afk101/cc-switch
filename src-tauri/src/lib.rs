@@ -1308,14 +1308,14 @@ pub fn run() {
                 if codex_ownership_ready {
                     if let Err(error) = state
                         .codex_route_manager
-                        .reconcile_all_profile_catalogs()
+                        .reconcile_all_profile_derived_state(state.db.as_ref())
                         .await
                     {
-                        log::warn!("Codex Profile 模型目录启动对账失败: {error}");
+                        log::warn!("Codex Profile 派生状态启动对账失败: {error}");
                     }
                     if let Err(error) = state
                         .codex_route_manager
-                        .restore_enabled_profiles()
+                        .restore_enabled_profiles_with_effective_settings(state.db.as_ref())
                         .await
                     {
                         log::warn!("恢复 Codex Profile 路由失败: {error}");
