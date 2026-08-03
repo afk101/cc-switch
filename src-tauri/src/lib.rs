@@ -1303,6 +1303,17 @@ pub fn run() {
                     }
                 }
 
+                // 必须排在 auto-extract 之前：先把历史泄漏进 Gemini 共享片段的凭据
+                // 清干净，否则紧接着的提取会基于被污染的 live 再写一遍。
+                if let Err(e) =
+                    crate::services::provider::ProviderService::scrub_leaked_gemini_common_config(
+                        &state,
+                    )
+                    .await
+                {
+                    log::warn!("清理 Gemini 通用配置泄漏凭据失败: {e}");
+                }
+
                 initialize_common_config_snippets(&state);
 
                 if codex_ownership_ready {
@@ -1523,6 +1534,7 @@ pub fn run() {
             commands::get_codex_oauth_quota,
             commands::get_codex_oauth_models,
             commands::get_xai_oauth_models,
+            commands::get_xai_oauth_quota,
             commands::get_coding_plan_quota,
             commands::get_balance,
             // New MCP via config.json (SSOT)
@@ -1668,7 +1680,11 @@ pub fn run() {
             commands::get_request_detail,
             commands::get_model_pricing,
             commands::update_model_pricing,
+            commands::update_model_pricing_batch,
             commands::delete_model_pricing,
+            commands::get_models_dev_sync_config,
+            commands::save_models_dev_sync_config,
+            commands::record_models_dev_sync_result,
             commands::check_provider_limits,
             // Session usage sync
             commands::sync_session_usage,
