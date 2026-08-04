@@ -492,6 +492,11 @@ impl Database {
                         Self::migrate_v15_to_v16(conn)?;
                         Self::set_user_version(conn, 16)?;
                     }
+                    16 => {
+                        log::info!("迁移数据库从 v16 到 v17（补齐 Grok Build Skills/MCP 开关）");
+                        Self::migrate_v16_to_v17(conn)?;
+                        Self::set_user_version(conn, 17)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1736,6 +1741,11 @@ impl Database {
         Self::ensure_grokbuild_skill_mcp_schema(conn)?;
         let codex_dir = crate::codex_config::get_codex_config_dir();
         crate::services::session_usage_codex::reset_codex_usage_on_conn(conn, &codex_dir)
+    }
+
+    /// v16 -> v17：补齐被历史同版本分支跳过的 Grok Build Skills/MCP 开关。
+    fn migrate_v16_to_v17(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_grokbuild_skill_mcp_schema(conn)
     }
 
     /// 插入默认模型定价数据
@@ -3408,6 +3418,83 @@ mod tests {
     }
 
     #[test]
+    fn migrate_v16_to_v17_repairs_missing_grokbuild_flags_idempotently() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE mcp_servers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                server_config TEXT NOT NULL,
+                description TEXT,
+                homepage TEXT,
+                docs TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                enabled_claude BOOLEAN NOT NULL DEFAULT 0,
+                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+                enabled_gemini BOOLEAN NOT NULL DEFAULT 0,
+                enabled_opencode BOOLEAN NOT NULL DEFAULT 0,
+                enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+            );
+            CREATE TABLE skills (
+                id TEXT PRIMARY KEY,
+                enabled_codex BOOLEAN NOT NULL DEFAULT 0,
+                enabled_hermes BOOLEAN NOT NULL DEFAULT 0
+            );
+            INSERT INTO mcp_servers (
+                id, name, server_config, enabled_claude, enabled_codex,
+                enabled_gemini, enabled_opencode, enabled_hermes
+            ) VALUES ('mcp-legacy', 'Legacy MCP', '{}', 1, 1, 0, 1, 1);
+            INSERT INTO skills (id, enabled_codex, enabled_hermes)
+            VALUES ('skill-legacy', 1, 1);",
+        )?;
+        Database::set_user_version(&conn, 16)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+        Database::set_user_version(&conn, 16)?;
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 17);
+        assert!(Database::has_column(
+            &conn,
+            "mcp_servers",
+            "enabled_grokbuild"
+        )?);
+        assert!(Database::has_column(&conn, "skills", "enabled_grokbuild")?);
+        let mcp_values: (String, i64, i64, i64, i64, i64, i64) = conn.query_row(
+            "SELECT name, enabled_claude, enabled_codex, enabled_gemini,
+                    enabled_grokbuild, enabled_opencode, enabled_hermes
+             FROM mcp_servers WHERE id = 'mcp-legacy'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        let skill_values: (i64, i64, i64) = conn.query_row(
+            "SELECT enabled_codex, enabled_grokbuild, enabled_hermes
+             FROM skills WHERE id = 'skill-legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(mcp_values, ("Legacy MCP".to_string(), 1, 1, 0, 0, 1, 1));
+        assert_eq!(skill_values, (1, 0, 1));
+
+        let db = Database {
+            conn: std::sync::Mutex::new(conn),
+        };
+        let servers = db.get_all_mcp_servers()?;
+        assert!(!servers["mcp-legacy"].apps.grokbuild);
+        Ok(())
+    }
+
+    #[test]
     fn migrate_v15_to_v16_resets_only_codex_session_usage() -> Result<(), AppError> {
         let conn = Connection::open_in_memory()?;
         Database::create_tables_on_conn(&conn)?;
@@ -3433,7 +3520,7 @@ mod tests {
 
         Database::apply_schema_migrations_on_conn(&conn)?;
 
-        assert_eq!(Database::get_user_version(&conn)?, 16);
+        assert_eq!(Database::get_user_version(&conn)?, 17);
         let counts: (i64, i64, i64, i64) = conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'),
