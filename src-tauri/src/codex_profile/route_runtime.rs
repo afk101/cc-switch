@@ -12,14 +12,56 @@ use crate::proxy::{
 };
 use std::sync::Arc;
 use std::{future::Future, pin::Pin};
+use thiserror::Error;
 use tokio::sync::RwLock;
 
 /// Route manager 使用的异步返回类型，避免将测试替身绑定到真实监听器。
 pub type CodexRouteRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Profile 监听器启动失败及其类型化分类。
+#[derive(Debug, Error)]
+pub enum CodexRouteRuntimeStartError {
+    #[error("{message}")]
+    BindFailed {
+        kind: Option<std::io::ErrorKind>,
+        message: String,
+    },
+    #[error("{message}")]
+    AlreadyRunning { message: String },
+    #[error("{message}")]
+    Other { message: String },
+}
+
+impl CodexRouteRuntimeStartError {
+    /// 从代理错误中提取启动诊断需要的安全分类。
+    fn from_proxy_error(error: &ProxyError) -> Self {
+        match error {
+            ProxyError::BindFailed { kind, .. } => Self::BindFailed {
+                kind: *kind,
+                message: error.to_string(),
+            },
+            ProxyError::AlreadyRunning => Self::AlreadyRunning {
+                message: error.to_string(),
+            },
+            _ => Self::Other {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// 为测试替身构造包含敏感原文的端口绑定失败，验证诊断边界会脱敏。
+    #[cfg(test)]
+    pub(crate) fn bind_failed(kind: std::io::ErrorKind, message: String) -> Self {
+        Self::BindFailed {
+            kind: Some(kind),
+            message,
+        }
+    }
+}
+
 /// Profile 路由运行时的最小生命周期契约。
 pub trait CodexRouteRuntime: Send + Sync {
-    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>>;
+    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>>;
     fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool>;
     fn swap_provider_snapshot(
         &self,
@@ -247,12 +289,12 @@ impl RouteRuntime {
 }
 
 impl CodexRouteRuntime for RouteRuntime {
-    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+    fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
         Box::pin(async move {
-            RouteRuntime::start(self)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            match RouteRuntime::start(self).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(CodexRouteRuntimeStartError::from_proxy_error(&error)),
+            }
         })
     }
 

@@ -15,7 +15,7 @@ use crate::codex_profile::{
     CodexHomeConfigService, CodexHomeReconcileOwnership, CodexModelCatalogProjectionPlan,
     CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
     CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
-    CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
+    CodexRouteRuntimeStartError, CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
     CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
     CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
@@ -27,7 +27,18 @@ use crate::codex_profile::{
     CODEX_ROUTE_RECOVERY_PHASE_RECONCILE_PREPARED,
     CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED,
     CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED,
-    CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED,
+    CODEX_ROUTE_RECOVERY_PHASE_SWITCH_RUNTIME_SWAPPED, CODEX_STARTUP_RESTORE_CATEGORY_DATABASE,
+    CODEX_STARTUP_RESTORE_CATEGORY_DERIVED_STATE, CODEX_STARTUP_RESTORE_CATEGORY_FILE_IO,
+    CODEX_STARTUP_RESTORE_CATEGORY_HEALTH_CHECK, CODEX_STARTUP_RESTORE_CATEGORY_INVALID_CONFIG,
+    CODEX_STARTUP_RESTORE_CATEGORY_PORT_BIND, CODEX_STARTUP_RESTORE_CATEGORY_PROVIDER_PLAN,
+    CODEX_STARTUP_RESTORE_CATEGORY_RECOVERY_STATE, CODEX_STARTUP_RESTORE_CATEGORY_RUNTIME_STATE,
+    CODEX_STARTUP_RESTORE_CATEGORY_TOKEN_STORE, CODEX_STARTUP_RESTORE_CATEGORY_UNKNOWN,
+    CODEX_STARTUP_RESTORE_OPERATION, CODEX_STARTUP_RESTORE_STAGE_ACQUIRE_LOCK,
+    CODEX_STARTUP_RESTORE_STAGE_BUILD_PLAN, CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
+    CODEX_STARTUP_RESTORE_STAGE_HEALTH_CHECK, CODEX_STARTUP_RESTORE_STAGE_READ_ROUTE,
+    CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME, CODEX_STARTUP_RESTORE_STAGE_RECOVER_PENDING,
+    CODEX_STARTUP_RESTORE_STAGE_RUNTIME_START, CODEX_STARTUP_RESTORE_STAGE_TRACK_RUNTIME,
+    CODEX_STARTUP_RESTORE_STAGE_VALIDATE_PROFILE,
 };
 use crate::database::Database;
 use crate::error::AppError;
@@ -96,6 +107,20 @@ pub trait CodexProfileTokenStore: Send + Sync {
     fn delete_token(&self, profile_id: &str) -> Result<(), AppError>;
 }
 
+/// 启动恢复诊断的输出边界，生产环境写入应用日志，测试可观察同一事件。
+trait CodexStartupRestoreDiagnosticLogger: Send + Sync {
+    fn warn(&self, message: &str);
+}
+
+/// 将启动恢复诊断写入应用日志的生产实现。
+struct SystemCodexStartupRestoreDiagnosticLogger;
+
+impl CodexStartupRestoreDiagnosticLogger for SystemCodexStartupRestoreDiagnosticLogger {
+    fn warn(&self, message: &str) {
+        log::warn!("{message}");
+    }
+}
+
 impl CodexProfileTokenStore for CodexProfileSecretStore {
     fn read_token(&self, profile_id: &str) -> Result<Option<String>, AppError> {
         self.read(profile_id)
@@ -117,6 +142,7 @@ pub struct CodexRouteManager {
     runtimes: Mutex<HashMap<String, Arc<dyn CodexRouteRuntime>>>,
     locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     catalog_sync_lock: AsyncMutex<()>,
+    startup_restore_diagnostic_logger: Arc<dyn CodexStartupRestoreDiagnosticLogger>,
 }
 
 /// 共享供应商保存时从数据库重新读取的单个 Profile 引用快照。
@@ -169,6 +195,245 @@ struct RouteRecoverySnapshot {
     failover_ids: Vec<String>,
 }
 
+/// 单个 Profile 启动恢复失败及其稳定阶段。
+struct CodexStartupRestoreFailure {
+    stage: &'static str,
+    cause: CodexStartupRestoreFailureCause,
+}
+
+/// 启动恢复登记运行时失败的非敏感原因。
+#[derive(Clone, Copy)]
+enum CodexRuntimeTrackingFailureReason {
+    Conflict,
+    Lock,
+}
+
+/// 启动恢复诊断允许进入脱敏器的类型化失败来源。
+enum CodexStartupRestoreFailureCause {
+    App(AppError),
+    RuntimeStart(CodexRouteRuntimeStartError),
+    HealthCheck {
+        stop_failed: bool,
+    },
+    RuntimeTracking {
+        reason: CodexRuntimeTrackingFailureReason,
+        stop_failed: bool,
+    },
+}
+
+impl CodexStartupRestoreFailure {
+    /// 为普通应用错误附加稳定恢复阶段。
+    fn app(stage: &'static str, error: AppError) -> Self {
+        Self {
+            stage,
+            cause: CodexStartupRestoreFailureCause::App(error),
+        }
+    }
+
+    /// 为运行时启动错误保留类型化分类。
+    fn runtime_start(error: CodexRouteRuntimeStartError) -> Self {
+        Self {
+            stage: CODEX_STARTUP_RESTORE_STAGE_RUNTIME_START,
+            cause: CodexStartupRestoreFailureCause::RuntimeStart(error),
+        }
+    }
+
+    /// 构造不携带底层正文的健康检查失败。
+    fn health_check(stop_failed: bool) -> Self {
+        Self {
+            stage: CODEX_STARTUP_RESTORE_STAGE_HEALTH_CHECK,
+            cause: CodexStartupRestoreFailureCause::HealthCheck { stop_failed },
+        }
+    }
+
+    /// 构造不携带底层正文的运行时登记失败。
+    fn runtime_tracking(reason: CodexRuntimeTrackingFailureReason, stop_failed: bool) -> Self {
+        Self {
+            stage: CODEX_STARTUP_RESTORE_STAGE_TRACK_RUNTIME,
+            cause: CodexStartupRestoreFailureCause::RuntimeTracking {
+                reason,
+                stop_failed,
+            },
+        }
+    }
+}
+
+/// 同时写入应用日志与路由状态的启动恢复安全诊断。
+struct CodexStartupRestoreDiagnostic {
+    profile_id: String,
+    profile_name: String,
+    home_path: String,
+    stage: &'static str,
+    category: &'static str,
+    summary: String,
+}
+
+impl CodexStartupRestoreDiagnostic {
+    /// 从类型化失败构造不包含秘密的诊断记录。
+    fn from_failure(profile: &CodexProfile, failure: &CodexStartupRestoreFailure) -> Self {
+        let (category, summary) = classify_startup_restore_failure(profile, failure);
+        Self {
+            profile_id: sanitize_diagnostic_text(&profile.id),
+            profile_name: sanitize_diagnostic_text(&profile.name),
+            home_path: sanitize_diagnostic_text(&profile.canonical_home_path),
+            stage: failure.stage,
+            category,
+            summary,
+        }
+    }
+
+    /// 输出结构稳定的单行诊断文本。
+    fn render(&self) -> String {
+        format!(
+            "Codex Profile 启动恢复失败: operation={} profile_id={} profile_name={} home={} stage={} category={} summary={}",
+            CODEX_STARTUP_RESTORE_OPERATION,
+            self.profile_id,
+            self.profile_name,
+            self.home_path,
+            self.stage,
+            self.category,
+            self.summary
+        )
+    }
+}
+
+/// 仅保留可安全进入单行日志的文本字符。
+fn sanitize_diagnostic_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '�'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+/// 根据类型化错误和恢复阶段生成稳定分类与安全摘要。
+fn classify_startup_restore_failure(
+    profile: &CodexProfile,
+    failure: &CodexStartupRestoreFailure,
+) -> (&'static str, String) {
+    match &failure.cause {
+        CodexStartupRestoreFailureCause::RuntimeStart(
+            CodexRouteRuntimeStartError::BindFailed { kind, .. },
+        ) => (
+            CODEX_STARTUP_RESTORE_CATEGORY_PORT_BIND,
+            format!(
+                "监听地址 127.0.0.1:{} 绑定失败，io_kind={:?}",
+                profile.listen_port, kind
+            ),
+        ),
+        CodexStartupRestoreFailureCause::RuntimeStart(
+            CodexRouteRuntimeStartError::AlreadyRunning { .. },
+        ) => (
+            CODEX_STARTUP_RESTORE_CATEGORY_RUNTIME_STATE,
+            "Profile 监听器已经运行".to_string(),
+        ),
+        CodexStartupRestoreFailureCause::RuntimeStart(CodexRouteRuntimeStartError::Other {
+            ..
+        }) => (
+            CODEX_STARTUP_RESTORE_CATEGORY_UNKNOWN,
+            "Profile 监听器启动失败，底层错误已隐藏".to_string(),
+        ),
+        CodexStartupRestoreFailureCause::HealthCheck { stop_failed } => (
+            CODEX_STARTUP_RESTORE_CATEGORY_HEALTH_CHECK,
+            if *stop_failed {
+                "Profile 监听器启动后健康检查失败，停止监听器也失败".to_string()
+            } else {
+                "Profile 监听器启动后健康检查失败".to_string()
+            },
+        ),
+        CodexStartupRestoreFailureCause::RuntimeTracking {
+            reason,
+            stop_failed,
+        } => {
+            let reason_summary = match reason {
+                CodexRuntimeTrackingFailureReason::Conflict => "Profile 运行时登记冲突",
+                CodexRuntimeTrackingFailureReason::Lock => "Profile 运行时表锁访问失败",
+            };
+            let cleanup_summary = if *stop_failed {
+                "，停止新建监听器也失败"
+            } else {
+                "，已停止新建监听器"
+            };
+            (
+                CODEX_STARTUP_RESTORE_CATEGORY_RUNTIME_STATE,
+                format!("{reason_summary}{cleanup_summary}"),
+            )
+        }
+        CodexStartupRestoreFailureCause::App(error) => {
+            classify_startup_restore_app_error(failure.stage, error)
+        }
+    }
+}
+
+/// 将应用错误限制为路径、I/O 类别或固定安全摘要。
+fn classify_startup_restore_app_error(
+    stage: &'static str,
+    error: &AppError,
+) -> (&'static str, String) {
+    match error {
+        AppError::Io { path, source } => (
+            CODEX_STARTUP_RESTORE_CATEGORY_FILE_IO,
+            format!(
+                "文件 I/O 失败，path={} io_kind={:?}",
+                sanitize_diagnostic_text(path),
+                source.kind()
+            ),
+        ),
+        AppError::IoContext { source, .. } => (
+            CODEX_STARTUP_RESTORE_CATEGORY_FILE_IO,
+            format!("文件 I/O 失败，io_kind={:?}", source.kind()),
+        ),
+        AppError::Json { path, .. } | AppError::Toml { path, .. } => (
+            CODEX_STARTUP_RESTORE_CATEGORY_INVALID_CONFIG,
+            format!("配置文件解析失败，path={}", sanitize_diagnostic_text(path)),
+        ),
+        AppError::Database(_) => (
+            CODEX_STARTUP_RESTORE_CATEGORY_DATABASE,
+            "数据库操作失败，底层错误已隐藏".to_string(),
+        ),
+        _ => match stage {
+            CODEX_STARTUP_RESTORE_STAGE_VALIDATE_PROFILE => (
+                CODEX_STARTUP_RESTORE_CATEGORY_INVALID_CONFIG,
+                "Profile 校验失败，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_RECOVER_PENDING => (
+                CODEX_STARTUP_RESTORE_CATEGORY_RECOVERY_STATE,
+                "待处理生命周期状态未收敛，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN => (
+                CODEX_STARTUP_RESTORE_CATEGORY_TOKEN_STORE,
+                "本地监听凭证访问失败，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_BUILD_PLAN => (
+                CODEX_STARTUP_RESTORE_CATEGORY_PROVIDER_PLAN,
+                "恢复计划构造失败，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME => (
+                CODEX_STARTUP_RESTORE_CATEGORY_DERIVED_STATE,
+                "Profile 派生状态对账失败，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_ACQUIRE_LOCK
+            | CODEX_STARTUP_RESTORE_STAGE_TRACK_RUNTIME => (
+                CODEX_STARTUP_RESTORE_CATEGORY_RUNTIME_STATE,
+                "Profile 运行时状态操作失败，底层错误已隐藏".to_string(),
+            ),
+            CODEX_STARTUP_RESTORE_STAGE_READ_ROUTE => (
+                CODEX_STARTUP_RESTORE_CATEGORY_DATABASE,
+                "路由读取失败，底层错误已隐藏".to_string(),
+            ),
+            _ => (
+                CODEX_STARTUP_RESTORE_CATEGORY_UNKNOWN,
+                "启动恢复失败，底层错误已隐藏".to_string(),
+            ),
+        },
+    }
+}
+
 impl CodexRouteManager {
     /// 使用注入依赖创建 Profile 隔离路由管理器。
     pub fn new(
@@ -185,7 +450,18 @@ impl CodexRouteManager {
             runtimes: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             catalog_sync_lock: AsyncMutex::new(()),
+            startup_restore_diagnostic_logger: Arc::new(SystemCodexStartupRestoreDiagnosticLogger),
         }
+    }
+
+    /// 替换启动恢复诊断输出边界，供高层测试观察应用日志事件。
+    #[cfg(test)]
+    fn with_startup_restore_diagnostic_logger(
+        mut self,
+        logger: Arc<dyn CodexStartupRestoreDiagnosticLogger>,
+    ) -> Self {
+        self.startup_restore_diagnostic_logger = logger;
+        self
     }
 
     /// 判断是否存在任意已启用的 Profile 路由，用于启动时裁决 Codex Home 所有权。
@@ -675,7 +951,7 @@ impl CodexRouteManager {
         );
 
         if let Err(error) = runtime.start().await {
-            let operation_error = AppError::Message(error);
+            let operation_error = AppError::Message(error.to_string());
             let compensation_error = self
                 .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
                 .await;
@@ -1394,38 +1670,69 @@ impl CodexRouteManager {
         db: Option<&Database>,
     ) -> Result<(), AppError> {
         for profile in self.persistence.list_profiles()? {
-            let result = async {
-                let lock = self.profile_lock(&profile.id)?;
+            let result: Result<(), CodexStartupRestoreFailure> = async {
+                let lock = self.profile_lock(&profile.id).map_err(|error| {
+                    CodexStartupRestoreFailure::app(CODEX_STARTUP_RESTORE_STAGE_ACQUIRE_LOCK, error)
+                })?;
                 let _guard = lock.lock().await;
-                let profile = self.persistence.get_profile(&profile.id)?;
-                profile.validate_route_operation()?;
-                self.recover_pending_locked(&profile.id).await?;
-                let Some(route) = self.persistence.get_route(&profile.id)? else {
+                let profile = self.persistence.get_profile(&profile.id).map_err(|error| {
+                    CodexStartupRestoreFailure::app(
+                        CODEX_STARTUP_RESTORE_STAGE_VALIDATE_PROFILE,
+                        error,
+                    )
+                })?;
+                profile.validate_route_operation().map_err(|error| {
+                    CodexStartupRestoreFailure::app(
+                        CODEX_STARTUP_RESTORE_STAGE_VALIDATE_PROFILE,
+                        error,
+                    )
+                })?;
+                self.recover_pending_locked(&profile.id)
+                    .await
+                    .map_err(|error| {
+                        CodexStartupRestoreFailure::app(
+                            CODEX_STARTUP_RESTORE_STAGE_RECOVER_PENDING,
+                            error,
+                        )
+                    })?;
+                let Some(route) = self.persistence.get_route(&profile.id).map_err(|error| {
+                    CodexStartupRestoreFailure::app(CODEX_STARTUP_RESTORE_STAGE_READ_ROUTE, error)
+                })?
+                else {
                     return Ok(());
                 };
                 if !route.enabled {
                     return Ok(());
                 }
-                let token = self.secret_store.ensure_token(&profile.id)?;
-                let (snapshot, plan) = self.build_restore_plan(&profile, &route, &token, db)?;
-                self.reconcile_enabled_home(&profile, &route, &plan)?;
+                let token = self
+                    .secret_store
+                    .ensure_token(&profile.id)
+                    .map_err(|error| {
+                        CodexStartupRestoreFailure::app(
+                            CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
+                            error,
+                        )
+                    })?;
+                let (snapshot, plan) = self
+                    .build_restore_plan(&profile, &route, &token, db)
+                    .map_err(|error| {
+                        CodexStartupRestoreFailure::app(
+                            CODEX_STARTUP_RESTORE_STAGE_BUILD_PLAN,
+                            error,
+                        )
+                    })?;
+                self.reconcile_enabled_home(&profile, &route, &plan)
+                    .map_err(|error| {
+                        CodexStartupRestoreFailure::app(
+                            CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
+                            error,
+                        )
+                    })?;
                 self.start_restored_runtime(&profile, token, snapshot).await
             }
             .await;
-            if result.is_err() {
-                if let Err(persist_error) = self.persist_restore_error_summary(&profile) {
-                    log::warn!(
-                        "记录 Codex Profile {} 恢复错误失败: {}",
-                        profile.id,
-                        persist_error
-                    );
-                }
-                log::warn!(
-                    "Codex Profile {} ({}) 恢复失败；Home {}，已记录脱敏错误摘要",
-                    profile.id,
-                    profile.name,
-                    profile.canonical_home_path
-                );
+            if let Err(failure) = result {
+                self.record_startup_restore_failure(&profile, &failure);
             }
         }
         Ok(())
@@ -1601,7 +1908,7 @@ impl CodexRouteManager {
         profile: &CodexProfile,
         listener_token: String,
         snapshot: CodexRouteProviderSnapshot,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), CodexStartupRestoreFailure> {
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
                 profile_id: profile.id.clone(),
@@ -1611,17 +1918,26 @@ impl CodexRouteManager {
             listener_token,
             snapshot,
         );
-        runtime.start().await.map_err(AppError::Message)?;
+        runtime
+            .start()
+            .await
+            .map_err(CodexStartupRestoreFailure::runtime_start)?;
         if !runtime.health_check().await {
             let stop_failed = Self::reject_new_requests_and_stop_runtime(runtime.clone())
                 .await
                 .is_err();
-            self.persist_error_summary(&profile.id, "恢复健康检查失败", stop_failed)?;
-            return Err(AppError::Message(
-                "Codex Profile 路由健康检查失败".to_string(),
+            return Err(CodexStartupRestoreFailure::health_check(stop_failed));
+        }
+        if let Err(reason) = self.track_restored_runtime(profile.id.clone(), runtime.clone()) {
+            let stop_failed = Self::reject_new_requests_and_stop_runtime(runtime)
+                .await
+                .is_err();
+            return Err(CodexStartupRestoreFailure::runtime_tracking(
+                reason,
+                stop_failed,
             ));
         }
-        self.track_runtime(profile.id.clone(), runtime)
+        Ok(())
     }
 
     /// 返回 Profile 当前运行状态。
@@ -1751,6 +2067,23 @@ impl CodexRouteManager {
             .lock()
             .map_err(|error| AppError::Lock(error.to_string()))?
             .insert(profile_id, runtime);
+        Ok(())
+    }
+
+    /// 启动恢复登记运行时时拒绝覆盖既有实例，避免遗失其生命周期所有权。
+    fn track_restored_runtime(
+        &self,
+        profile_id: String,
+        runtime: Arc<dyn CodexRouteRuntime>,
+    ) -> Result<(), CodexRuntimeTrackingFailureReason> {
+        let mut runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| CodexRuntimeTrackingFailureReason::Lock)?;
+        if runtimes.contains_key(&profile_id) {
+            return Err(CodexRuntimeTrackingFailureReason::Conflict);
+        }
+        runtimes.insert(profile_id, runtime);
         Ok(())
     }
 
@@ -1980,7 +2313,9 @@ impl CodexRouteManager {
         })
     }
 
+    /*
     /// 持久化不含凭证的失败摘要，并明确标注是否仍有回滚动作待处理。
+    // 历史说明：启动恢复现在由统一诊断记录同时驱动日志和 last_error，保留旧实现供后续生命周期错误兼容时参考。
     fn persist_error_summary(
         &self,
         profile_id: &str,
@@ -2002,15 +2337,40 @@ impl CodexRouteManager {
         }
         Ok(())
     }
+    */
 
-    /// 持久化包含 Profile 与 Home 定位信息的启动恢复脱敏摘要。
-    fn persist_restore_error_summary(&self, profile: &CodexProfile) -> Result<(), AppError> {
+    /// 记录单条启动恢复安全诊断，并复用同一文本更新路由状态。
+    fn record_startup_restore_failure(
+        &self,
+        profile: &CodexProfile,
+        failure: &CodexStartupRestoreFailure,
+    ) {
+        let diagnostic = CodexStartupRestoreDiagnostic::from_failure(profile, failure);
+        let message = diagnostic.render();
+        self.startup_restore_diagnostic_logger.warn(&message);
+        if self
+            .persist_startup_restore_diagnostic(profile, &message)
+            .is_err()
+        {
+            log::warn!(
+                "Codex Profile 启动恢复诊断持久化失败: operation={} profile_id={} stage={} category={}",
+                CODEX_STARTUP_RESTORE_OPERATION,
+                diagnostic.profile_id,
+                diagnostic.stage,
+                CODEX_STARTUP_RESTORE_CATEGORY_DATABASE
+            );
+        }
+    }
+
+    /// 将已经脱敏的启动恢复诊断保存到现有路由错误字段。
+    fn persist_startup_restore_diagnostic(
+        &self,
+        profile: &CodexProfile,
+        message: &str,
+    ) -> Result<(), AppError> {
         if let Some(route) = self.persistence.get_route(&profile.id)? {
             self.persistence.save_route(&CodexProfileRoute {
-                last_error: Some(format!(
-                    "Codex Profile 恢复失败: Profile {} ({})，Home {}",
-                    profile.id, profile.name, profile.canonical_home_path
-                )),
+                last_error: Some(message.to_string()),
                 updated_at: Utc::now().timestamp_millis(),
                 ..route
             })?;
@@ -2377,13 +2737,35 @@ mod codex_route_manager {
         runtimes: Mutex<HashMap<String, Arc<SnapshotTrackingRuntime>>>,
     }
 
+    /// 捕获应用日志边界收到的启动恢复诊断。
+    #[derive(Default)]
+    struct RecordingStartupRestoreDiagnosticLogger {
+        messages: Mutex<Vec<String>>,
+    }
+
+    impl CodexStartupRestoreDiagnosticLogger for RecordingStartupRestoreDiagnosticLogger {
+        fn warn(&self, message: &str) {
+            self.messages
+                .lock()
+                .expect("诊断日志捕获锁")
+                .push(message.to_string());
+        }
+    }
+
+    impl RecordingStartupRestoreDiagnosticLogger {
+        /// 返回已捕获诊断的不可变快照。
+        fn messages(&self) -> Vec<String> {
+            self.messages.lock().expect("诊断日志读取锁").clone()
+        }
+    }
+
     /// 模拟仍有请求在途的运行时，用于证明关闭不会等待请求完成。
     struct InFlightRequestRuntime {
         stop_called: AtomicBool,
     }
 
     impl CodexRouteRuntime for InFlightRequestRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -2424,7 +2806,7 @@ mod codex_route_manager {
     }
 
     impl CodexRouteRuntime for CloseOrderRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async { Ok(()) })
         }
 
@@ -2482,7 +2864,7 @@ mod codex_route_manager {
     }
 
     impl CodexRouteRuntime for FakeRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async { Ok(()) })
         }
         fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
@@ -2508,7 +2890,7 @@ mod codex_route_manager {
     }
 
     impl CodexRouteRuntime for SnapshotTrackingRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async move {
                 self.starts.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -2832,6 +3214,26 @@ mod codex_route_manager {
     struct TrackingTokenStore {
         ensured: AtomicUsize,
         deleted: AtomicUsize,
+    }
+
+    /// 模拟启动恢复读取本地凭证失败，并在原始错误中放入敏感样本。
+    struct FailingEnsureTokenStore;
+
+    impl CodexProfileTokenStore for FailingEnsureTokenStore {
+        fn read_token(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(None)
+        }
+
+        fn ensure_token(&self, _: &str) -> Result<String, AppError> {
+            Err(AppError::Message(
+                "token=private-token api_key=private-api-key Authorization=Bearer private-auth Cookie=private-cookie request_body=private-request response_body=private-response config=private-config provider_settings=private-provider-settings"
+                    .to_string(),
+            ))
+        }
+
+        fn delete_token(&self, _: &str) -> Result<(), AppError> {
+            Ok(())
+        }
     }
 
     impl CodexProfileTokenStore for TrackingTokenStore {
@@ -5486,6 +5888,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         )?;
         let external = "model_provider = \"external\"\n\n[model_providers.external]\nname = \"External\"\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"external-token\"\n";
         fs::write(codex_config_path_for_home(bad_home.path()), external).expect("写入外部配置");
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
         let manager = CodexRouteManager::new(
             db.clone(),
             home_config.clone(),
@@ -5494,7 +5897,8 @@ experimental_bearer_token = "PROXY_MANAGED"
                 deleted: AtomicUsize::new(0),
             }),
             Arc::new(FakeFactory),
-        );
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
 
         manager.restore_enabled_profiles().await?;
 
@@ -5511,8 +5915,11 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(failure.contains("profile-bad-home"));
         assert!(failure.contains("Broken Profile"));
         assert!(failure.contains(&bad_home.path().display().to_string()));
+        assert!(failure.contains("stage=reconcile_home"));
+        assert!(failure.contains("category=derived_state"));
         assert!(!failure.contains("external-token"));
         assert!(!failure.contains("external.example"));
+        assert_eq!(logger.messages(), vec![failure]);
         assert_eq!(
             manager.status("profile-good-home").await?,
             CodexRuntimeStatus::Running
@@ -5734,7 +6141,7 @@ experimental_bearer_token = "PROXY_MANAGED"
     }
 
     impl CodexRouteRuntime for StopFailingRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async { Ok(()) })
         }
         fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
@@ -5820,8 +6227,65 @@ experimental_bearer_token = "PROXY_MANAGED"
         stopped: AtomicBool,
     }
 
+    /// 模拟启动时端口绑定失败，并记录启动次数。
+    struct BindFailingRuntime {
+        starts: Arc<AtomicUsize>,
+        message: String,
+    }
+
+    impl CodexRouteRuntime for BindFailingRuntime {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
+            Box::pin(async move {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                Err(CodexRouteRuntimeStartError::bind_failed(
+                    std::io::ErrorKind::AddrInUse,
+                    self.message.clone(),
+                ))
+            })
+        }
+        fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
+            Box::pin(async { false })
+        }
+        fn swap_provider_snapshot(
+            &self,
+            _: CodexRouteProviderSnapshot,
+        ) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn reject_new_requests(&self) -> CodexRouteRuntimeFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
+            Box::pin(async { CodexRuntimeStatus::Stopped })
+        }
+    }
+
+    /// 为启动恢复返回固定的端口绑定失败运行时。
+    struct BindFailingFactory {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl CodexRouteRuntimeFactory for BindFailingFactory {
+        fn create(
+            &self,
+            _: CodexProfileScope,
+            listener_token: String,
+            _: CodexRouteProviderSnapshot,
+        ) -> Arc<dyn CodexRouteRuntime> {
+            Arc::new(BindFailingRuntime {
+                starts: self.starts.clone(),
+                message: format!(
+                    "地址绑定失败: Address already in use; Authorization: Bearer {listener_token}"
+                ),
+            })
+        }
+    }
+
     impl CodexRouteRuntime for HealthRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async move {
                 self.started.store(true, Ordering::SeqCst);
                 Ok(())
@@ -5882,7 +6346,7 @@ experimental_bearer_token = "PROXY_MANAGED"
     }
 
     impl CodexRouteRuntime for RecoveryRuntime {
-        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
+        fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async { Ok(()) })
         }
         fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
@@ -7394,6 +7858,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         }
         let bad_runtime = runtimes.get("profile-bad").expect("失败运行时").clone();
         let good_runtime = runtimes.get("profile-good").expect("成功运行时").clone();
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
         let manager = CodexRouteManager::new(
             db,
             home_config,
@@ -7402,18 +7867,372 @@ experimental_bearer_token = "PROXY_MANAGED"
                 deleted: AtomicUsize::new(0),
             }),
             Arc::new(HealthFactory { runtimes }),
-        );
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
 
         manager.restore_enabled_profiles().await?;
         assert!(!bad_runtime.started.load(Ordering::SeqCst));
         assert!(!bad_runtime.stopped.load(Ordering::SeqCst));
         assert!(manager.status("profile-bad").await.is_err());
+        let failure = manager
+            .persistence
+            .get_route("profile-bad")?
+            .expect("失败路由存在")
+            .last_error
+            .expect("非法恢复记录应留下诊断");
+        assert!(failure.contains("stage=recover_pending"));
+        assert!(failure.contains("category=recovery_state"));
+        assert_eq!(logger.messages(), vec![failure]);
         assert!(good_runtime.started.load(Ordering::SeqCst));
         assert!(!good_runtime.stopped.load(Ordering::SeqCst));
         assert_eq!(
             manager.status("profile-good").await?,
             CodexRuntimeStatus::Running
         );
+        Ok(())
+    }
+
+    /// 启动恢复的端口绑定失败必须记录阶段化脱敏诊断，且不得自动重试。
+    #[tokio::test]
+    async fn startup_restore_records_redacted_runtime_bind_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-bind-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        let starts = Arc::new(AtomicUsize::new(0));
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(BindFailingFactory {
+                starts: starts.clone(),
+            }),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+
+        manager.restore_enabled_profiles().await?;
+
+        let route = db
+            .get_codex_profile_route("profile-bind-failure")?
+            .expect("失败路由仍存在");
+        let diagnostic = route.last_error.expect("启动失败应记录诊断");
+        assert!(diagnostic.contains("operation=startup_restore"));
+        assert!(diagnostic.contains("stage=runtime_start"));
+        assert!(diagnostic.contains("category=port_bind"));
+        assert!(diagnostic.contains("127.0.0.1:16001"));
+        assert!(diagnostic.contains("AddrInUse"));
+        assert!(!diagnostic.contains("Authorization"));
+        assert!(!diagnostic.contains("test-local-token"));
+        assert_eq!(logger.messages(), vec![diagnostic.clone()]);
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(route.enabled);
+        Ok(())
+    }
+
+    /// 本地监听凭证失败必须记录凭证阶段，同时隐藏所有敏感错误正文。
+    #[tokio::test]
+    async fn startup_restore_redacts_token_store_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-token-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(FailingEnsureTokenStore),
+            Arc::new(FakeFactory),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+
+        manager.restore_enabled_profiles().await?;
+
+        let diagnostic = db
+            .get_codex_profile_route("profile-token-failure")?
+            .expect("失败路由仍存在")
+            .last_error
+            .expect("凭证失败应记录诊断");
+        assert!(diagnostic.contains("stage=ensure_token"));
+        assert!(diagnostic.contains("category=token_store"));
+        for sensitive in [
+            "private-token",
+            "private-api-key",
+            "private-auth",
+            "private-cookie",
+            "private-request",
+            "private-response",
+            "private-config",
+            "private-provider-settings",
+        ] {
+            assert!(!diagnostic.contains(sensitive));
+        }
+        assert_eq!(logger.messages(), vec![diagnostic]);
+        Ok(())
+    }
+
+    /// 缺失 Profile 主供应商引用必须归入恢复计划阶段。
+    #[tokio::test]
+    async fn startup_restore_records_provider_plan_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-plan-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        let mut route = db
+            .get_codex_profile_route("profile-plan-failure")?
+            .expect("路由存在");
+        route.current_provider_id = None;
+        db.save_codex_profile_route(&route)?;
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+
+        manager.restore_enabled_profiles().await?;
+
+        let diagnostic = db
+            .get_codex_profile_route("profile-plan-failure")?
+            .expect("失败路由仍存在")
+            .last_error
+            .expect("计划失败应记录诊断");
+        assert!(diagnostic.contains("stage=build_plan"));
+        assert!(diagnostic.contains("category=provider_plan"));
+        assert!(!diagnostic.contains("test-local-token"));
+        assert_eq!(logger.messages(), vec![diagnostic]);
+        Ok(())
+    }
+
+    /// 已启动但不健康的运行时必须记录独立阶段并执行现有停止补偿。
+    #[tokio::test]
+    async fn startup_restore_records_health_check_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let good_home = tempfile::tempdir().expect("健康 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-health-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            good_home.path(),
+            "profile-health-good",
+            16_002,
+            "test-local-token",
+        )?;
+        let runtime = Arc::new(HealthRuntime {
+            healthy: false,
+            stop_fails: false,
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        });
+        let good_runtime = Arc::new(HealthRuntime {
+            healthy: true,
+            stop_fails: false,
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        });
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(HealthFactory {
+                runtimes: HashMap::from([
+                    ("profile-health-failure".to_string(), runtime.clone()),
+                    ("profile-health-good".to_string(), good_runtime.clone()),
+                ]),
+            }),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+
+        manager.restore_enabled_profiles().await?;
+
+        let diagnostic = db
+            .get_codex_profile_route("profile-health-failure")?
+            .expect("失败路由仍存在")
+            .last_error
+            .expect("健康检查失败应记录诊断");
+        assert!(diagnostic.contains("stage=health_check"));
+        assert!(diagnostic.contains("category=health_check"));
+        assert!(runtime.started.load(Ordering::SeqCst));
+        assert!(runtime.stopped.load(Ordering::SeqCst));
+        assert_eq!(logger.messages(), vec![diagnostic]);
+        assert!(good_runtime.started.load(Ordering::SeqCst));
+        assert!(!good_runtime.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            manager.status("profile-health-good").await?,
+            CodexRuntimeStatus::Running
+        );
+        assert!(db
+            .get_codex_profile_route("profile-health-good")?
+            .expect("健康路由存在")
+            .last_error
+            .is_none());
+        Ok(())
+    }
+
+    /// 运行时登记冲突及其停止补偿失败必须写入同一条脱敏诊断。
+    #[tokio::test]
+    async fn startup_restore_records_runtime_tracking_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-track-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        let new_runtime = Arc::new(HealthRuntime {
+            healthy: true,
+            stop_fails: true,
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        });
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(HealthFactory {
+                runtimes: HashMap::from([(
+                    "profile-track-failure".to_string(),
+                    new_runtime.clone(),
+                )]),
+            }),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+        let existing_runtime = Arc::new(FakeRuntime {
+            provider: AsyncMutex::new("existing-provider".to_string()),
+            port: 16_001,
+        });
+        manager
+            .runtimes
+            .lock()
+            .expect("运行时锁可用")
+            .insert("profile-track-failure".to_string(), existing_runtime);
+
+        manager.restore_enabled_profiles().await?;
+
+        let diagnostic = db
+            .get_codex_profile_route("profile-track-failure")?
+            .expect("失败路由仍存在")
+            .last_error
+            .expect("运行时登记失败应记录诊断");
+        assert!(diagnostic.contains("stage=track_runtime"));
+        assert!(diagnostic.contains("category=runtime_state"));
+        assert!(diagnostic.contains("停止新建监听器也失败"));
+        assert_eq!(logger.messages(), vec![diagnostic]);
+        assert!(new_runtime.started.load(Ordering::SeqCst));
+        assert!(new_runtime.stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            manager.status("profile-track-failure").await?,
+            CodexRuntimeStatus::Running
+        );
+        Ok(())
+    }
+
+    /// 运行时表锁失败必须与已有实例冲突区分，并隐藏锁错误正文。
+    #[tokio::test]
+    async fn startup_restore_distinguishes_runtime_tracking_lock_failure() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-track-lock-failure",
+            16_001,
+            "test-local-token",
+        )?;
+        let new_runtime = Arc::new(HealthRuntime {
+            healthy: true,
+            stop_fails: false,
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        });
+        let logger = Arc::new(RecordingStartupRestoreDiagnosticLogger::default());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(HealthFactory {
+                runtimes: HashMap::from([(
+                    "profile-track-lock-failure".to_string(),
+                    new_runtime.clone(),
+                )]),
+            }),
+        )
+        .with_startup_restore_diagnostic_logger(logger.clone());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.runtimes.lock().expect("运行时锁可用");
+            panic!("模拟包含 private-lock-detail 的运行时表锁失败");
+        }));
+        assert!(poisoned.is_err());
+
+        manager.restore_enabled_profiles().await?;
+
+        let diagnostic = db
+            .get_codex_profile_route("profile-track-lock-failure")?
+            .expect("失败路由仍存在")
+            .last_error
+            .expect("运行时表锁失败应记录诊断");
+        assert!(diagnostic.contains("stage=track_runtime"));
+        assert!(diagnostic.contains("category=runtime_state"));
+        assert!(diagnostic.contains("运行时表锁访问失败，已停止新建监听器"));
+        assert!(!diagnostic.contains("private-lock-detail"));
+        assert_eq!(logger.messages(), vec![diagnostic]);
+        assert!(new_runtime.started.load(Ordering::SeqCst));
+        assert!(new_runtime.stopped.load(Ordering::SeqCst));
         Ok(())
     }
 

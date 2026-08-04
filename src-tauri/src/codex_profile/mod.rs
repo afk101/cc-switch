@@ -35,6 +35,7 @@ pub use repository::{
 pub use route_manager::{CodexProfileRoutePersistence, CodexProfileTokenStore, CodexRouteManager};
 pub use route_runtime::{
     CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
-    CodexRouteRuntimeFuture, RouteRuntime, SystemCodexRouteRuntimeFactory,
+    CodexRouteRuntimeFuture, CodexRouteRuntimeStartError, RouteRuntime,
+    SystemCodexRouteRuntimeFactory,
 };
 pub use secret_store::CodexProfileSecretStore;

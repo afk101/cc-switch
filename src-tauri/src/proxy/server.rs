@@ -176,7 +176,10 @@ impl ProxyServer {
         let addr: SocketAddr =
             format!("{}:{}", self.config.listen_address, self.config.listen_port)
                 .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
+                .map_err(|e| ProxyError::BindFailed {
+                    message: format!("无效的地址: {e}"),
+                    kind: Some(std::io::ErrorKind::InvalidInput),
+                })?;
 
         // 创建关闭通道
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -185,12 +188,17 @@ impl ProxyServer {
         let app = self.build_router();
 
         // 绑定监听器
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
+        let listener =
+            tokio::net::TcpListener::bind(&addr)
+                .await
+                .map_err(|e| ProxyError::BindFailed {
+                    message: e.to_string(),
+                    kind: Some(e.kind()),
+                })?;
+        let local_addr = listener.local_addr().map_err(|e| ProxyError::BindFailed {
+            message: e.to_string(),
+            kind: Some(e.kind()),
+        })?;
         let actual_port = local_addr.port();
 
         log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);

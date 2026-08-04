@@ -1925,7 +1925,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::Internal(_) => "cc_switch_internal_error",
         ProxyError::AlreadyRunning
         | ProxyError::NotRunning
-        | ProxyError::BindFailed(_)
+        | ProxyError::BindFailed { .. }
         | ProxyError::StopTimeout
         | ProxyError::StopFailed(_) => "cc_switch_proxy_error",
     }

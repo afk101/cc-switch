@@ -82,3 +82,47 @@ pub const CODEX_CATALOG_SYNC_COMPENSATION_ERROR: &str =
 pub const CODEX_CATALOG_RECONCILE_ERROR_PREFIX: &str = "Codex Profile 模型目录对账失败";
 /// 启动完整派生状态对账错误的稳定前缀，仅用于识别并清理本类错误。
 pub const CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX: &str = "Codex Profile 派生状态对账失败";
+/// Codex Profile 启动恢复诊断的稳定操作标识。
+pub const CODEX_STARTUP_RESTORE_OPERATION: &str = "startup_restore";
+/// 启动恢复获取 Profile 生命周期锁阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_ACQUIRE_LOCK: &str = "acquire_lock";
+/// 启动恢复读取并校验 Profile 阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_VALIDATE_PROFILE: &str = "validate_profile";
+/// 启动恢复收敛待处理生命周期记录阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_RECOVER_PENDING: &str = "recover_pending";
+/// 启动恢复读取路由阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_READ_ROUTE: &str = "read_route";
+/// 启动恢复确保本地监听凭证阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN: &str = "ensure_token";
+/// 启动恢复构造运行计划阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_BUILD_PLAN: &str = "build_plan";
+/// 启动恢复对账开启态 Profile 派生状态阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME: &str = "reconcile_home";
+/// 启动恢复创建并启动 Profile 运行时阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_RUNTIME_START: &str = "runtime_start";
+/// 启动恢复执行 Profile 运行时健康检查阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_HEALTH_CHECK: &str = "health_check";
+/// 启动恢复登记 Profile 运行时阶段。
+pub const CODEX_STARTUP_RESTORE_STAGE_TRACK_RUNTIME: &str = "track_runtime";
+/// 启动恢复端口绑定错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_PORT_BIND: &str = "port_bind";
+/// 启动恢复文件读写错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_FILE_IO: &str = "file_io";
+/// 启动恢复数据库错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_DATABASE: &str = "database";
+/// 启动恢复配置或输入错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_INVALID_CONFIG: &str = "invalid_config";
+/// 启动恢复供应商引用或计划错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_PROVIDER_PLAN: &str = "provider_plan";
+/// 启动恢复待处理状态未收敛的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_RECOVERY_STATE: &str = "recovery_state";
+/// 启动恢复本地监听凭证错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_TOKEN_STORE: &str = "token_store";
+/// 启动恢复 Profile 派生状态错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_DERIVED_STATE: &str = "derived_state";
+/// 启动恢复健康检查错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_HEALTH_CHECK: &str = "health_check";
+/// 启动恢复运行时状态错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_RUNTIME_STATE: &str = "runtime_state";
+/// 启动恢复无法安全细分错误的稳定分类。
+pub const CODEX_STARTUP_RESTORE_CATEGORY_UNKNOWN: &str = "unknown";
