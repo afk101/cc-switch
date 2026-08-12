@@ -2444,7 +2444,8 @@ impl CodexRouteManager {
             .contains(profile_id))
     }
 
-    /// 用同一份 listener token 构造 Home 目标与运行时供应商快照。
+    /// 用同一份 listener token 构造严格 Home 路由目标与运行时供应商快照。
+    /// 数据库有效配置只进入运行时快照；启动恢复不得借机替换用户维护的 MCP 表。
     fn build_restore_plan(
         &self,
         profile: &CodexProfile,
@@ -2470,25 +2471,12 @@ impl CodexRouteManager {
             None => self.provider_snapshot(provider_id, &failover_ids)?,
         };
         let home = std::path::Path::new(&profile.canonical_home_path);
-        let plan = match db {
-            Some(db) => self
-                .home_config
-                .build_profile_route_plan_with_base_transform(
-                    home,
-                    profile.listen_port,
-                    None,
-                    listener_token,
-                    |current_toml| {
-                        McpService::project_enabled_codex_servers_to_config(db, current_toml)
-                    },
-                )?,
-            None => self.home_config.build_profile_route_plan(
-                home,
-                profile.listen_port,
-                None,
-                listener_token,
-            )?,
-        };
+        let plan = self.home_config.build_profile_route_plan(
+            home,
+            profile.listen_port,
+            None,
+            listener_token,
+        )?;
         Ok((snapshot, plan))
     }
 
@@ -7363,7 +7351,7 @@ mod codex_route_manager {
     }
 
     #[tokio::test]
-    async fn startup_restore_uses_database_versions_for_enabled_primary_and_failover(
+    async fn startup_restore_uses_database_provider_versions_without_replacing_user_mcp(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("创建开启态启动恢复 Home");
@@ -7409,7 +7397,19 @@ mod codex_route_manager {
         document["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
         document["plugins"]["user-plugin"]["enabled"] = toml_edit::value(true);
         document["unknown_future_setting"] = toml_edit::value("preserve-me");
-        fs::write(&config_path, document.to_string()).expect("写入正常非路由变化");
+        let user_mcp = r#"
+# 用户维护的 MCP 注释必须由启动恢复保留
+[mcp_servers.user_local]
+command = "user-command"
+user_extension = "preserve-me"
+
+# Codex 自己新增且未登记到 CC Switch 数据库
+[mcp_servers.codex_builtin]
+url = "https://codex.example.com/mcp"
+codex_unknown = true
+"#;
+        let config_before_startup = format!("{}{user_mcp}", document);
+        fs::write(&config_path, &config_before_startup).expect("写入正常非路由变化");
         db.replace_codex_profile_failovers(
             "profile-enabled-startup",
             std::slice::from_ref(&old_failover.id),
@@ -7428,9 +7428,12 @@ mod codex_route_manager {
         let manager = CodexRouteManager::new(
             db.clone(),
             home_config,
-            Arc::new(TrackingTokenStore {
-                ensured: AtomicUsize::new(0),
-                deleted: AtomicUsize::new(0),
+            Arc::new(ProfileTokenMapStore {
+                tokens: HashMap::from([(
+                    "profile-enabled-startup".to_string(),
+                    "rotated-startup-token".to_string(),
+                )]),
+                reads: Mutex::new(HashMap::new()),
             }),
             factory.clone(),
         );
@@ -7444,9 +7447,12 @@ mod codex_route_manager {
 
         let config = fs::read_to_string(config_path).expect("读取启动恢复后的路由配置");
         assert!(config.contains("http://127.0.0.1:16001/v1"));
+        assert!(config.contains("experimental_bearer_token = \"rotated-startup-token\""));
+        assert!(!config.contains("experimental_bearer_token = \"test-local-token\""));
         assert!(!config.contains("https://startup-primary.example.com/v1"));
-        assert!(config.contains("[mcp_servers.playwright]"));
-        assert!(config.contains("command = \"npx\""));
+        assert!(config.contains(user_mcp));
+        assert!(!config.contains("[mcp_servers.playwright]"));
+        assert!(!config.contains("command = \"npx\""));
         assert!(config.contains("model = \"user-selected-model\""));
         assert!(config.contains("followUpQueueMode = \"queue\""));
         assert!(config.contains("user-plugin"));
@@ -7483,6 +7489,7 @@ mod codex_route_manager {
                 .contains("web_search = true"));
         }
         assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.status().await, CodexRuntimeStatus::Running);
         Ok(())
     }
 
