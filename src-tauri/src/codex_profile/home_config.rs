@@ -1,5 +1,6 @@
 use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
+    CODEX_MODEL_CATALOG_FIELD,
 };
 use crate::codex_profile::{
     CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD,
@@ -472,6 +473,45 @@ impl CodexHomeConfigService {
         home: &Path,
         provider: &Provider,
     ) -> Result<CodexModelCatalogProjectionPlan, AppError> {
+        let current = self.inspect(home)?;
+        self.build_model_catalog_projection_plan_from_snapshot(home, provider, current)
+    }
+
+    /// 从原始 Home 快照同时构造模型目录投影与路由接管计划，不产生文件副作用。
+    pub fn build_profile_enable_plans(
+        &self,
+        home: &Path,
+        provider: &Provider,
+        listen_port: u16,
+        listener_token: &str,
+    ) -> Result<(CodexModelCatalogProjectionPlan, CodexRouteConfigPlan), AppError> {
+        let current = self.inspect(home)?;
+        let catalog_plan = self.build_model_catalog_projection_plan_from_snapshot(
+            home,
+            provider,
+            current.clone(),
+        )?;
+        let projected_content = catalog_plan
+            .config
+            .as_ref()
+            .map(|plan| plan.target_content.as_slice())
+            .or(current.content.as_deref())
+            .unwrap_or_default();
+        let projected_toml = std::str::from_utf8(projected_content)
+            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?;
+        let target =
+            build_codex_profile_route_toml(projected_toml, listen_port, None, listener_token);
+        let route_plan = self.build_route_plan_from_snapshot(home, current, &target)?;
+        Ok((catalog_plan, route_plan))
+    }
+
+    /// 使用调用方提供的原始快照构造模型目录投影，保证组合计划共享同一基线。
+    fn build_model_catalog_projection_plan_from_snapshot(
+        &self,
+        home: &Path,
+        provider: &Provider,
+        current: CodexLiveConfigSnapshot,
+    ) -> Result<CodexModelCatalogProjectionPlan, AppError> {
         let mut settings = provider.settings_config.clone();
         crate::codex_config::apply_codex_unified_session_bucket_to_settings(
             provider.category.as_deref(),
@@ -481,7 +521,6 @@ impl CodexHomeConfigService {
             .get("config")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let current = self.inspect(home)?;
         let home_config = current
             .content
             .as_deref()
@@ -534,6 +573,28 @@ impl CodexHomeConfigService {
             }
         }
         Ok(())
+    }
+
+    /// 启用组合计划仅应用模型目录文件，配置目标已合并进同基线的路由计划。
+    pub fn apply_profile_enable_catalog_plan(
+        &self,
+        plan: &CodexModelCatalogProjectionPlan,
+    ) -> Result<(), AppError> {
+        match &plan.model_catalog {
+            Some(catalog) => self.apply_auxiliary_plan(catalog),
+            None => Ok(()),
+        }
+    }
+
+    /// 补偿启用组合计划写入的模型目录文件，不重复恢复配置正文。
+    pub fn restore_profile_enable_catalog_plan(
+        &self,
+        plan: &CodexModelCatalogProjectionPlan,
+    ) -> Result<(), AppError> {
+        match &plan.model_catalog {
+            Some(catalog) => self.restore_auxiliary_plan(catalog),
+            None => Ok(()),
+        }
     }
 
     /// 反向恢复单个 Home 的模型目录投影，先恢复配置再恢复目录文件。
@@ -895,6 +956,16 @@ impl CodexHomeConfigService {
         }
         ensure_managed_route_owned(&current_state, &projection.target, listen_port)?;
         apply_previous_managed_route_state(&mut current_document, &projection)?;
+        if backup.previous_content.is_none()
+            && current_document
+                .get(CODEX_MODEL_CATALOG_FIELD)
+                .and_then(Item::as_str)
+                == Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        {
+            current_document
+                .as_table_mut()
+                .remove(CODEX_MODEL_CATALOG_FIELD);
+        }
         let merged_content = current_document.to_string().into_bytes();
 
         let latest = self.file_ops.read(&current.config_path)?;

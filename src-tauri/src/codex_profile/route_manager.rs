@@ -933,45 +933,19 @@ impl CodexRouteManager {
         let snapshot = self.provider_snapshot(provider_id, &failover_ids)?;
         let token = self.secret_store.ensure_token(profile_id)?;
         let home = std::path::Path::new(&profile.canonical_home_path);
-        let catalog_plan = self
-            .home_config
-            .build_model_catalog_projection_plan(home, &selected_provider)?;
+        let (catalog_plan, plan) = self.home_config.build_profile_enable_plans(
+            home,
+            &selected_provider,
+            profile.listen_port,
+            &token,
+        )?;
+        let backup = self.home_config.serialize_backup(&plan)?;
         let target_snapshot = RouteRecoverySnapshot {
             current_provider_id: Some(provider_id.to_string()),
             enabled: true,
             failover_ids: failover_ids.clone(),
         };
-        self.home_config
-            .apply_model_catalog_projection_plan(&catalog_plan)?;
-        let plan =
-            match self
-                .home_config
-                .build_profile_route_plan(home, profile.listen_port, None, &token)
-            {
-                Ok(plan) => plan,
-                Err(error) => {
-                    let compensation_error = self
-                        .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
-                        .await;
-                    return Err(Self::compensation_failure_error(
-                        &error,
-                        compensation_error.as_ref(),
-                    ));
-                }
-            };
-        let backup = match self.home_config.serialize_backup(&plan) {
-            Ok(backup) => backup,
-            Err(error) => {
-                let compensation_error = self
-                    .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
-                    .await;
-                return Err(Self::compensation_failure_error(
-                    &error,
-                    compensation_error.as_ref(),
-                ));
-            }
-        };
-        if let Err(error) = self.persist_operation(
+        self.persist_operation(
             &previous,
             "enable",
             RouteRecoverySnapshot::from_route(
@@ -981,14 +955,18 @@ impl CodexRouteManager {
             target_snapshot,
             CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
             None,
-        ) {
-            let compensation_error = self
-                .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
-                .await;
-            return Err(Self::compensation_failure_error(
+        )?;
+        self.persist_enable_backup(profile_id, backup.clone())?;
+        if let Err(error) = self
+            .home_config
+            .apply_profile_enable_catalog_plan(&catalog_plan)
+        {
+            self.persist_enable_recovery_error(
+                profile_id,
+                CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
                 &error,
-                compensation_error.as_ref(),
-            ));
+            )?;
+            return Err(error);
         }
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
@@ -1041,15 +1019,6 @@ impl CodexRouteManager {
                 compensation_errors.push(persist_error);
             }
             let compensation_error = Self::combine_compensation_errors(compensation_errors);
-            return Err(Self::compensation_failure_error(
-                &error,
-                compensation_error.as_ref(),
-            ));
-        }
-        if let Err(error) = self.persist_enable_backup(profile_id, backup.clone()) {
-            let compensation_error = self
-                .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
-                .await;
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
@@ -1633,6 +1602,21 @@ impl CodexRouteManager {
                 proven_previous_listener_token.as_ref(),
             )
         {
+            match self
+                .converge_external_after_disable_restore_failure(profile_id, profile, &route)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(reclassification_error) => {
+                    self.persist_operation_error(
+                        profile_id,
+                        CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                        &reclassification_error.to_string(),
+                    )?;
+                    return Err(reclassification_error);
+                }
+            }
             self.persist_operation_error(
                 profile_id,
                 CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
@@ -1721,6 +1705,23 @@ impl CodexRouteManager {
             backup_json,
             proven_previous_listener_token,
         })
+    }
+
+    /// restore 冲突后只读重验当前 Home，确认外部接管时放弃陈旧恢复记录。
+    async fn converge_external_after_disable_restore_failure(
+        &self,
+        profile_id: &str,
+        profile: &CodexProfile,
+        route: &CodexProfileRoute,
+    ) -> Result<bool, AppError> {
+        match self.prepare_managed_home_for_disable(profile, route)? {
+            CodexDisableHomePreparation::Managed { .. } => Ok(false),
+            CodexDisableHomePreparation::ExternalTakeover => {
+                self.disable_external_takeover_locked(profile_id, profile, route)
+                    .await?;
+                Ok(true)
+            }
+        }
     }
 
     /// 停止已失效路由后原子放弃 Home 所有权，不创建关闭 recovery 或改写 Home。
@@ -2717,7 +2718,7 @@ impl CodexRouteManager {
         }
         if let Err(error) = self
             .home_config
-            .restore_model_catalog_projection_plan(catalog_plan)
+            .restore_profile_enable_catalog_plan(catalog_plan)
         {
             errors.push(error);
         }
@@ -2989,6 +2990,21 @@ impl CodexRouteManager {
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             let profile = self.persistence.get_profile(profile_id)?;
             if let Err(error) = self.restore_profile_home_for_disable(&profile, &route) {
+                match self
+                    .converge_external_after_disable_restore_failure(profile_id, &profile, &route)
+                    .await
+                {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(reclassification_error) => {
+                        self.persist_operation_error(
+                            profile_id,
+                            CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                            &reclassification_error.to_string(),
+                        )?;
+                        return Err(Self::recovery_unconverged_error(reclassification_error));
+                    }
+                }
                 self.persist_operation_error(
                     profile_id,
                     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
@@ -3560,6 +3576,199 @@ mod codex_route_manager {
         save_count: AtomicUsize,
         fail_on_save: usize,
         fail_replace: bool,
+    }
+
+    /// 在关闭 prepared 落库后立即写入外部严格字段，模拟预检与恢复之间的并发修改。
+    struct InterfereAfterDisablePreparedPersistence {
+        db: Arc<Database>,
+        config_path: std::path::PathBuf,
+        external_content: Vec<u8>,
+        interfered: AtomicBool,
+    }
+
+    impl CodexProfileRoutePersistence for InterfereAfterDisablePreparedPersistence {
+        fn list_profiles(&self) -> Result<Vec<CodexProfile>, AppError> {
+            self.db.list_codex_profiles()
+        }
+
+        fn get_profile(&self, profile_id: &str) -> Result<CodexProfile, AppError> {
+            self.db.get_codex_profile(profile_id)
+        }
+
+        fn get_route(&self, profile_id: &str) -> Result<Option<CodexProfileRoute>, AppError> {
+            self.db.get_codex_profile_route(profile_id)
+        }
+
+        fn save_route(&self, route: &CodexProfileRoute) -> Result<(), AppError> {
+            self.db.save_codex_profile_route(route)?;
+            let prepared_disable = route
+                .recovery_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<RouteRecoveryRecord>(json).ok())
+                .is_some_and(|recovery| {
+                    recovery.operation == "disable"
+                        && recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_PREPARED
+                });
+            if prepared_disable && !self.interfered.swap(true, Ordering::SeqCst) {
+                fs::write(&self.config_path, &self.external_content)
+                    .map_err(|error| AppError::io(&self.config_path, error))?;
+            }
+            Ok(())
+        }
+
+        fn list_failovers(&self, profile_id: &str) -> Result<Vec<String>, AppError> {
+            self.db.list_codex_profile_failovers(profile_id)
+        }
+
+        fn replace_failovers(
+            &self,
+            profile_id: &str,
+            provider_ids: &[String],
+        ) -> Result<(), AppError> {
+            self.db
+                .replace_codex_profile_failovers(profile_id, provider_ids)
+        }
+
+        fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
+            self.db
+                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        }
+
+        fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
+            self.db.save_provider(AppType::Codex.as_str(), provider)
+        }
+
+        fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
+            self.db.delete_codex_profile(profile_id)
+        }
+    }
+
+    /// 在每次 Home 写入前检查原始备份与 recovery 已持久化。
+    struct RecoveryBeforeHomeWriteOps {
+        db: Arc<Database>,
+        profile_id: String,
+        ordering_violations: AtomicUsize,
+    }
+
+    /// 允许模型目录写入后拒绝 config.toml，验证启用失败可按已持久化基线补偿。
+    struct FailConfigAfterCatalogWriteOps {
+        config_path: std::path::PathBuf,
+        catalog_writes: AtomicUsize,
+    }
+
+    /// 在 restore 读取时注入外部编辑，随后让只读重分类遇到瞬态 I/O。
+    struct ExternalThenRetryableReadErrorOps {
+        config_path: std::path::PathBuf,
+        external_content: Vec<u8>,
+        config_reads: AtomicUsize,
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for RecoveryBeforeHomeWriteOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            let protected = self
+                .db
+                .get_codex_profile_route(&self.profile_id)?
+                .is_some_and(|route| {
+                    route.live_backup_json.is_some() && route.recovery_json.is_some()
+                });
+            if !protected {
+                self.ordering_violations.fetch_add(1, Ordering::SeqCst);
+            }
+            crate::config::atomic_write(path, content)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            let protected = self
+                .db
+                .get_codex_profile_route(&self.profile_id)?
+                .is_some_and(|route| {
+                    route.live_backup_json.is_some() && route.recovery_json.is_some()
+                });
+            if !protected {
+                self.ordering_violations.fetch_add(1, Ordering::SeqCst);
+            }
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for FailConfigAfterCatalogWriteOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            if path == self.config_path {
+                return Err(AppError::Message(
+                    "模拟模型目录写入后的配置失败".to_string(),
+                ));
+            }
+            self.catalog_writes.fetch_add(1, Ordering::SeqCst);
+            crate::config::atomic_write(path, content)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for ExternalThenRetryableReadErrorOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path == self.config_path {
+                let read = self.config_reads.fetch_add(1, Ordering::SeqCst) + 1;
+                if read == 4 {
+                    fs::write(path, &self.external_content)
+                        .map_err(|error| AppError::io(path, error))?;
+                } else if read >= 5 {
+                    return Err(AppError::IoContext {
+                        context: "模拟关闭重分类瞬态读取失败".to_string(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "temporary reclassification read failure",
+                        ),
+                    });
+                }
+            }
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            crate::config::atomic_write(path, content)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
+            }
+            Ok(())
+        }
     }
 
     /// 按保存序号连续拒绝写入，用于验证补偿失败不会被伪装成已收敛。
@@ -5157,6 +5366,149 @@ mod codex_route_manager {
                 .expect("读取 Profile 配置");
         assert!(catalog.contains("model-a"));
         assert!(config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
+        Ok(())
+    }
+
+    /// 缺失配置的首次启用必须先保存真实空基线，关闭后恢复为文件不存在。
+    #[tokio::test]
+    async fn enabling_missing_config_with_catalog_persists_recovery_before_home_write(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let profile_id = "profile-missing-config-catalog";
+        let provider = provider_with_route_catalog("provider-a", "model-a");
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: "Profile Missing Config Catalog".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let file_ops = Arc::new(RecoveryBeforeHomeWriteOps {
+            db: db.clone(),
+            profile_id: profile_id.to_string(),
+            ordering_violations: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(file_ops.clone())),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let config_path = codex_config_path_for_home(home.path());
+        assert!(!config_path.exists());
+
+        manager.enable(profile_id, &provider.id, vec![]).await?;
+
+        assert_eq!(
+            file_ops.ordering_violations.load(Ordering::SeqCst),
+            0,
+            "任何 Home 投影写入前都必须已经持久化 recovery 与原始备份"
+        );
+        let enabled = db
+            .get_codex_profile_route(profile_id)?
+            .expect("启用路由存在");
+        let backup: serde_json::Value =
+            serde_json::from_str(enabled.live_backup_json.as_deref().expect("启用备份存在"))
+                .expect("解析启用备份");
+        assert!(backup["previous_content"].is_null());
+
+        manager.disable(profile_id).await?;
+
+        assert!(!config_path.exists(), "关闭必须恢复为原始文件不存在");
+        let disabled = db
+            .get_codex_profile_route(profile_id)?
+            .expect("关闭路由存在");
+        assert!(!disabled.enabled);
+        assert!(disabled.recovery_json.is_none());
+        Ok(())
+    }
+
+    /// 模型目录已写而路由配置失败时，启用补偿必须恢复目录并保留可恢复记录。
+    #[tokio::test]
+    async fn enabling_failure_after_catalog_write_compensates_from_persisted_baseline(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let profile_id = "profile-catalog-write-failure";
+        let provider = provider_with_route_catalog("provider-a", "model-a");
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: "Profile Catalog Write Failure".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        let catalog_path = home
+            .path()
+            .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let file_ops = Arc::new(FailConfigAfterCatalogWriteOps {
+            config_path: config_path.clone(),
+            catalog_writes: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(file_ops.clone())),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .enable(profile_id, &provider.id, vec![])
+            .await
+            .expect_err("路由配置失败必须中止启用");
+
+        assert_eq!(file_ops.catalog_writes.load(Ordering::SeqCst), 1);
+        assert!(!config_path.exists(), "原始缺失配置必须保持缺失");
+        assert!(!catalog_path.exists(), "已写模型目录必须被即时补偿");
+        let pending = db
+            .get_codex_profile_route(profile_id)?
+            .expect("失败路由存在");
+        assert!(!pending.enabled);
+        assert!(pending.live_backup_json.is_some());
+        assert!(pending.recovery_json.is_some());
+
+        manager.recover_pending_locked(profile_id).await?;
+
+        let recovered = db
+            .get_codex_profile_route(profile_id)?
+            .expect("补偿后路由存在");
+        assert!(!recovered.enabled);
+        assert!(recovered.live_backup_json.is_none());
+        assert!(recovered.recovery_json.is_none());
+        assert!(!config_path.exists());
+        assert!(!catalog_path.exists());
         Ok(())
     }
 
@@ -6913,6 +7265,209 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(!messages[0].contains("upstream-token"));
         assert!(!messages[0].contains(&home.path().display().to_string()));
         assert!(manager.status("profile-a").await.is_err());
+        Ok(())
+    }
+
+    /// 关闭预检通过后若严格字段被并发改写，CAS 冲突必须重新分类并收敛 External。
+    #[tokio::test]
+    async fn disabling_reclassifies_external_edit_between_preflight_and_restore(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-disable-cas",
+            16_001,
+            "test-local-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let routed = fs::read_to_string(&config_path).expect("读取路由态 Home");
+        let external = routed.replace(
+            "http://127.0.0.1:16001/v1",
+            "https://external-after-preflight.example/v1",
+        );
+        assert_ne!(external, routed, "测试必须修改活动严格字段");
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(false),
+            reject_new_requests_calls: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            Arc::new(InterfereAfterDisablePreparedPersistence {
+                db: db.clone(),
+                config_path: config_path.clone(),
+                external_content: external.as_bytes().to_vec(),
+                interfered: AtomicBool::new(false),
+            }),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-disable-cas".to_string(), runtime.clone())?;
+
+        manager.disable("profile-disable-cas").await?;
+
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("读取并发修改后的 Home"),
+            external
+        );
+        let route = db
+            .get_codex_profile_route("profile-disable-cas")?
+            .expect("关闭路由");
+        assert!(!route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+        assert!(route.live_backup_json.is_none());
+        assert!(route.recovery_json.is_none());
+        assert!(route.last_error.is_none());
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// restore 冲突后的重分类若遇到瞬态 I/O，必须保留 Managed recovery 供重试。
+    #[tokio::test]
+    async fn disabling_reclassification_io_failure_keeps_managed_recovery_retryable(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let system_home_config = CodexHomeConfigService::system();
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            &system_home_config,
+            home.path(),
+            "profile-disable-reclass-io",
+            16_001,
+            "test-local-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let routed = fs::read_to_string(&config_path).expect("读取路由态 Home");
+        let external = routed.replace(
+            "http://127.0.0.1:16001/v1",
+            "https://external-before-io.example/v1",
+        );
+        let file_ops = Arc::new(ExternalThenRetryableReadErrorOps {
+            config_path: config_path.clone(),
+            external_content: external.as_bytes().to_vec(),
+            config_reads: AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(false),
+            reject_new_requests_calls: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(file_ops)),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-disable-reclass-io".to_string(), runtime.clone())?;
+
+        manager
+            .disable("profile-disable-reclass-io")
+            .await
+            .expect_err("瞬态重分类读取失败必须保留重试状态");
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取 Home"),
+            external
+        );
+        let route = db
+            .get_codex_profile_route("profile-disable-reclass-io")?
+            .expect("路由存在");
+        assert!(route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::Managed);
+        assert!(route.live_backup_json.is_some());
+        assert!(route.recovery_json.is_some());
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// 历史关闭恢复遇到已外部接管的严格字段时，不得永久重放旧 restore。
+    #[tokio::test]
+    async fn pending_disable_restore_failure_reclassifies_external_takeover() -> Result<(), AppError>
+    {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-pending-external",
+            16_001,
+            "test-local-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let external = fs::read_to_string(&config_path)
+            .expect("读取路由态 Home")
+            .replace(
+                "http://127.0.0.1:16001/v1",
+                "https://external-during-recovery.example/v1",
+            );
+        fs::write(&config_path, &external).expect("写入外部严格字段");
+        let mut route = db
+            .get_codex_profile_route("profile-pending-external")?
+            .expect("路由存在");
+        let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+        let mut target = before.clone();
+        target.enabled = false;
+        route.recovery_json = Some(
+            serde_json::to_string(&RouteRecoveryRecord {
+                operation: "disable".to_string(),
+                before,
+                target,
+                phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
+                last_error: Some("CODEX_PROFILE_OPERATION_FAILURE".to_string()),
+                reconcile: None,
+            })
+            .expect("编码历史关闭恢复"),
+        );
+        db.save_codex_profile_route(&route)?;
+        let runtime = Arc::new(RecoveryRuntime {
+            healthy: true,
+            stop_fails: AtomicBool::new(false),
+            reject_new_requests_calls: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime("profile-pending-external".to_string(), runtime.clone())?;
+
+        manager.disable("profile-pending-external").await?;
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取 Home"),
+            external
+        );
+        let route = db
+            .get_codex_profile_route("profile-pending-external")?
+            .expect("路由存在");
+        assert!(!route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+        assert!(route.live_backup_json.is_none());
+        assert!(route.recovery_json.is_none());
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -10780,7 +11335,7 @@ keep = true
             Arc::new(SaveFailingPersistence {
                 db: db.clone(),
                 save_count: AtomicUsize::new(0),
-                fail_on_save: 2,
+                fail_on_save: 3,
                 fail_replace: false,
             }),
             Arc::new(CodexHomeConfigService::system()),
