@@ -560,20 +560,57 @@ impl CodexHomeConfigService {
 
     /// 将计划的原始配置编码为 Profile 私有恢复备份。
     pub fn serialize_backup(&self, plan: &CodexRouteConfigPlan) -> Result<String, AppError> {
-        let ownership_proof = build_route_ownership_proof(&plan.target_content).ok();
-        let version = if ownership_proof.is_some() {
-            CODEX_ROUTE_BACKUP_VERSION
-        } else {
-            legacy_route_backup_version()
+        serialize_route_backup(
+            plan.previous.content.clone(),
+            plan.previous.fingerprint.clone(),
+            &plan.target_content,
+            &plan.target_fingerprint,
+        )
+    }
+
+    /// 为显式切换构造最新恢复基线；托管 Home 复用旧严格字段，外部 Home 采用当前配置。
+    pub fn serialize_explicit_switch_backup(
+        &self,
+        plan: &CodexRouteConfigPlan,
+        backup_json: Option<&str>,
+        listen_port: u16,
+        listener_token: &str,
+    ) -> Result<String, AppError> {
+        let Some(backup_json) = backup_json else {
+            let current_proof = plan
+                .previous
+                .content
+                .as_deref()
+                .and_then(|content| build_route_ownership_proof(content).ok());
+            let desired_proof = build_route_ownership_proof(&plan.target_content)?;
+            if current_proof
+                .as_ref()
+                .is_some_and(|proof| route_proof_matches(proof, &desired_proof))
+            {
+                return Err(AppError::Config(
+                    "Codex Profile 托管路由缺少接管前恢复备份".to_string(),
+                ));
+            }
+            return self.serialize_backup(plan);
         };
-        serde_json::to_string(&CodexRouteBackup {
-            version,
-            previous_content: plan.previous.content.clone(),
-            previous_fingerprint: plan.previous.fingerprint.clone(),
-            target_fingerprint: plan.target_fingerprint.clone(),
-            ownership_proof,
-        })
-        .map_err(|error| AppError::JsonSerialize { source: error })
+        if self.classify_profile_reconcile(plan, backup_json, listen_port)?
+            == CodexHomeReconcileOwnership::ExternalTakeover
+        {
+            return self.serialize_backup(plan);
+        }
+        let previous_content = build_latest_managed_baseline(
+            plan.previous.content.as_deref(),
+            backup_json,
+            listen_port,
+            listener_token,
+        )?;
+        let previous_fingerprint = fingerprint_content(previous_content.as_deref());
+        serialize_route_backup(
+            previous_content,
+            previous_fingerprint,
+            &plan.target_content,
+            &plan.target_fingerprint,
+        )
     }
 
     /// 仅当 Home 仍是该 Profile 接管版本时恢复其备份配置。
@@ -1144,6 +1181,62 @@ fn apply_previous_managed_route_state(
     )?;
     cleanup_created_provider_tables(current, projection);
     Ok(())
+}
+
+/// 将旧接管前严格字段合并到当前 Home 的非路由字段，形成显式切换的新恢复基线。
+fn build_latest_managed_baseline(
+    current_content: Option<&[u8]>,
+    backup_json: &str,
+    listen_port: u16,
+    listener_token: &str,
+) -> Result<Option<Vec<u8>>, AppError> {
+    let backup = CodexHomeConfigService::decode_route_backup(backup_json)?;
+    let projection = build_managed_route_projection(
+        backup.previous_content.as_deref(),
+        listen_port,
+        listener_token,
+    )?;
+    let current_content = current_content.ok_or_else(|| {
+        AppError::Config("Codex Profile 托管路由缺少当前 config.toml".to_string())
+    })?;
+    let mut current_document = parse_codex_document(current_content, "当前")?;
+    let current_state = read_managed_route_state(&current_document, &projection);
+    ensure_managed_route_owned(&current_state, &projection.target, listen_port)?;
+    apply_previous_managed_route_state(&mut current_document, &projection)?;
+    let merged_content = current_document.to_string().into_bytes();
+    if backup.previous_content.is_none()
+        && std::str::from_utf8(&merged_content)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        Ok(None)
+    } else {
+        Ok(Some(merged_content))
+    }
+}
+
+/// 将恢复基线和路由目标编码为不含 listener token 明文的版本化备份。
+fn serialize_route_backup(
+    previous_content: Option<Vec<u8>>,
+    previous_fingerprint: String,
+    target_content: &[u8],
+    target_fingerprint: &str,
+) -> Result<String, AppError> {
+    let ownership_proof = build_route_ownership_proof(target_content).ok();
+    let version = if ownership_proof.is_some() {
+        CODEX_ROUTE_BACKUP_VERSION
+    } else {
+        legacy_route_backup_version()
+    };
+    serde_json::to_string(&CodexRouteBackup {
+        version,
+        previous_content,
+        previous_fingerprint,
+        target_fingerprint: target_fingerprint.to_string(),
+        ownership_proof,
+    })
+    .map_err(|source| AppError::JsonSerialize { source })
 }
 
 /// 读取活动 provider 中的字符串字段，缺失时回退顶层。

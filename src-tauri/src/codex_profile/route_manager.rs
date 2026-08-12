@@ -632,7 +632,8 @@ impl CodexRouteManager {
         let mut runtime_updates = Vec::new();
         for reference in references {
             let home_path = std::path::PathBuf::from(&reference.profile.canonical_home_path);
-            if reference.is_primary {
+            if reference.is_primary && reference.route.home_ownership == CodexHomeOwnership::Managed
+            {
                 let plan = if reference.route.enabled {
                     CodexProviderHomeProjectionPlan::Catalog(
                         self.home_config
@@ -1276,7 +1277,13 @@ impl CodexRouteManager {
                 ));
             }
         };
-        let latest_backup = match self.home_config.serialize_backup(&route_plan) {
+        let latest_backup_result = self.home_config.serialize_explicit_switch_backup(
+            &route_plan,
+            route.live_backup_json.as_deref(),
+            profile.listen_port,
+            &listener_token,
+        );
+        let latest_backup = match latest_backup_result {
             Ok(backup) => backup,
             Err(error) => {
                 let compensation_error = self
@@ -4026,6 +4033,81 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 共享供应商保存不得覆盖已由用户外部接管的 Home，其他托管 Profile 仍应正常收敛。
+    #[tokio::test]
+    async fn shared_provider_save_skips_external_home_and_updates_managed_profile(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = AppState::new(db.clone());
+        let external_home = tempfile::tempdir().expect("临时外部接管 Home");
+        let managed_home = tempfile::tempdir().expect("临时托管 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            managed_home.path(),
+            "profile-managed",
+            16_001,
+            &old_provider,
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-external".to_string(),
+            name: "Profile External".to_string(),
+            canonical_home_path: external_home.path().display().to_string(),
+            listen_port: 16_002,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-external".to_string(),
+            current_provider_id: Some(old_provider.id.clone()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::External,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let external_path = codex_config_path_for_home(external_home.path());
+        let external_config = b"user-owned config that need not parse as TOML\n";
+        fs::write(&external_path, external_config).expect("写入外部接管配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await?;
+
+        assert_eq!(
+            fs::read(&external_path).expect("读取外部接管配置"),
+            external_config
+        );
+        let managed_config = fs::read_to_string(codex_config_path_for_home(managed_home.path()))
+            .expect("读取托管配置");
+        assert!(managed_config.contains("https://new.example.com/v1"));
+        let stored = db
+            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .expect("新供应商已提交");
+        assert!(stored
+            .settings_config
+            .to_string()
+            .contains("new.example.com"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn shared_provider_save_hot_swaps_enabled_primary_runtime_without_restarting(
     ) -> Result<(), AppError> {
@@ -5823,6 +5905,81 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(restored.contains("wire_api = \"chat\""));
         assert!(restored.contains("experimental_bearer_token = \"latest-token\""));
         assert!(restored.contains("js_repl = true"));
+        Ok(())
+    }
+
+    /// 托管路由显式切换时，最新非路由字段与最初直连严格字段共同组成恢复基线。
+    #[tokio::test]
+    async fn switching_managed_profile_preserves_original_route_fields_in_latest_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        for (id, config) in [
+            ("provider-old", ""),
+            ("provider-new", "model = \"provider-model\"\n"),
+        ] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    id.to_string(),
+                    id.to_string(),
+                    json!({"auth": {}, "config": config}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"initial-model\"\nbase_url = \"https://initial.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"initial-token\"\n",
+        )
+        .expect("写入接管前 Home");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-old", vec![]).await?;
+        let routed = fs::read_to_string(&config_path).expect("读取接管配置");
+        fs::write(
+            &config_path,
+            routed.replace("model = \"initial-model\"", "model = \"user-latest\"")
+                + "\n[features]\njs_repl = true\n",
+        )
+        .expect("写入接管期间的非路由配置");
+
+        manager
+            .switch_provider("profile-a", "provider-new", vec![])
+            .await?;
+        let switched_route = db
+            .get_codex_profile_route("profile-a")?
+            .expect("切换后路由存在");
+        let backup = switched_route.live_backup_json.expect("切换后备份存在");
+        assert!(!backup.contains("test-local-token"));
+        manager.disable("profile-a").await?;
+
+        let restored = fs::read_to_string(config_path).expect("读取关闭后的 Home");
+        assert!(restored.contains("model = \"provider-model\""));
+        assert!(restored.contains("base_url = \"https://initial.example/v1\""));
+        assert!(restored.contains("wire_api = \"chat\""));
+        assert!(restored.contains("experimental_bearer_token = \"initial-token\""));
+        assert!(restored.contains("js_repl = true"));
+        assert!(!restored.contains("test-local-token"));
         Ok(())
     }
 
