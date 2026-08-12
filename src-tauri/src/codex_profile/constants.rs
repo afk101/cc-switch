@@ -38,6 +38,10 @@ pub const CODEX_PROFILE_SECRET_DIRECTORY: &str = "codex-profiles";
 pub const CODEX_PROFILE_TOKEN_FILENAME: &str = "listener-token";
 /// 旧单例代理接管配置中使用的兼容占位符。
 pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
+/// 当前 Codex Profile Home 路由备份格式版本。
+pub const CODEX_ROUTE_BACKUP_VERSION: u8 = 2;
+/// listener token 所有权摘要的域分离标签。
+pub const CODEX_ROUTE_TOKEN_PROOF_DOMAIN: &[u8] = b"cc-switch/codex-route-token-proof/v1";
 /// 已迁移旧路由等待创建兼容本地凭证时使用的数据库设置键。
 pub const CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING: &str =
     "codex_legacy_token_pending_profile_id";

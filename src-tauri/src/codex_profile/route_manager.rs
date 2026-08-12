@@ -1801,12 +1801,15 @@ impl CodexRouteManager {
             .classify_profile_reconcile(plan, backup, profile.listen_port)?
         {
             CodexHomeReconcileOwnership::Current => {
-                self.finalize_current_home_backup(route, backup, plan.target_fingerprint())
+                self.finalize_current_home_backup(route, backup, plan)
             }
             CodexHomeReconcileOwnership::RouteOwned
             | CodexHomeReconcileOwnership::LegacyManaged => {
                 self.apply_profile_reconcile(route, backup, plan)
             }
+            CodexHomeReconcileOwnership::ExternalTakeover => Err(AppError::Config(
+                "Codex Profile Home 已由外部连接配置接管".to_string(),
+            )),
         }
     }
 
@@ -1815,11 +1818,9 @@ impl CodexRouteManager {
         &self,
         route: &CodexProfileRoute,
         backup: &str,
-        target_fingerprint: &str,
+        plan: &CodexRouteConfigPlan,
     ) -> Result<(), AppError> {
-        let rebased = self
-            .home_config
-            .rebase_route_backup(backup, target_fingerprint)?;
+        let rebased = self.home_config.rebase_route_backup_to_plan(backup, plan)?;
         if rebased == backup {
             return Ok(());
         }
@@ -1847,10 +1848,7 @@ impl CodexRouteManager {
         ) {
             return Err(self.compensate_reconcile_failure(plan, &error));
         }
-        let rebased = match self
-            .home_config
-            .rebase_route_backup(backup, plan.target_fingerprint())
-        {
+        let rebased = match self.home_config.rebase_route_backup_to_plan(backup, plan) {
             Ok(rebased) => rebased,
             Err(error) => return Err(self.compensate_reconcile_failure(plan, &error)),
         };

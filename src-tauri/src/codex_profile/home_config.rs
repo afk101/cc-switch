@@ -2,9 +2,10 @@ use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
 use crate::codex_profile::{
-    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_ROUTE_FIELD_BASE_URL,
-    CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API, CODEX_ROUTE_LISTEN_HOST,
-    CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
+    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_ROUTE_BACKUP_VERSION,
+    CODEX_ROUTE_FIELD_BASE_URL, CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API,
+    CODEX_ROUTE_LISTEN_HOST, CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_TOKEN_PROOF_DOMAIN,
+    CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
 };
 use crate::error::AppError;
 use crate::provider::Provider;
@@ -99,14 +100,29 @@ pub enum CodexHomeReconcileOwnership {
     RouteOwned,
     /// Home 是端口匹配的旧 `PROXY_MANAGED` 配置。
     LegacyManaged,
+    /// 当前活动连接路径已不再由该 Profile 路由持有。
+    ExternalTakeover,
 }
 
 /// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
 #[derive(Serialize, Deserialize)]
 struct CodexRouteBackup {
+    #[serde(default = "legacy_route_backup_version")]
+    version: u8,
     previous_content: Option<Vec<u8>>,
     previous_fingerprint: String,
     target_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership_proof: Option<CodexRouteOwnershipProof>,
+}
+
+/// 不含凭证明文的活动路由字段所有权证明。
+#[derive(Serialize, Deserialize)]
+struct CodexRouteOwnershipProof {
+    active_provider_id: Option<String>,
+    base_url: String,
+    wire_api: String,
+    token_digest: String,
 }
 
 /// 单个严格路由字段在 Codex TOML 中的准确位置。
@@ -520,10 +536,18 @@ impl CodexHomeConfigService {
 
     /// 将计划的原始配置编码为 Profile 私有恢复备份。
     pub fn serialize_backup(&self, plan: &CodexRouteConfigPlan) -> Result<String, AppError> {
+        let ownership_proof = build_route_ownership_proof(&plan.target_content).ok();
+        let version = if ownership_proof.is_some() {
+            CODEX_ROUTE_BACKUP_VERSION
+        } else {
+            legacy_route_backup_version()
+        };
         serde_json::to_string(&CodexRouteBackup {
+            version,
             previous_content: plan.previous.content.clone(),
             previous_fingerprint: plan.previous.fingerprint.clone(),
             target_fingerprint: plan.target_fingerprint.clone(),
+            ownership_proof,
         })
         .map_err(|error| AppError::JsonSerialize { source: error })
     }
@@ -629,20 +653,41 @@ impl CodexHomeConfigService {
         backup_json: &str,
         listen_port: u16,
     ) -> Result<CodexHomeReconcileOwnership, AppError> {
-        if plan.previous.fingerprint == plan.target_fingerprint {
-            return Ok(CodexHomeReconcileOwnership::Current);
-        }
+        let current_content = plan.previous.content.as_deref().ok_or_else(|| {
+            AppError::Config("Codex Profile 路由所有权检查缺少 config.toml".to_string())
+        })?;
+        let current_proof = build_route_ownership_proof(current_content)?;
+        let desired_proof = build_route_ownership_proof(&plan.target_content)?;
         let backup = Self::decode_route_backup(backup_json)?;
-        if plan.previous.fingerprint == backup.target_fingerprint {
-            return Ok(CodexHomeReconcileOwnership::RouteOwned);
-        }
         if Self::is_legacy_managed_home(plan.previous.content.as_deref(), listen_port) {
             return Ok(CodexHomeReconcileOwnership::LegacyManaged);
         }
-        Err(AppError::CodexLiveConfigConflict {
-            expected_fingerprint: backup.target_fingerprint,
-            actual_fingerprint: plan.previous.fingerprint.clone(),
-        })
+        if backup.version == CODEX_ROUTE_BACKUP_VERSION {
+            let Some(proof) = backup.ownership_proof.as_ref() else {
+                return Ok(CodexHomeReconcileOwnership::ExternalTakeover);
+            };
+            if !route_proof_public_target_matches(&current_proof, proof) {
+                return Ok(CodexHomeReconcileOwnership::ExternalTakeover);
+            }
+            if current_proof.token_digest == desired_proof.token_digest {
+                if plan.previous.fingerprint == backup.target_fingerprint
+                    && plan.previous.fingerprint != plan.target_fingerprint
+                {
+                    return Ok(CodexHomeReconcileOwnership::RouteOwned);
+                }
+                return Ok(CodexHomeReconcileOwnership::Current);
+            }
+            if current_proof.token_digest == proof.token_digest {
+                return Ok(CodexHomeReconcileOwnership::RouteOwned);
+            }
+            return Ok(CodexHomeReconcileOwnership::ExternalTakeover);
+        }
+        if backup.version < CODEX_ROUTE_BACKUP_VERSION
+            && plan.previous.fingerprint == backup.target_fingerprint
+        {
+            return Ok(CodexHomeReconcileOwnership::RouteOwned);
+        }
+        Ok(CodexHomeReconcileOwnership::ExternalTakeover)
     }
 
     /// 保留最初 Home 快照，只把路由备份的 target 指纹重定位到新配置。
@@ -653,6 +698,19 @@ impl CodexHomeConfigService {
     ) -> Result<String, AppError> {
         let mut backup = Self::decode_route_backup(backup_json)?;
         backup.target_fingerprint = target_fingerprint.to_string();
+        serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
+    }
+
+    /// 将备份升级到指定目标计划，并同步更新字段级所有权证明。
+    pub fn rebase_route_backup_to_plan(
+        &self,
+        backup_json: &str,
+        plan: &CodexRouteConfigPlan,
+    ) -> Result<String, AppError> {
+        let mut backup = Self::decode_route_backup(backup_json)?;
+        backup.version = CODEX_ROUTE_BACKUP_VERSION;
+        backup.target_fingerprint = plan.target_fingerprint.clone();
+        backup.ownership_proof = Some(build_route_ownership_proof(&plan.target_content)?);
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
@@ -689,6 +747,50 @@ fn parse_codex_document(content: &[u8], context: &str) -> Result<DocumentMut, Ap
     })?;
     text.parse::<DocumentMut>()
         .map_err(|error| AppError::Config(format!("{context} Codex config.toml 无效: {error}")))
+}
+
+/// 为无版本字段的旧备份提供兼容版本号。
+fn legacy_route_backup_version() -> u8 {
+    1
+}
+
+/// 对 listener token 计算域分离摘要，避免与普通 SHA-256 摘要混用。
+fn route_token_digest(listener_token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CODEX_ROUTE_TOKEN_PROOF_DOMAIN);
+    hasher.update([0]);
+    hasher.update(listener_token.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 从目标配置提取当前活动连接路径并生成脱敏所有权证明。
+fn build_route_ownership_proof(
+    target_content: &[u8],
+) -> Result<CodexRouteOwnershipProof, AppError> {
+    let target = parse_codex_document(target_content, "路由目标")?;
+    let target_text = target.to_string();
+    let base_url = extract_active_codex_route_string(&target_text, CODEX_ROUTE_FIELD_BASE_URL)
+        .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少 base_url".to_string()))?;
+    let wire_api = extract_active_codex_route_string(&target_text, CODEX_ROUTE_FIELD_WIRE_API)
+        .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少 wire_api".to_string()))?;
+    let listener_token = crate::codex_config::extract_codex_experimental_bearer_token(&target_text)
+        .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
+    Ok(CodexRouteOwnershipProof {
+        active_provider_id: active_codex_provider_id(&target),
+        base_url,
+        wire_api,
+        token_digest: route_token_digest(&listener_token),
+    })
+}
+
+/// 判断两个证明是否指向同一个活动 provider 与公开路由目标。
+fn route_proof_public_target_matches(
+    actual: &CodexRouteOwnershipProof,
+    expected: &CodexRouteOwnershipProof,
+) -> bool {
+    actual.active_provider_id == expected.active_provider_id
+        && actual.base_url == expected.base_url
+        && actual.wire_api == expected.wire_api
 }
 
 /// 返回文档中当前活动 provider 标识。
@@ -1838,6 +1940,187 @@ wire_api = "responses"
 
     /// 启动修复重定位备份时只能更新 target 指纹，不能丢失最初的 Home 快照。
     #[test]
+    fn profile_ownership_ignores_non_route_changes_and_hides_listener_token() -> Result<(), AppError>
+    {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            r#"model_provider = "custom"
+model = "before-model"
+
+[model_providers.custom]
+base_url = "https://upstream.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "upstream-token"
+
+[model_providers.inactive]
+base_url = "https://inactive.example/v1"
+wire_api = "chat"
+"#,
+        )
+        .expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let listener_token = "listener-token-must-not-be-persisted";
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+
+        let changed = fs::read_to_string(&config_path)
+            .expect("读取接管配置")
+            .replace("model = \"before-model\"", "model = \"latest-model\"")
+            .replace(
+                "https://inactive.example/v1",
+                "https://changed-inactive.example/v1",
+            )
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.example]\nenabled = true\n";
+        fs::write(&config_path, changed).expect("写入非路由变化");
+        let desired =
+            service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired, &backup, 15_722)?,
+            CodexHomeReconcileOwnership::Current
+        );
+        let backup_json: serde_json::Value = serde_json::from_str(&backup).expect("解析备份");
+        assert_eq!(backup_json["version"], 2);
+        assert!(backup_json.get("ownership_proof").is_some());
+        assert!(!backup.contains(listener_token));
+        Ok(())
+    }
+
+    /// token secret 重建后只能用备份摘要证明旧 token，不能依赖整文件指纹。
+    #[test]
+    fn profile_ownership_proves_stale_listener_token_after_non_route_change() -> Result<(), AppError>
+    {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\nmodel = \"before\"\n\n[model_providers.custom]\nbase_url = \"https://upstream.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"upstream-token\"\n",
+        )
+        .expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let old_plan =
+            service.build_profile_route_plan(home.path(), 15_722, None, "old-listener-token")?;
+        let backup = service.serialize_backup(&old_plan)?;
+        service.apply_route_plan(&old_plan)?;
+        let changed = fs::read_to_string(&config_path)
+            .expect("读取旧路由配置")
+            .replace("model = \"before\"", "model = \"latest\"")
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n";
+        fs::write(&config_path, changed).expect("写入非路由变化");
+        let desired =
+            service.build_profile_route_plan(home.path(), 15_722, None, "new-listener-token")?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired, &backup, 15_722)?,
+            CodexHomeReconcileOwnership::RouteOwned
+        );
+        Ok(())
+    }
+
+    /// 当前活动连接路径的 selector 或严格字段变化必须分类为外部接管。
+    #[test]
+    fn profile_ownership_classifies_active_route_changes_as_external_takeover(
+    ) -> Result<(), AppError> {
+        let original = r#"model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://upstream.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "upstream-token"
+
+[model_providers.external]
+base_url = "https://external.example/v1"
+wire_api = "chat"
+experimental_bearer_token = "external-token"
+"#;
+        let cases = [
+            (
+                "model_provider = \"custom\"",
+                "model_provider = \"external\"",
+            ),
+            ("http://127.0.0.1:15722/v1", "https://external.example/v1"),
+            ("wire_api = \"responses\"", "wire_api = \"chat\""),
+            (
+                "experimental_bearer_token = \"listener-token-aaaaaaaa\"",
+                "experimental_bearer_token = \"external-token-bbbbbbb\"",
+            ),
+        ];
+
+        for (from, to) in cases {
+            let home = tempfile::tempdir().expect("创建临时 Home");
+            let config_path = codex_config_path_for_home(home.path());
+            fs::write(&config_path, original).expect("写入接管前配置");
+            let service = CodexHomeConfigService::system();
+            let plan = service.build_profile_route_plan(
+                home.path(),
+                15_722,
+                None,
+                "listener-token-aaaaaaaa",
+            )?;
+            let backup = service.serialize_backup(&plan)?;
+            service.apply_route_plan(&plan)?;
+            let changed = fs::read_to_string(&config_path)
+                .expect("读取接管配置")
+                .replacen(from, to, 1);
+            assert!(changed.contains(to), "测试夹具必须改写活动连接路径");
+            fs::write(&config_path, changed).expect("写入外部接管配置");
+            let desired = service.build_profile_route_plan(
+                home.path(),
+                15_722,
+                None,
+                "listener-token-aaaaaaaa",
+            )?;
+
+            assert_eq!(
+                service.classify_profile_reconcile(&desired, &backup, 15_722)?,
+                CodexHomeReconcileOwnership::ExternalTakeover
+            );
+        }
+        Ok(())
+    }
+
+    /// selector 即使改到相同本地三字段，也属于用户显式改变活动连接路径。
+    #[test]
+    fn profile_ownership_rejects_changed_selector_with_same_route_shape() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\n\n[model_providers.custom]\nbase_url = \"https://upstream.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"upstream-token\"\n",
+        )
+        .expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "listener-token-aaaaaaaa",
+        )?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+        let routed = fs::read_to_string(&config_path).expect("读取接管配置");
+        let current = routed.replace("model_provider = \"custom\"", "model_provider = \"other\"")
+            + "\n[model_providers.other]\nbase_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"listener-token-aaaaaaaa\"\n";
+        fs::write(&config_path, current).expect("写入相同形状的新 selector");
+        let desired = service.build_profile_route_plan(
+            home.path(),
+            15_722,
+            None,
+            "listener-token-aaaaaaaa",
+        )?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired, &backup, 15_722)?,
+            CodexHomeReconcileOwnership::ExternalTakeover
+        );
+        Ok(())
+    }
+
+    /// 启动修复重定位备份时只能更新 target 指纹，不能丢失最初的 Home 快照。
+    #[test]
     fn restoring_enabled_profile_home_rebases_backup_without_serializing_new_token(
     ) -> Result<(), AppError> {
         let home = tempfile::tempdir().expect("创建临时 Home");
@@ -1859,8 +2142,7 @@ wire_api = "responses"
             service.classify_profile_reconcile(&desired_plan, &old_backup, 15_722)?,
             CodexHomeReconcileOwnership::RouteOwned
         );
-        let rebased =
-            service.rebase_route_backup(&old_backup, desired_plan.target_fingerprint())?;
+        let rebased = service.rebase_route_backup_to_plan(&old_backup, &desired_plan)?;
         let old_json: serde_json::Value = serde_json::from_str(&old_backup).expect("解析旧备份");
         let rebased_json: serde_json::Value = serde_json::from_str(&rebased).expect("解析新备份");
 
@@ -1876,6 +2158,12 @@ wire_api = "responses"
             rebased_json["target_fingerprint"],
             desired_plan.target_fingerprint()
         );
+        assert_ne!(
+            rebased_json["ownership_proof"]["token_digest"],
+            old_json["ownership_proof"]["token_digest"]
+        );
+        assert_eq!(rebased_json["version"], CODEX_ROUTE_BACKUP_VERSION);
+        assert!(!rebased.contains("old-listener-token"));
         assert!(!rebased.contains("new-listener-token"));
         Ok(())
     }
@@ -1910,9 +2198,10 @@ wire_api = "responses"
         .expect("写入外部编辑");
         let external_plan =
             service.build_profile_route_plan(home.path(), 15_722, None, "new-token")?;
-        assert!(service
-            .classify_profile_reconcile(&external_plan, &backup, 15_722)
-            .is_err());
+        assert_eq!(
+            service.classify_profile_reconcile(&external_plan, &backup, 15_722)?,
+            CodexHomeReconcileOwnership::ExternalTakeover
+        );
         assert!(service
             .restore_profile_backup(home.path(), &backup, 15_722, "new-token")
             .is_err());
