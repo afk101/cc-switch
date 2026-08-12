@@ -707,6 +707,11 @@ impl CodexHomeConfigService {
             return Ok(CodexHomeReconcileOwnership::ExternalTakeover);
         }
         if backup.version < CODEX_ROUTE_BACKUP_VERSION
+            && route_proof_matches(&current_proof, &desired_proof)
+        {
+            return Ok(CodexHomeReconcileOwnership::Current);
+        }
+        if backup.version < CODEX_ROUTE_BACKUP_VERSION
             && plan.previous.fingerprint == backup.target_fingerprint
         {
             return Ok(CodexHomeReconcileOwnership::RouteOwned);
@@ -815,6 +820,15 @@ fn route_proof_public_target_matches(
     actual.active_provider_id == expected.active_provider_id
         && actual.base_url == expected.base_url
         && actual.wire_api == expected.wire_api
+}
+
+/// 判断活动连接路径及 listener token 是否完整一致。
+fn route_proof_matches(
+    actual: &CodexRouteOwnershipProof,
+    expected: &CodexRouteOwnershipProof,
+) -> bool {
+    route_proof_public_target_matches(actual, expected)
+        && actual.token_digest == expected.token_digest
 }
 
 /// 返回文档中当前活动 provider 标识。
@@ -2040,6 +2054,47 @@ wire_api = "chat"
         assert_eq!(
             service.classify_profile_reconcile(&desired, &backup, 15_722)?,
             CodexHomeReconcileOwnership::RouteOwned
+        );
+        Ok(())
+    }
+
+    /// v1 备份缺少字段级证明时，当前 listener token 仍能证明路由所有权。
+    #[test]
+    fn profile_ownership_upgrades_v1_backup_when_current_token_still_matches(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model_provider = \"custom\"\nmodel = \"before\"\n\n[model_providers.custom]\nbase_url = \"https://upstream.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"upstream-token\"\n",
+        )
+        .expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let listener_token = "current-listener-token";
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let mut legacy_backup: serde_json::Value =
+            serde_json::from_str(&service.serialize_backup(&plan)?).expect("解析新版备份");
+        legacy_backup
+            .as_object_mut()
+            .expect("备份应为对象")
+            .remove("version");
+        legacy_backup
+            .as_object_mut()
+            .expect("备份应为对象")
+            .remove("ownership_proof");
+        let legacy_backup = serde_json::to_string(&legacy_backup).expect("编码 v1 备份");
+        service.apply_route_plan(&plan)?;
+        let changed = fs::read_to_string(&config_path)
+            .expect("读取接管配置")
+            .replace("model = \"before\"", "model = \"latest\"")
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n";
+        fs::write(&config_path, changed).expect("写入非路由变化");
+        let desired =
+            service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired, &legacy_backup, 15_722)?,
+            CodexHomeReconcileOwnership::Current
         );
         Ok(())
     }

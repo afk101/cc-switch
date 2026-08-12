@@ -3458,6 +3458,9 @@ mod tests {
                 enabled_codex BOOLEAN NOT NULL DEFAULT 0,
                 enabled_hermes BOOLEAN NOT NULL DEFAULT 0
             );
+            CREATE TABLE codex_profile_routes (
+                profile_id TEXT PRIMARY KEY
+            );
             INSERT INTO mcp_servers (
                 id, name, server_config, enabled_claude, enabled_codex,
                 enabled_gemini, enabled_opencode, enabled_hermes
@@ -3471,7 +3474,7 @@ mod tests {
         Database::set_user_version(&conn, 16)?;
         Database::apply_schema_migrations_on_conn(&conn)?;
 
-        assert_eq!(Database::get_user_version(&conn)?, 17);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         assert!(Database::has_column(
             &conn,
             "mcp_servers",
@@ -3538,7 +3541,7 @@ mod tests {
 
         Database::apply_schema_migrations_on_conn(&conn)?;
 
-        assert_eq!(Database::get_user_version(&conn)?, 17);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
         let counts: (i64, i64, i64, i64) = conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM proxy_request_logs WHERE data_source = 'codex_session'),

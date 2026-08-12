@@ -3804,6 +3804,29 @@ mod codex_route_manager {
         Ok(plan)
     }
 
+    /// 将测试路由的新版备份降级为无版本、无字段证明的 v1 形态。
+    fn downgrade_route_backup_to_v1(db: &Database, profile_id: &str) -> Result<(), AppError> {
+        let mut route = db
+            .get_codex_profile_route(profile_id)?
+            .ok_or_else(|| AppError::InvalidInput("测试路由不存在".to_string()))?;
+        let mut backup: serde_json::Value = serde_json::from_str(
+            route
+                .live_backup_json
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidInput("测试路由缺少备份".to_string()))?,
+        )
+        .map_err(|source| AppError::Config(format!("测试备份 JSON 无效: {source}")))?;
+        let backup = backup
+            .as_object_mut()
+            .ok_or_else(|| AppError::Config("测试备份不是 JSON 对象".to_string()))?;
+        backup.remove("version");
+        backup.remove("ownership_proof");
+        route.live_backup_json = Some(
+            serde_json::to_string(backup).map_err(|source| AppError::JsonSerialize { source })?,
+        );
+        db.save_codex_profile_route(&route)
+    }
+
     /// 构造包含路由模型目录的测试供应商。
     fn provider_with_route_catalog(id: &str, model: &str) -> Provider {
         let mut provider = Provider::with_id(
@@ -6291,6 +6314,252 @@ experimental_bearer_token = "PROXY_MANAGED"
                 manager.status(profile_id).await?,
                 CodexRuntimeStatus::Running
             );
+        }
+        Ok(())
+    }
+
+    /// listener token 文件丢失后，新版证明只能升级严格路由字段并保留用户配置。
+    #[tokio::test]
+    async fn startup_repairs_missing_listener_token_from_v2_proof_without_leaking_or_overwriting(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("token 丢失 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-missing-token",
+            16_001,
+            "old-listener-token-private",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let changed = fs::read_to_string(&config_path)
+            .expect("读取旧路由配置")
+            .replace(
+                "name = \"Original\"",
+                "name = \"Original\"\nmodel = \"latest-model\"",
+            )
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.example]\nenabled = true\n";
+        fs::write(&config_path, changed).expect("模拟 token 丢失后的用户配置");
+        let token_store = Arc::new(MissingReadTokenStore {
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        let repaired = fs::read_to_string(&config_path).expect("读取 token 自愈配置");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&repaired).as_deref(),
+            Some("unexpected-new-token")
+        );
+        assert!(repaired.contains("model = \"latest-model\""));
+        assert!(repaired.contains("followUpQueueMode = \"queue\""));
+        assert!(repaired.contains("[plugins.example]"));
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.status("profile-missing-token").await?,
+            CodexRuntimeStatus::Running
+        );
+        let route = db
+            .get_codex_profile_route("profile-missing-token")?
+            .expect("路由存在");
+        let backup = route.live_backup_json.expect("新版备份存在");
+        assert!(!backup.contains("old-listener-token-private"));
+        assert!(!backup.contains("unexpected-new-token"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&backup).expect("解析新版备份")["version"],
+            crate::codex_profile::CODEX_ROUTE_BACKUP_VERSION
+        );
+        Ok(())
+    }
+
+    /// v1 备份仅在当前 token、旧 target 或完整 legacy triple 可证明时升级。
+    #[tokio::test]
+    async fn startup_upgrades_only_provable_v1_route_backups() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let current_home = tempfile::tempdir().expect("当前 token Home");
+        let target_home = tempfile::tempdir().expect("旧 target Home");
+        let legacy_home = tempfile::tempdir().expect("legacy Home");
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            current_home.path(),
+            "profile-v1-current",
+            16_001,
+            "test-local-token",
+        )?;
+        downgrade_route_backup_to_v1(&db, "profile-v1-current")?;
+        let current_path = codex_config_path_for_home(current_home.path());
+        let current_changed = fs::read_to_string(&current_path).expect("读取 current Home")
+            + "\nmodel = \"latest-model\"\n[desktop]\nfollowUpQueueMode = \"queue\"\n";
+        fs::write(&current_path, current_changed).expect("写入 current 非路由变化");
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            target_home.path(),
+            "profile-v1-target",
+            16_002,
+            "old-listener-token",
+        )?;
+        downgrade_route_backup_to_v1(&db, "profile-v1-target")?;
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            legacy_home.path(),
+            "profile-v1-legacy",
+            16_003,
+            "old-listener-token",
+        )?;
+        downgrade_route_backup_to_v1(&db, "profile-v1-legacy")?;
+        fs::write(
+            codex_config_path_for_home(legacy_home.path()),
+            "model_provider = \"provider-profile-v1-legacy\"\n\n[model_providers.provider-profile-v1-legacy]\nbase_url = \"http://127.0.0.1:16003/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n",
+        )
+        .expect("写入完整 legacy triple");
+
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        for profile_id in [
+            "profile-v1-current",
+            "profile-v1-target",
+            "profile-v1-legacy",
+        ] {
+            assert_eq!(
+                manager.status(profile_id).await?,
+                CodexRuntimeStatus::Running
+            );
+            let backup = db
+                .get_codex_profile_route(profile_id)?
+                .expect("升级后路由存在")
+                .live_backup_json
+                .expect("升级后备份存在");
+            let backup_json: serde_json::Value =
+                serde_json::from_str(&backup).expect("解析升级后备份");
+            assert_eq!(
+                backup_json["version"],
+                crate::codex_profile::CODEX_ROUTE_BACKUP_VERSION
+            );
+            assert!(backup_json.get("ownership_proof").is_some());
+            assert!(!backup.contains("test-local-token"));
+            assert!(!backup.contains("old-listener-token"));
+            assert!(!backup.contains("PROXY_MANAGED"));
+        }
+        let current = fs::read_to_string(current_path).expect("读取升级后 current Home");
+        assert!(current.contains("model = \"latest-model\""));
+        assert!(current.contains("followUpQueueMode = \"queue\""));
+        Ok(())
+    }
+
+    /// 模糊 v1 token、同形状外部 token 与不完整 legacy 均必须保护 Home 并静默关闭。
+    #[tokio::test]
+    async fn startup_fails_closed_for_unprovable_v1_and_legacy_tokens() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let ambiguous_home = tempfile::tempdir().expect("模糊 v1 Home");
+        let same_shape_home = tempfile::tempdir().expect("同形状外部 token Home");
+        let incomplete_legacy_home = tempfile::tempdir().expect("不完整 legacy Home");
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            ambiguous_home.path(),
+            "profile-v1-ambiguous",
+            16_011,
+            "old-listener-token",
+        )?;
+        downgrade_route_backup_to_v1(&db, "profile-v1-ambiguous")?;
+        let ambiguous_path = codex_config_path_for_home(ambiguous_home.path());
+        let ambiguous = fs::read_to_string(&ambiguous_path).expect("读取模糊 v1 Home")
+            + "\n[desktop]\nfollowUpQueueMode = \"queue\"\n";
+        fs::write(&ambiguous_path, &ambiguous).expect("写入 v1 非路由变化");
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            same_shape_home.path(),
+            "profile-same-shape",
+            16_012,
+            "test-local-token",
+        )?;
+        let same_shape_path = codex_config_path_for_home(same_shape_home.path());
+        let same_shape = fs::read_to_string(&same_shape_path)
+            .expect("读取同形状 token Home")
+            .replace("test-local-token", "evil-local-token");
+        assert_eq!("test-local-token".len(), "evil-local-token".len());
+        fs::write(&same_shape_path, &same_shape).expect("写入同形状外部 token");
+
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            incomplete_legacy_home.path(),
+            "profile-incomplete-legacy",
+            16_013,
+            "old-listener-token",
+        )?;
+        downgrade_route_backup_to_v1(&db, "profile-incomplete-legacy")?;
+        let incomplete_legacy_path = codex_config_path_for_home(incomplete_legacy_home.path());
+        let incomplete_legacy = "model_provider = \"provider-profile-incomplete-legacy\"\n\n[model_providers.provider-profile-incomplete-legacy]\nbase_url = \"http://127.0.0.1:16013/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n";
+        fs::write(&incomplete_legacy_path, incomplete_legacy).expect("写入不完整 legacy triple");
+
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        for (profile_id, path, expected) in [
+            ("profile-v1-ambiguous", ambiguous_path, ambiguous),
+            ("profile-same-shape", same_shape_path, same_shape),
+            (
+                "profile-incomplete-legacy",
+                incomplete_legacy_path,
+                incomplete_legacy.to_string(),
+            ),
+        ] {
+            assert_eq!(fs::read_to_string(path).expect("重读受保护 Home"), expected);
+            let route = db
+                .get_codex_profile_route(profile_id)?
+                .expect("静默关闭路由存在");
+            assert!(!route.enabled);
+            assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+            assert!(route.live_backup_json.is_none());
+            assert!(route.last_error.is_none());
+            assert!(manager.status(profile_id).await.is_err());
         }
         Ok(())
     }

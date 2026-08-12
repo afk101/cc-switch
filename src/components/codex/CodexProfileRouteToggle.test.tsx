@@ -27,8 +27,8 @@ const enabledState: CodexProfileState = {
   route: {
     profileId: "profile-a",
     currentProviderId: "provider-a",
-  enabled: true,
-  homeOwnership: "managed",
+    enabled: true,
+    homeOwnership: "managed",
     lastError: null,
     recoveryJson: null,
     updatedAt: 3,
@@ -48,8 +48,8 @@ const disabledState: CodexProfileState = {
   route: {
     profileId: "profile-b",
     currentProviderId: "provider-b",
-  enabled: false,
-  homeOwnership: "managed",
+    enabled: false,
+    homeOwnership: "managed",
     lastError: null,
     recoveryJson: null,
     updatedAt: 6,
@@ -119,7 +119,7 @@ describe("CodexProfileRouteToggle", () => {
     await user.click(screen.getByRole("switch"));
 
     await waitFor(() =>
-      expect(enableRoute).toHaveBeenCalledWith("profile-b", "provider-b", []),
+      expect(enableRoute).toHaveBeenCalledWith("profile-b", "provider-b"),
     );
     expect(disableRoute).not.toHaveBeenCalled();
   });
