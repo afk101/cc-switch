@@ -2251,6 +2251,13 @@ impl CodexRouteManager {
                 .is_err();
             return Err(CodexStartupRestoreFailure::health_check(stop_failed));
         }
+        if let Err(error) = self.clear_successful_startup_restore_error(&profile.id) {
+            let _ = Self::reject_new_requests_and_stop_runtime(runtime).await;
+            return Err(CodexStartupRestoreFailure::app(
+                CODEX_STARTUP_RESTORE_STAGE_READ_ROUTE,
+                error,
+            ));
+        }
         if let Err(reason) = self.track_restored_runtime(profile.id.clone(), runtime.clone()) {
             let stop_failed = Self::reject_new_requests_and_stop_runtime(runtime)
                 .await
@@ -2261,6 +2268,21 @@ impl CodexRouteManager {
             ));
         }
         Ok(())
+    }
+
+    /// 健康检查成功后清除上一轮启动诊断，不依赖 Home 或 backup 是否发生变化。
+    fn clear_successful_startup_restore_error(&self, profile_id: &str) -> Result<(), AppError> {
+        let Some(route) = self.persistence.get_route(profile_id)? else {
+            return Ok(());
+        };
+        if route.last_error.is_none() {
+            return Ok(());
+        }
+        self.persistence.save_route(&CodexProfileRoute {
+            last_error: None,
+            updated_at: Utc::now().timestamp_millis(),
+            ..route
+        })
     }
 
     /// 返回 Profile 当前运行状态。
@@ -6285,6 +6307,92 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 顶层 fallback listener token 必须在关闭时恢复到原路径，不能错发到活动 provider。
+    #[tokio::test]
+    async fn enable_then_disable_restores_listener_token_to_top_level_fallback_origin(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建顶层 fallback Home");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({"auth": {}, "config": ""}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-token-origin".to_string(),
+            name: "Profile Token Origin".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        let original = concat!(
+            "model_provider = \"custom\"\n",
+            "experimental_bearer_token = \"test-local-token\"\n\n",
+            "[model_providers.custom]\n",
+            "base_url = \"https://upstream.example/v1\"\n",
+            "wire_api = \"responses\"\n",
+        );
+        fs::write(&config_path, original).expect("写入顶层 fallback 配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .enable("profile-token-origin", "provider-a", vec![])
+            .await?;
+        let enabled_route = db
+            .get_codex_profile_route("profile-token-origin")?
+            .expect("启用后的路由存在");
+        let backup: serde_json::Value = serde_json::from_str(
+            enabled_route
+                .live_backup_json
+                .as_deref()
+                .expect("启用后的备份存在"),
+        )
+        .expect("解析启用备份");
+        assert_eq!(backup["previous_token_origin"], "top_level");
+        assert!(!backup.to_string().contains("test-local-token"));
+
+        manager.disable("profile-token-origin").await?;
+
+        assert_eq!(
+            fs::read(&config_path).expect("读取关闭后的 Home"),
+            original.as_bytes()
+        );
+        let restored = fs::read_to_string(config_path).expect("读取恢复配置");
+        let document = restored
+            .parse::<toml_edit::DocumentMut>()
+            .expect("恢复配置应为 TOML");
+        assert_eq!(
+            document
+                .get("experimental_bearer_token")
+                .and_then(toml_edit::Item::as_str),
+            Some("test-local-token")
+        );
+        assert!(document
+            .get("model_providers")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|providers| providers.get("custom"))
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|provider| provider.get("experimental_bearer_token"))
+            .is_none());
+        Ok(())
+    }
+
     /// 外部接管后重新启用不得在可逆备份正文中持久化 Profile listener token。
     #[tokio::test]
     async fn reenabling_external_base_url_redacts_reversible_listener_token_from_backup(
@@ -6777,9 +6885,14 @@ experimental_bearer_token = "PROXY_MANAGED"
             16_001,
             "test-local-token",
         )?;
+        let mut stale_route = db
+            .get_codex_profile_route("profile-current")?
+            .expect("当前路由存在");
+        stale_route.last_error = Some("上一轮启动恢复错误".to_string());
+        db.save_codex_profile_route(&stale_route)?;
         file_ops.writes.store(0, Ordering::SeqCst);
         let manager = CodexRouteManager::new(
-            db,
+            db.clone(),
             home_config,
             Arc::new(TrackingTokenStore {
                 ensured: AtomicUsize::new(0),
@@ -6791,6 +6904,11 @@ experimental_bearer_token = "PROXY_MANAGED"
         manager.restore_enabled_profiles().await?;
 
         assert_eq!(file_ops.writes.load(Ordering::SeqCst), 0);
+        assert!(db
+            .get_codex_profile_route("profile-current")?
+            .expect("健康启动后的路由存在")
+            .last_error
+            .is_none());
         assert_eq!(
             manager.status("profile-current").await?,
             CodexRuntimeStatus::Running

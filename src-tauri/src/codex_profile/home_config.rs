@@ -127,6 +127,8 @@ struct CodexRouteBackup {
     ownership_proof: Option<CodexRouteOwnershipProof>,
     #[serde(default)]
     previous_token_state: CodexRouteBackupTokenState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_token_origin: Option<CodexRouteBackupTokenOrigin>,
 }
 
 /// 只读取备份版本的最小 envelope，用于副作用前区分未知未来格式。
@@ -147,6 +149,23 @@ enum CodexRouteBackupTokenState {
     ListenerTokenReference,
 }
 
+/// listener token 引用在接管前配置中的准确来源路径。
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CodexRouteBackupTokenOrigin {
+    /// token 位于配置顶层。
+    TopLevel,
+    /// token 位于指定 provider 的标准或 inline table 中。
+    Provider(String),
+}
+
+/// 已脱敏的接管前正文及其不可逆 listener token 元数据。
+struct CodexRedactedPreviousToken {
+    content: Option<Vec<u8>>,
+    state: CodexRouteBackupTokenState,
+    origin: Option<CodexRouteBackupTokenOrigin>,
+}
+
 /// 不含凭证明文的活动路由字段所有权证明。
 #[derive(Serialize, Deserialize)]
 struct CodexRouteOwnershipProof {
@@ -164,6 +183,19 @@ enum CodexRouteFieldPath {
         provider_id: String,
         field: &'static str,
     },
+}
+
+/// 将持久化 token 来源转换为字段定位路径。
+fn token_origin_path(origin: &CodexRouteBackupTokenOrigin) -> CodexRouteFieldPath {
+    match origin {
+        CodexRouteBackupTokenOrigin::TopLevel => {
+            CodexRouteFieldPath::TopLevel(CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        }
+        CodexRouteBackupTokenOrigin::Provider(provider_id) => CodexRouteFieldPath::Provider {
+            provider_id: provider_id.clone(),
+            field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        },
+    }
 }
 
 /// 严格路由字段的缺失状态或原始 TOML Item。
@@ -201,6 +233,7 @@ struct CodexManagedRouteProjection {
     bearer_token_path: CodexRouteFieldPath,
     previous: CodexManagedRouteState,
     target: CodexManagedRouteState,
+    referenced_token_origin: Option<CodexRouteFieldPath>,
     created_provider_tables: Vec<String>,
     created_model_providers_table: bool,
 }
@@ -690,9 +723,11 @@ impl CodexHomeConfigService {
         listen_port: u16,
         listener_token: &str,
     ) -> Result<(), AppError> {
+        let previous_token_origin = resolve_previous_token_origin(&backup, listener_token)?;
         let projection = build_managed_route_projection(
             backup.previous_content.as_deref(),
             backup.previous_token_state,
+            previous_token_origin.as_ref(),
             listen_port,
             listener_token,
         )?;
@@ -708,7 +743,7 @@ impl CodexHomeConfigService {
         };
         let mut current_document = parse_codex_document(current_content, "当前")?;
         let current_state = read_managed_route_state(&current_document, &projection);
-        if current_state == projection.previous {
+        if managed_route_restore_is_complete(&current_document, &current_state, &projection) {
             return Ok(());
         }
         ensure_managed_route_owned(&current_state, &projection.target, listen_port)?;
@@ -845,17 +880,21 @@ impl CodexHomeConfigService {
             CODEX_ROUTE_FIELD_BEARER_TOKEN,
         )
         .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
-        let (previous_content, previous_token_state) =
+        let resolved_previous_token_origin =
+            resolve_previous_token_origin(&backup, &listener_token)?;
+        let redacted =
             if backup.previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
-                (
-                    backup.previous_content,
-                    CodexRouteBackupTokenState::ListenerTokenReference,
-                )
+                CodexRedactedPreviousToken {
+                    content: backup.previous_content,
+                    state: CodexRouteBackupTokenState::ListenerTokenReference,
+                    origin: resolved_previous_token_origin,
+                }
             } else {
                 redact_previous_listener_token(backup.previous_content, &listener_token)?
             };
-        backup.previous_content = previous_content;
-        backup.previous_token_state = previous_token_state;
+        backup.previous_content = redacted.content;
+        backup.previous_token_state = redacted.state;
+        backup.previous_token_origin = redacted.origin;
         backup.ownership_proof = Some(proof);
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
@@ -967,6 +1006,109 @@ fn active_codex_provider_id(document: &DocumentMut) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 返回当前实际生效且精确匹配 listener token 的来源路径。
+fn active_listener_token_origin(
+    document: &DocumentMut,
+    listener_token: &str,
+) -> Option<CodexRouteBackupTokenOrigin> {
+    if let Some(provider_id) = active_codex_provider_id(document) {
+        let provider_path = CodexRouteFieldPath::Provider {
+            provider_id: provider_id.clone(),
+            field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        };
+        if route_field_item(document, &provider_path).and_then(Item::as_str) == Some(listener_token)
+        {
+            return Some(CodexRouteBackupTokenOrigin::Provider(provider_id));
+        }
+    }
+    (document
+        .get(CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        .and_then(Item::as_str)
+        == Some(listener_token))
+    .then_some(CodexRouteBackupTokenOrigin::TopLevel)
+}
+
+/// 用不可逆的旧正文指纹证明 token 来源，兼容没有路径字段的历史 v3。
+fn resolve_previous_token_origin(
+    backup: &CodexRouteBackup,
+    listener_token: &str,
+) -> Result<Option<CodexRouteBackupTokenOrigin>, AppError> {
+    if backup.previous_token_state != CodexRouteBackupTokenState::ListenerTokenReference {
+        return Ok(None);
+    }
+    let content = backup.previous_content.as_deref().ok_or_else(|| {
+        AppError::Config("Codex 路由备份缺少可证明 token 来源的接管前配置".to_string())
+    })?;
+    if let Some(origin) = backup.previous_token_origin.as_ref() {
+        if token_origin_can_be_active(content, origin, listener_token)? {
+            return Ok(Some(origin.clone()));
+        }
+        return Err(AppError::Config(
+            "Codex 路由备份的 token 来源证明不匹配".to_string(),
+        ));
+    }
+
+    let document = parse_codex_document(content, "接管前")?;
+    let mut candidates = vec![CodexRouteBackupTokenOrigin::TopLevel];
+    if let Some(provider_id) = active_codex_provider_id(&document) {
+        candidates.push(CodexRouteBackupTokenOrigin::Provider(provider_id));
+    }
+    let mut proven = candidates.into_iter().filter_map(|origin| {
+        token_origin_matches_previous_fingerprint(
+            content,
+            &backup.previous_fingerprint,
+            &origin,
+            listener_token,
+        )
+        .ok()
+        .filter(|matches| *matches)
+        .map(|_| origin)
+    });
+    let origin = proven.next();
+    if origin.is_none() || proven.next().is_some() {
+        return Err(AppError::Config(
+            "旧 Codex v3 路由备份的 token 来源无法唯一证明".to_string(),
+        ));
+    }
+    Ok(origin)
+}
+
+/// 验证显式来源能在接管前结构中成为实际生效路径。
+fn token_origin_can_be_active(
+    redacted_content: &[u8],
+    origin: &CodexRouteBackupTokenOrigin,
+    listener_token: &str,
+) -> Result<bool, AppError> {
+    let mut document = parse_codex_document(redacted_content, "接管前")?;
+    apply_route_field_state(
+        &mut document,
+        &token_origin_path(origin),
+        &CodexRouteFieldState::Present(toml_edit::value(listener_token)),
+    )?;
+    Ok(active_listener_token_origin(&document, listener_token).as_ref() == Some(origin))
+}
+
+/// 通过重建候选字段并比较接管前指纹，证明来源路径而不持久化 token。
+fn token_origin_matches_previous_fingerprint(
+    redacted_content: &[u8],
+    previous_fingerprint: &str,
+    origin: &CodexRouteBackupTokenOrigin,
+    listener_token: &str,
+) -> Result<bool, AppError> {
+    let mut document = parse_codex_document(redacted_content, "接管前")?;
+    let path = token_origin_path(origin);
+    apply_route_field_state(
+        &mut document,
+        &path,
+        &CodexRouteFieldState::Present(toml_edit::value(listener_token)),
+    )?;
+    if active_listener_token_origin(&document, listener_token).as_ref() != Some(origin) {
+        return Ok(false);
+    }
+    let content = document.to_string().into_bytes();
+    Ok(fingerprint_content(Some(&content)) == previous_fingerprint)
+}
+
 /// 从准确路径读取字段 Item。
 fn route_field_item<'a>(document: &'a DocumentMut, path: &CodexRouteFieldPath) -> Option<&'a Item> {
     match path {
@@ -1025,6 +1167,25 @@ fn read_managed_route_state(
     }
 }
 
+/// 判断严格字段与不可逆 token 来源是否已经完整恢复。
+fn managed_route_restore_is_complete(
+    document: &DocumentMut,
+    current: &CodexManagedRouteState,
+    projection: &CodexManagedRouteProjection,
+) -> bool {
+    if current != &projection.previous {
+        return false;
+    }
+    let Some(origin) = projection
+        .referenced_token_origin
+        .as_ref()
+        .filter(|origin| *origin != &projection.bearer_token_path)
+    else {
+        return true;
+    };
+    read_route_field_state(document, origin) == projection.target.bearer_token
+}
+
 /// 记录 target 相比 previous 新建的 provider 表。
 fn created_provider_tables(previous: &DocumentMut, target: &DocumentMut) -> Vec<String> {
     let previous_providers = previous
@@ -1052,6 +1213,7 @@ fn created_provider_tables(previous: &DocumentMut, target: &DocumentMut) -> Vec<
 fn build_managed_route_projection(
     previous_content: Option<&[u8]>,
     previous_token_state: CodexRouteBackupTokenState,
+    previous_token_origin: Option<&CodexRouteBackupTokenOrigin>,
     listen_port: u16,
     listener_token: &str,
 ) -> Result<CodexManagedRouteProjection, AppError> {
@@ -1091,7 +1253,9 @@ fn build_managed_route_projection(
         wire_api: read_route_field_state(&previous_document, &wire_api_path),
         bearer_token: read_route_field_state(&previous_document, &bearer_token_path),
     };
-    if previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+    if previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference
+        && previous_token_origin.map(token_origin_path).as_ref() == Some(&bearer_token_path)
+    {
         previous.bearer_token = CodexRouteFieldState::Present(toml_edit::value(listener_token));
     }
     let target = CodexManagedRouteState {
@@ -1106,6 +1270,7 @@ fn build_managed_route_projection(
         bearer_token_path,
         previous,
         target,
+        referenced_token_origin: previous_token_origin.map(token_origin_path),
         created_provider_tables,
         created_model_providers_table,
     })
@@ -1272,6 +1437,13 @@ fn apply_previous_managed_route_state(
         &projection.bearer_token_path,
         &projection.previous.bearer_token,
     )?;
+    if let Some(origin) = projection
+        .referenced_token_origin
+        .as_ref()
+        .filter(|origin| *origin != &projection.bearer_token_path)
+    {
+        apply_route_field_state(current, origin, &projection.target.bearer_token)?;
+    }
     cleanup_created_provider_tables(current, projection);
     Ok(())
 }
@@ -1284,9 +1456,11 @@ fn build_latest_managed_baseline(
     listener_token: &str,
 ) -> Result<Option<Vec<u8>>, AppError> {
     let backup = CodexHomeConfigService::decode_route_backup(backup_json)?;
+    let previous_token_origin = resolve_previous_token_origin(&backup, listener_token)?;
     let projection = build_managed_route_projection(
         backup.previous_content.as_deref(),
         backup.previous_token_state,
+        previous_token_origin.as_ref(),
         listen_port,
         listener_token,
     )?;
@@ -1323,15 +1497,15 @@ fn serialize_route_backup(
     let listener_token =
         extract_active_codex_route_string(target_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
             .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
-    let (previous_content, previous_token_state) =
-        redact_previous_listener_token(previous_content, &listener_token)?;
+    let redacted = redact_previous_listener_token(previous_content, &listener_token)?;
     serde_json::to_string(&CodexRouteBackup {
         version: CODEX_ROUTE_BACKUP_VERSION,
-        previous_content,
+        previous_content: redacted.content,
         previous_fingerprint,
         target_fingerprint: target_fingerprint.to_string(),
         ownership_proof: Some(ownership_proof),
-        previous_token_state,
+        previous_token_state: redacted.state,
+        previous_token_origin: redacted.origin,
     })
     .map_err(|source| AppError::JsonSerialize { source })
 }
@@ -1340,29 +1514,37 @@ fn serialize_route_backup(
 fn redact_previous_listener_token(
     previous_content: Option<Vec<u8>>,
     listener_token: &str,
-) -> Result<(Option<Vec<u8>>, CodexRouteBackupTokenState), AppError> {
+) -> Result<CodexRedactedPreviousToken, AppError> {
     let Some(content) = previous_content else {
-        return Ok((None, CodexRouteBackupTokenState::Embedded));
+        return Ok(CodexRedactedPreviousToken {
+            content: None,
+            state: CodexRouteBackupTokenState::Embedded,
+            origin: None,
+        });
     };
     let mut document = parse_codex_document(&content, "接管前")?;
-    let text = document.to_string();
-    let active_token = extract_active_codex_route_string(&text, CODEX_ROUTE_FIELD_BEARER_TOKEN);
+    let active_token_origin = active_listener_token_origin(&document, listener_token);
     let matching_paths = listener_token_paths(&document, listener_token);
     if matching_paths.is_empty() {
-        return Ok((Some(content), CodexRouteBackupTokenState::Embedded));
+        return Ok(CodexRedactedPreviousToken {
+            content: Some(content),
+            state: CodexRouteBackupTokenState::Embedded,
+            origin: None,
+        });
     }
-    if active_token.as_deref() != Some(listener_token) {
+    let Some(active_token_origin) = active_token_origin else {
         return Err(AppError::Config(
             "Codex 路由备份包含无法无损表达的非活动 listener token".to_string(),
         ));
-    }
+    };
     for path in matching_paths {
         apply_route_field_state(&mut document, &path, &CodexRouteFieldState::Missing)?;
     }
-    Ok((
-        Some(document.to_string().into_bytes()),
-        CodexRouteBackupTokenState::ListenerTokenReference,
-    ))
+    Ok(CodexRedactedPreviousToken {
+        content: Some(document.to_string().into_bytes()),
+        state: CodexRouteBackupTokenState::ListenerTokenReference,
+        origin: Some(active_token_origin),
+    })
 }
 
 /// 找出配置中全部精确匹配 listener token 的可持久化路径。
@@ -2404,6 +2586,71 @@ wire_api = "chat"
         Ok(())
     }
 
+    /// 旧 v3 无路径引用仅在接管前指纹能唯一证明来源时恢复，否则必须拒绝猜测。
+    #[test]
+    fn legacy_pathless_v3_token_origin_requires_unique_fingerprint_proof() -> Result<(), AppError> {
+        let service = CodexHomeConfigService::system();
+        let listener_token = "legacy-pathless-listener-token";
+
+        let proven_home = tempfile::tempdir().expect("创建可证明旧 v3 Home");
+        let proven_path = codex_config_path_for_home(proven_home.path());
+        let proven_original = concat!(
+            "model_provider = \"custom\"\n",
+            "experimental_bearer_token = \"legacy-pathless-listener-token\"\n\n",
+            "[model_providers.custom]\n",
+            "base_url = \"https://upstream.example/v1\"\n",
+            "wire_api = \"responses\"\n",
+        );
+        fs::write(&proven_path, proven_original).expect("写入可证明配置");
+        let proven_plan =
+            service.build_profile_route_plan(proven_home.path(), 15_722, None, listener_token)?;
+        let mut pathless: serde_json::Value =
+            serde_json::from_str(&service.serialize_backup(&proven_plan)?).expect("解析旧 v3");
+        pathless
+            .as_object_mut()
+            .expect("备份为对象")
+            .remove("previous_token_origin");
+        let pathless = serde_json::to_string(&pathless).expect("编码旧 v3");
+        service.apply_route_plan(&proven_plan)?;
+        service.restore_profile_backup(proven_home.path(), &pathless, 15_722, listener_token)?;
+        assert_eq!(
+            fs::read(&proven_path).expect("读取证明恢复配置"),
+            proven_original.as_bytes()
+        );
+
+        let ambiguous_home = tempfile::tempdir().expect("创建模糊旧 v3 Home");
+        let ambiguous_path = codex_config_path_for_home(ambiguous_home.path());
+        fs::write(&ambiguous_path, proven_original).expect("写入模糊配置");
+        let ambiguous_plan = service.build_profile_route_plan(
+            ambiguous_home.path(),
+            15_723,
+            None,
+            listener_token,
+        )?;
+        let mut ambiguous: serde_json::Value =
+            serde_json::from_str(&service.serialize_backup(&ambiguous_plan)?)
+                .expect("解析模糊备份");
+        ambiguous
+            .as_object_mut()
+            .expect("备份为对象")
+            .remove("previous_token_origin");
+        ambiguous["previous_fingerprint"] = serde_json::json!("not-a-provable-fingerprint");
+        let ambiguous = serde_json::to_string(&ambiguous).expect("编码模糊备份");
+        service.apply_route_plan(&ambiguous_plan)?;
+        let routed_before = fs::read(&ambiguous_path).expect("读取拒绝前路由配置");
+
+        let error = service
+            .restore_profile_backup(ambiguous_home.path(), &ambiguous, 15_723, listener_token)
+            .expect_err("无唯一证明的旧 v3 必须拒绝恢复");
+        assert!(error.to_string().contains("无法唯一证明"));
+        assert!(!error.to_string().contains(listener_token));
+        assert_eq!(
+            fs::read(ambiguous_path).expect("读取拒绝后路由配置"),
+            routed_before
+        );
+        Ok(())
+    }
+
     /// v3 备份必须脱敏全部 listener token 路径，并保留普通用户 token 与关闭恢复语义。
     #[test]
     fn backup_redacts_listener_token_from_all_paths_and_restores_without_data_loss(
@@ -2450,6 +2697,10 @@ experimental_bearer_token = "{ordinary_token}"
         assert!(previous
             .windows(ordinary_token.len())
             .any(|window| window == ordinary_token.as_bytes()));
+        assert_eq!(
+            backup_json["previous_token_origin"],
+            serde_json::json!({"provider": "active"})
+        );
         service.restore_profile_backup(home.path(), &backup, 15_722, listener_token)?;
         assert_eq!(
             fs::read_to_string(config_path).expect("读取关闭恢复配置"),
@@ -2481,6 +2732,10 @@ model_providers = {{ active = {{ base_url = "https://active.example/v1", wire_ap
         let previous_toml = String::from_utf8(previous).expect("备份正文应为 UTF-8");
 
         assert_eq!(backup_json["version"], CODEX_ROUTE_BACKUP_VERSION);
+        assert_eq!(
+            backup_json["previous_token_origin"],
+            serde_json::json!({"provider": "active"})
+        );
         assert!(!previous_toml.contains(listener_token));
         assert!(previous_toml.contains(ordinary_token));
         assert!(previous_toml.contains("model_providers = {"));
