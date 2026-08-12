@@ -3743,7 +3743,7 @@ mod codex_route_manager {
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<RouteRecoveryRecord>(json).ok())
                 .is_some_and(|recovery| {
-                    recovery.operation == "disable"
+                    recovery.operation == CODEX_ROUTE_RECOVERY_OPERATION_DISABLE
                         && recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_PREPARED
                 });
             if prepared_disable && !self.interfered.swap(true, Ordering::SeqCst) {
@@ -4084,7 +4084,9 @@ mod codex_route_manager {
                 .recovery_json
                 .as_deref()
                 .and_then(|json| serde_json::from_str::<RouteRecoveryRecord>(json).ok())
-                .is_some_and(|recovery| recovery.operation == "enable");
+                .is_some_and(|recovery| {
+                    recovery.operation == CODEX_ROUTE_RECOVERY_OPERATION_ENABLE
+                });
             if enable_recovery && route.live_backup_json.as_deref() == Some(&self.old_backup) {
                 self.split_saves.fetch_add(1, Ordering::SeqCst);
                 return Err(AppError::Message(
