@@ -20,7 +20,6 @@ pub const CC_SWITCH_CODEX_MODEL_PROVIDER_ID: &str = "custom";
 /// cleaned up without mistaking a user's own local provider for takeover.
 pub const CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID: &str = "cc-switch-official";
 pub const CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME: &str = "cc-switch-model-catalog.json";
-pub const CODEX_MODEL_CATALOG_FIELD: &str = "model_catalog_json";
 const CODEX_PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 #[cfg(target_os = "windows")]

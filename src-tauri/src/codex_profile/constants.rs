@@ -16,6 +16,8 @@ pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
 pub const CODEX_MODEL_PROVIDER_FIELD: &str = "model_provider";
 /// Codex 模型供应商配置父表。
 pub const CODEX_MODEL_PROVIDERS_TABLE: &str = "model_providers";
+/// Codex Home 中引用外部模型目录文件的字段。
+pub const CODEX_MODEL_CATALOG_FIELD: &str = "model_catalog_json";
 /// Codex Profile 路由接管的服务地址字段。
 pub const CODEX_ROUTE_FIELD_BASE_URL: &str = "base_url";
 /// Codex Profile 路由接管的协议字段。
