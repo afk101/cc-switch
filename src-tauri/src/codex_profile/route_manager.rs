@@ -5650,10 +5650,15 @@ mod codex_route_manager {
         let home_a = tempfile::tempdir().expect("临时 Profile Home A");
         let home_b = tempfile::tempdir().expect("临时 Profile Home B");
         let home_config = CodexHomeConfigService::system();
-        let old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        old_provider.settings_config["auth"] = json!({});
+        old_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"rollback-old-token\"\n"
+        );
         let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
+        new_provider.settings_config["auth"] = json!({});
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-new-token\"\n"
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
         for (profile_id, home, port) in [
@@ -5707,7 +5712,7 @@ mod codex_route_manager {
         let message = error.to_string();
         assert!(message.contains("profile-b"));
         assert!(message.contains(&home_b.path().display().to_string()));
-        assert!(!message.contains("private-new-token"));
+        assert!(!message.contains("rollback-old-token"));
         assert_eq!(
             fs::read(&config_a_path).expect("读取 A 补偿配置"),
             config_a_before
@@ -5730,7 +5735,7 @@ mod codex_route_manager {
         Ok(())
     }
 
-    /// 共享供应商保存属于自动投影，不得覆盖关闭态托管 Home 的用户模型。
+    /// 共享供应商保存应权威撤销受管字段，同时保留用户扩展。
     #[tokio::test]
     async fn shared_provider_save_preserves_disabled_managed_user_model_and_non_route_fields(
     ) -> Result<(), AppError> {
@@ -5740,12 +5745,14 @@ mod codex_route_manager {
         let home_config = Arc::new(CodexHomeConfigService::system());
         let mut old_provider = provider_with_route_catalog("provider-shared-model", "old-model");
         old_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\nmodel = \"old-default-model\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model_provider = \"custom\"\nmodel = \"old-default-model\"\nexperimental_bearer_token = \"revoked-top-level-fallback\"\n[model_providers.custom]\nname = \"Old Provider\"\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"revoked-provider-token\"\nrequires_openai_auth = true\nhttp_headers = { x_remove = \"stale\", x_shared = \"old\" }\nprovider_user_extension = \"keep-provider-extension\"\n"
         );
+        old_provider.settings_config["auth"] = json!({});
         let mut new_provider = provider_with_route_catalog("provider-shared-model", "new-model");
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nname = \"New Provider\"\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nhttp_headers = { x_new = \"fresh\" }\n"
         );
+        new_provider.settings_config["auth"] = json!({});
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
@@ -5763,6 +5770,7 @@ mod codex_route_manager {
         document["model"] = toml_edit::value("user-selected-model");
         document["model_reasoning_effort"] = toml_edit::value("medium");
         document["user_unknown_setting"] = toml_edit::value("keep-me");
+        document["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
         fs::write(&config_path, document.to_string()).expect("写入用户非路由修改");
         save_codex_mcp_server(db.as_ref())?;
         let manager = CodexRouteManager::new(
@@ -5783,7 +5791,15 @@ mod codex_route_manager {
         assert!(updated.contains("model = \"user-selected-model\""));
         assert!(updated.contains("model_reasoning_effort = \"medium\""));
         assert!(updated.contains("user_unknown_setting = \"keep-me\""));
+        assert!(updated.contains("followUpQueueMode = \"queue\""));
         assert!(updated.contains("https://new.example.com/v1"));
+        assert!(updated.contains("name = \"New Provider\""));
+        assert!(updated.contains("provider_user_extension = \"keep-provider-extension\""));
+        assert!(!updated.contains("experimental_bearer_token"));
+        assert!(!updated.contains("requires_openai_auth"));
+        assert!(!updated.contains("x_remove"));
+        assert!(!updated.contains("x_shared"));
+        assert!(updated.contains("x_new = \"fresh\""));
         assert!(updated.contains("[mcp_servers.playwright]"));
         let catalog = fs::read_to_string(
             home.path()
@@ -7293,19 +7309,21 @@ mod codex_route_manager {
     }
 
     #[tokio::test]
-    async fn disabled_managed_startup_reconcile_preserves_user_model_and_non_route_fields(
+    async fn disabled_managed_startup_reconcile_authoritatively_updates_inline_provider_fields(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("创建关闭态托管 Home");
         let home_config = Arc::new(CodexHomeConfigService::system());
         let mut old_provider = provider_with_route_catalog("provider-preserve-model", "old-model");
         old_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\nmodel = \"old-default-model\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model_provider = \"custom\"\nmodel = \"old-default-model\"\nmodel_providers = { custom = { name = \"Old Provider\", base_url = \"https://old.example.com/v1\", wire_api = \"responses\", experimental_bearer_token = \"revoked-inline-token\", requires_openai_auth = true, provider_user_extension = \"keep-inline-extension\" } }\n"
         );
+        old_provider.settings_config["auth"] = json!({});
         let mut new_provider = provider_with_route_catalog("provider-preserve-model", "new-model");
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model_provider = \"custom\"\nmodel = \"new-default-model\"\nmodel_providers = { custom = { name = \"New Provider\", base_url = \"https://new.example.com/v1\", wire_api = \"responses\" } }\n"
         );
+        new_provider.settings_config["auth"] = json!({});
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
@@ -7347,6 +7365,10 @@ mod codex_route_manager {
         assert!(reconciled.contains("user_unknown_setting = \"keep-me\""));
         assert!(reconciled.contains("followUpQueueMode = \"queue\""));
         assert!(reconciled.contains("https://new.example.com/v1"));
+        assert!(reconciled.contains("name = \"New Provider\""));
+        assert!(reconciled.contains("provider_user_extension = \"keep-inline-extension\""));
+        assert!(!reconciled.contains("experimental_bearer_token"));
+        assert!(!reconciled.contains("requires_openai_auth"));
         assert!(reconciled.contains("[mcp_servers.playwright]"));
         let catalog = fs::read_to_string(
             home.path()

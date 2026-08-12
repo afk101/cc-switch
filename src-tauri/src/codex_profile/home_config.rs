@@ -2,6 +2,7 @@ use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
 use crate::codex_profile::{
+    CODEX_AUTHORITATIVE_MODEL_PROVIDER_FIELDS, CODEX_AUTHORITATIVE_TOP_LEVEL_PROVIDER_FIELDS,
     CODEX_MCP_SERVERS_TABLE, CODEX_MODEL_CATALOG_FIELD, CODEX_MODEL_FIELD,
     CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_MODEL_REASONING_FIELD_PREFIX,
     CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION, CODEX_ROUTE_BACKUP_VERSION,
@@ -18,7 +19,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 /// Codex Home 配置文件的当前快照。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1597,6 +1598,7 @@ fn merge_automatic_direct_provider_projection(
     current_document
         .as_table_mut()
         .remove(CODEX_MCP_SERVERS_TABLE);
+    synchronize_automatic_provider_managed_fields(&mut current_document, &projected_document);
     merge_automatic_projection_table(
         current_document.as_table_mut(),
         projected_document.as_table(),
@@ -1607,8 +1609,8 @@ fn merge_automatic_direct_provider_projection(
 
 /// 递归合并目标明确声明的派生字段，并保留当前文档的未知扩展字段。
 fn merge_automatic_projection_table(
-    current: &mut toml_edit::Table,
-    projected: &toml_edit::Table,
+    current: &mut dyn TableLike,
+    projected: &dyn TableLike,
     top_level: bool,
 ) {
     for (key, projected_item) in projected.iter() {
@@ -1617,8 +1619,13 @@ fn merge_automatic_projection_table(
         {
             continue;
         }
-        match (current.get_mut(key), projected_item.as_table()) {
-            (Some(Item::Table(current_table)), Some(projected_table)) => {
+        match (
+            current
+                .get_mut(key)
+                .and_then(|item| item.as_table_like_mut()),
+            projected_item.as_table_like(),
+        ) {
+            (Some(current_table), Some(projected_table)) => {
                 merge_automatic_projection_table(current_table, projected_table, false);
             }
             _ => {
@@ -1626,6 +1633,94 @@ fn merge_automatic_projection_table(
             }
         }
     }
+}
+
+/// 在合并前撤销目标未再声明的标准 provider 受管字段。
+fn synchronize_automatic_provider_managed_fields(
+    current: &mut DocumentMut,
+    projected: &DocumentMut,
+) {
+    let projected_provider_id = projected
+        .get(CODEX_MODEL_PROVIDER_FIELD)
+        .and_then(Item::as_str);
+    let projected_provider =
+        projected_provider_id.and_then(|provider_id| provider_table_like(projected, provider_id));
+    synchronize_effective_top_level_provider_fields(current, projected, projected_provider);
+    let (Some(provider_id), Some(projected_provider)) = (projected_provider_id, projected_provider)
+    else {
+        return;
+    };
+    let Some(current_provider) = provider_table_like_mut(current, provider_id) else {
+        return;
+    };
+    synchronize_authoritative_fields(
+        current_provider,
+        projected_provider,
+        CODEX_AUTHORITATIVE_MODEL_PROVIDER_FIELDS,
+    );
+}
+
+/// 只同步会成为目标有效 fallback 的顶层路由字段。
+fn synchronize_effective_top_level_provider_fields(
+    current: &mut DocumentMut,
+    projected: &DocumentMut,
+    projected_provider: Option<&dyn TableLike>,
+) {
+    for field in CODEX_AUTHORITATIVE_TOP_LEVEL_PROVIDER_FIELDS {
+        if projected_provider.is_some_and(|provider| provider.contains_key(field)) {
+            continue;
+        }
+        match projected.get(field) {
+            Some(projected_item) => {
+                current.as_table_mut().insert(field, projected_item.clone());
+            }
+            None => {
+                current.as_table_mut().remove(field);
+            }
+        }
+    }
+}
+
+/// 从当前表删除目标表已撤销的权威字段，其他扩展字段保持不变。
+fn synchronize_authoritative_fields(
+    current: &mut dyn TableLike,
+    projected: &dyn TableLike,
+    authoritative_fields: &[&str],
+) {
+    for field in authoritative_fields {
+        match projected.get(field) {
+            Some(projected_item) => {
+                current.insert(field, projected_item.clone());
+            }
+            None => {
+                current.remove(field);
+            }
+        }
+    }
+}
+
+/// 读取指定标准表或 inline table 形态的 provider。
+fn provider_table_like<'a>(
+    document: &'a DocumentMut,
+    provider_id: &str,
+) -> Option<&'a dyn TableLike> {
+    document
+        .get(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like)
+}
+
+/// 可变读取指定标准表或 inline table 形态的 provider。
+fn provider_table_like_mut<'a>(
+    document: &'a mut DocumentMut,
+    provider_id: &str,
+) -> Option<&'a mut dyn TableLike> {
+    document
+        .get_mut(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table_like_mut)
+        .and_then(|providers| providers.get_mut(provider_id))
+        .and_then(Item::as_table_like_mut)
 }
 
 /// 将指定字节解析为保留格式的 Codex TOML 文档。

@@ -30,6 +30,51 @@ pub const CODEX_ROUTE_FIELD_BASE_URL: &str = "base_url";
 pub const CODEX_ROUTE_FIELD_WIRE_API: &str = "wire_api";
 /// Codex Profile 路由接管的本地凭证字段。
 pub const CODEX_ROUTE_FIELD_BEARER_TOKEN: &str = "experimental_bearer_token";
+/// Codex 模型供应商的显示名称字段。
+pub const CODEX_PROVIDER_FIELD_NAME: &str = "name";
+/// Codex 模型供应商的 API key 环境变量字段。
+pub const CODEX_PROVIDER_FIELD_ENV_KEY: &str = "env_key";
+/// Codex 模型供应商的 API key 说明字段。
+pub const CODEX_PROVIDER_FIELD_ENV_KEY_INSTRUCTIONS: &str = "env_key_instructions";
+/// Codex 模型供应商的查询参数字段。
+pub const CODEX_PROVIDER_FIELD_QUERY_PARAMS: &str = "query_params";
+/// Codex 模型供应商的固定 HTTP 请求头字段。
+pub const CODEX_PROVIDER_FIELD_HTTP_HEADERS: &str = "http_headers";
+/// Codex 模型供应商的环境变量 HTTP 请求头字段。
+pub const CODEX_PROVIDER_FIELD_ENV_HTTP_HEADERS: &str = "env_http_headers";
+/// Codex 模型供应商的普通请求重试次数字段。
+pub const CODEX_PROVIDER_FIELD_REQUEST_MAX_RETRIES: &str = "request_max_retries";
+/// Codex 模型供应商的流式请求重试次数字段。
+pub const CODEX_PROVIDER_FIELD_STREAM_MAX_RETRIES: &str = "stream_max_retries";
+/// Codex 模型供应商的流式请求空闲超时字段。
+pub const CODEX_PROVIDER_FIELD_STREAM_IDLE_TIMEOUT_MS: &str = "stream_idle_timeout_ms";
+/// Codex 模型供应商是否使用 OpenAI 登录的字段。
+pub const CODEX_PROVIDER_FIELD_REQUIRES_OPENAI_AUTH: &str = "requires_openai_auth";
+/// Codex 模型供应商是否支持 WebSocket 的字段。
+pub const CODEX_PROVIDER_FIELD_SUPPORTS_WEBSOCKETS: &str = "supports_websockets";
+/// 共享供应商对活动 provider 表权威管理的 Codex 标准字段。
+pub const CODEX_AUTHORITATIVE_MODEL_PROVIDER_FIELDS: &[&str] = &[
+    CODEX_PROVIDER_FIELD_NAME,
+    CODEX_ROUTE_FIELD_BASE_URL,
+    CODEX_PROVIDER_FIELD_ENV_KEY,
+    CODEX_PROVIDER_FIELD_ENV_KEY_INSTRUCTIONS,
+    CODEX_ROUTE_FIELD_BEARER_TOKEN,
+    CODEX_ROUTE_FIELD_WIRE_API,
+    CODEX_PROVIDER_FIELD_QUERY_PARAMS,
+    CODEX_PROVIDER_FIELD_HTTP_HEADERS,
+    CODEX_PROVIDER_FIELD_ENV_HTTP_HEADERS,
+    CODEX_PROVIDER_FIELD_REQUEST_MAX_RETRIES,
+    CODEX_PROVIDER_FIELD_STREAM_MAX_RETRIES,
+    CODEX_PROVIDER_FIELD_STREAM_IDLE_TIMEOUT_MS,
+    CODEX_PROVIDER_FIELD_REQUIRES_OPENAI_AUTH,
+    CODEX_PROVIDER_FIELD_SUPPORTS_WEBSOCKETS,
+];
+/// 没有活动 provider 表时，共享供应商权威管理的顶层路由字段。
+pub const CODEX_AUTHORITATIVE_TOP_LEVEL_PROVIDER_FIELDS: &[&str] = &[
+    CODEX_ROUTE_FIELD_BASE_URL,
+    CODEX_ROUTE_FIELD_WIRE_API,
+    CODEX_ROUTE_FIELD_BEARER_TOKEN,
+];
 /// Codex Profile 本地路由接收的固定 wire API。
 pub const CODEX_ROUTE_WIRE_API_RESPONSES: &str = "responses";
 /// listener token 缺失或不匹配时使用的脱敏描述。
