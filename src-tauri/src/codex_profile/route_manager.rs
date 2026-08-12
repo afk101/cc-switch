@@ -10426,7 +10426,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         target.enabled = false;
         route.recovery_json = Some(
             serde_json::to_string(&RouteRecoveryRecord {
-                operation: "disable".to_string(),
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
                 before,
                 target,
                 phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
@@ -12308,7 +12308,7 @@ keep = true
         target.enabled = false;
         route.recovery_json = Some(
             serde_json::to_string(&RouteRecoveryRecord {
-                operation: "disable".to_string(),
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
                 before,
                 target,
                 phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
@@ -12377,7 +12377,7 @@ keep = true
         target.enabled = false;
         route.recovery_json = Some(
             serde_json::to_string(&RouteRecoveryRecord {
-                operation: "disable".to_string(),
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
                 before,
                 target,
                 phase: CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED.to_string(),
@@ -13709,7 +13709,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -13798,7 +13798,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -13882,7 +13882,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -13948,7 +13948,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -14022,7 +14022,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery_json = serde_json::to_string(&RouteRecoveryRecord {
-            operation: "switch".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_SWITCH.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: Some("provider-old".to_string()),
                 enabled: true,
@@ -14109,7 +14109,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery_json = serde_json::to_string(&RouteRecoveryRecord {
-            operation: "switch".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_SWITCH.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: Some("provider-old".to_string()),
                 enabled: true,
@@ -14208,7 +14208,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery_json = serde_json::to_string(&RouteRecoveryRecord {
-            operation: "switch".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_SWITCH.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: Some("provider-old".to_string()),
                 enabled: true,
@@ -14511,7 +14511,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -14583,7 +14583,7 @@ keep = true
             updated_at: 1,
         })?;
         let recovery = RouteRecoveryRecord {
-            operation: "enable".to_string(),
+            operation: CODEX_ROUTE_RECOVERY_OPERATION_ENABLE.to_string(),
             before: RouteRecoverySnapshot {
                 current_provider_id: None,
                 enabled: false,
@@ -14682,7 +14682,7 @@ keep = true
                 reconcile: None,
             },
             RouteRecoveryRecord {
-                operation: "switch".to_string(),
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_SWITCH.to_string(),
                 before: snapshot.clone(),
                 target: snapshot.clone(),
                 phase: CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING.to_string(),
@@ -14716,6 +14716,8 @@ keep = true
             ensured: AtomicUsize::new(0),
             deleted: AtomicUsize::new(0),
         });
+        // 这里必须保留原始 JSON：测试需要覆盖历史线格式、未知字段与 operation/phase 错配，
+        // 若改为类型化结构体和协议常量，序列化层会提前消除这些非法输入。
         for json in [
             "{",
             r#"{"operation":"unknown","phase":"prepared","before":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"target":{"current_provider_id":null,"enabled":false,"failover_ids":[]},"last_error":null}"#,
@@ -15711,7 +15713,7 @@ keep = true
         target.enabled = false;
         route.recovery_json = Some(
             serde_json::to_string(&RouteRecoveryRecord {
-                operation: "disable".to_string(),
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
                 before,
                 target,
                 phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(),
@@ -15863,7 +15865,7 @@ keep = true
             last_error: None,
             recovery_json: Some(
                 serde_json::to_string(&RouteRecoveryRecord {
-                    operation: "disable".to_string(),
+                    operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
                     before: RouteRecoverySnapshot {
                         current_provider_id: None,
                         enabled: true,
