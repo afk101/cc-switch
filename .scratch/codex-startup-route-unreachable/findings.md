@@ -173,6 +173,22 @@
 - 继续使用整份 `config.toml` hash，只对白名单字段做 hash 归一化：拒绝。它仍会把未来新增的 Codex/Desktop 字段错误纳入路由所有权，维护上属于默认拒绝未知字段。
 - 启动时无条件覆盖整份 `config.toml`：拒绝。会丢失 Codex/Desktop 与用户合法配置。
 
+## 实施完成审计（2026-08-12）
+
+- 最终实现提交：`7b69f7965bb194158fb2010054f4f7518e395bb7`；审查固定点：`5dcd63127b4bb14bd803c269dc0b7759dab43656`。
+- Issues 01—28 均为 `resolved`，每个行为修复均使用公开 Home service 或 Route Manager seam 完成 RED→GREEN，并独立提交。
+- `REQ-01—04`：字段级活动路径 ownership、非路由字段/MCP/model 保留、单 listener 与健康启动清错，由启动两阶段、MCP 保留、自动投影保留模型及 runtime tracking 回归证明。
+- `REQ-05—09`：selector/严格字段/损坏配置的 External 静默收敛、I/O 可重试、派生跳过、无持久提示与脱敏日志，由 startup external takeover、DB/I/O 失败及 External 后续派生回归证明。
+- `REQ-10—12`：显式启用/切换以操作当刻 Home 建基线，关闭恢复最近严格字段；只有 different-provider 显式切换可改 model，由启停/切换、崩溃补偿、自动直连投影回归证明。
+- `REQ-13—16`：整文件 hash 仅用于短窗口 CAS；v3 字段 proof、域分离 token 摘要、v1/v2/legacy/token 丢失迁移、ownership 前置，由 Home 39 项与真实旧 envelope 回归证明。
+- `REQ-17—18`：Profile/Home/token/auth 隔离以及自动关闭 DB 失败保持 Home、route、runtime 可重试，由多 Profile、secret store、DB failure seams 证明。
+- `SCN-01—21`：均由 Issue 01—28 acceptance tests 映射覆盖；后续审查增加的崩溃、并发尾窗、External 显式操作、inline table、未知版本、嵌套 backup、runtime 重建与 provider 字段撤销均已纳入相邻回归。
+- 最终验证：Rust lib `2525 passed / 2 ignored`；RouteManager `137/137`；Codex Profile `230/230`；Vitest `93 files / 637 tests`；TypeScript typecheck、renderer production build、`cargo fmt`、`git diff --check` 通过。
+- Clippy：本任务修改文件新增告警为 0；严格默认命令仍被未修改的 `migration.rs`、`proxy/body_dump.rs`、`proxy/forwarder.rs` 共 8 个既有 lint 阻断，显式允许这 4 类既有 lint 后 `-D warnings` 通过。
+- 最终 Diamond 双轴代码审查：Standards 0 findings，Spec 0 findings；完整范围为 `git diff 5dcd63127b4bb14bd803c269dc0b7759dab43656...7b69f7965bb194158fb2010054f4f7518e395bb7`。
+- `docs-spec/` 不存在，因此按 implement 流程跳过 `oms-spec-sync-docs`。
+- 防复发采用推荐架构门禁：字段级 ownership 是唯一持久语义；所有 Home/catalog 副作用前必须已有原子 recovery+backup；所有异步尾窗必须做最终只读校验；新增 route 生命周期必须覆盖真实启动、显式操作、崩溃恢复、DB/I/O/stop 失败和 token 不可逆持久化 seam。
+
 ## Spec/Issue 覆盖自审
 
 - 待 design tree 收敛后填写。
