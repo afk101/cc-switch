@@ -160,6 +160,10 @@
 - 最高层 test seam：真实 app 顺序的 `CodexRouteManager` 启动两阶段 seam；低层补充字段路径、token digest、CAS 与备份版本兼容测试。
 - 覆盖矩阵：Issue 01 覆盖字段级 ownership/proof 与 CAS（REQ-01/03/13/14/15/17，SCN-01/02/03/15/17/18/19）；Issue 02 覆盖真实启动、自动外部接管和错误分类（REQ-01—09/16—18，SCN-01—10/21）；Issue 03 覆盖显式启用/切换/关闭的新基线（REQ-02/10—12/17，SCN-11—14/20/21）；Issue 04 覆盖旧版兼容与最终回归（REQ-13—18，SCN-15—21）。
 - blocking graph 为 `01 → 02 → 03 → 04`，无环；每个 issue 都能在完成时通过对应 public seam 独立验证，粒度适合 fresh context。
+
+## Execution Context
+
+- Review Base Commit: `5dcd63127b4bb14bd803c269dc0b7759dab43656`
 - 上游原版 `upstream/main` 没有本 fork 的 Codex 多 Home/Profile 独立路由；它使用全局 proxy takeover。启动时读取 DB 中 enabled app，调用严格 `set_takeover_for_app(true)`；若恢复失败，立即调用 `set_takeover_for_app(false)` 清除 enabled 状态，而不是无限保留“开启但不可用”。
 - 原版 `read_codex_live_settings` 在 `auth.json` 与 `config.toml` 都不存在时明确返回 `codex.live.missing`；严格 takeover 要先读取 live 配置再写接管字段，缺失时失败。第三方 token 写入也明确拒绝空 `config.toml`。因此原版总体原则是“缺失 live 配置不静默凭空重建接管；启动恢复失败则关闭状态”。
 - 原版缺失场景与 Profile 版并非完全同构：原版全局 takeover 没有每 Profile Home backup、listener token proof、外部接管状态。但其 fail-closed 产品语义支持本设计将配置缺失视为无法恢复并关闭，而非自动创建用户文件。
