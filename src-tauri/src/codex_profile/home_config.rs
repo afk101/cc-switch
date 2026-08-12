@@ -2,7 +2,8 @@ use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
 use crate::codex_profile::{
-    CODEX_MODEL_CATALOG_FIELD, CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD,
+    CODEX_MCP_SERVERS_TABLE, CODEX_MODEL_CATALOG_FIELD, CODEX_MODEL_FIELD,
+    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_MODEL_REASONING_FIELD_PREFIX,
     CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION, CODEX_ROUTE_BACKUP_VERSION,
     CODEX_ROUTE_FIELD_BASE_URL, CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API,
     CODEX_ROUTE_LEGACY_BACKUP_VERSION, CODEX_ROUTE_LISTEN_HOST,
@@ -53,6 +54,15 @@ struct CodexAuxiliaryFilePlan {
 pub struct CodexDirectProviderConfigPlan {
     config: CodexRouteConfigPlan,
     model_catalog: Option<CodexAuxiliaryFilePlan>,
+}
+
+/// 直连供应商投影对用户模型选择的授权模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexDirectProviderProjectionMode {
+    /// 用户显式切换到不同供应商，允许应用供应商模型。
+    ApplyProviderModel,
+    /// 自动派生状态投影，保留 Home 中的用户模型与推理设置。
+    PreserveUserModel,
 }
 
 impl CodexDirectProviderConfigPlan {
@@ -748,6 +758,33 @@ impl CodexHomeConfigService {
         home: &Path,
         provider: &Provider,
     ) -> Result<CodexDirectProviderConfigPlan, AppError> {
+        self.build_direct_provider_plan_with_mode(
+            home,
+            provider,
+            CodexDirectProviderProjectionMode::ApplyProviderModel,
+        )
+    }
+
+    /// 构造自动派生状态使用的直连计划，保留用户当前模型与非路由扩展字段。
+    pub fn build_automatic_direct_provider_plan(
+        &self,
+        home: &Path,
+        provider: &Provider,
+    ) -> Result<CodexDirectProviderConfigPlan, AppError> {
+        self.build_direct_provider_plan_with_mode(
+            home,
+            provider,
+            CodexDirectProviderProjectionMode::PreserveUserModel,
+        )
+    }
+
+    /// 按调用方已确认的模型授权模式构造直连配置计划。
+    fn build_direct_provider_plan_with_mode(
+        &self,
+        home: &Path,
+        provider: &Provider,
+        mode: CodexDirectProviderProjectionMode,
+    ) -> Result<CodexDirectProviderConfigPlan, AppError> {
         let mut settings = provider.settings_config.clone();
         crate::codex_config::apply_codex_unified_session_bucket_to_settings(
             provider.category.as_deref(),
@@ -774,7 +811,14 @@ impl CodexHomeConfigService {
             &direct_config,
             catalog_profile,
         )?;
-        let config = self.build_route_plan(home, &prepared.config_text)?;
+        let current = self.inspect(home)?;
+        let target_config = match mode {
+            CodexDirectProviderProjectionMode::ApplyProviderModel => prepared.config_text,
+            CodexDirectProviderProjectionMode::PreserveUserModel => {
+                merge_automatic_direct_provider_projection(&current, &prepared.config_text)?
+            }
+        };
+        let config = self.build_route_plan_from_snapshot(home, current, &target_config)?;
         let model_catalog = self.build_model_catalog_file_plan(home, prepared.model_catalog)?;
         Ok(CodexDirectProviderConfigPlan {
             config,
@@ -1535,6 +1579,52 @@ impl CodexHomeConfigService {
                 == Some(expected_base_url.as_str())
             && extract_active_codex_route_string(content, CODEX_ROUTE_FIELD_WIRE_API).as_deref()
                 == Some(CODEX_ROUTE_WIRE_API_RESPONSES)
+    }
+}
+
+/// 将自动直连派生字段合并到当前 Home，用户模型、推理设置与未被目标声明的字段保持不变。
+fn merge_automatic_direct_provider_projection(
+    current: &CodexLiveConfigSnapshot,
+    projected_config: &str,
+) -> Result<String, AppError> {
+    let mut current_document = match current.content.as_deref() {
+        Some(content) => parse_codex_document(content, "当前")?,
+        None => DocumentMut::default(),
+    };
+    let projected_document = projected_config.parse::<DocumentMut>().map_err(|error| {
+        AppError::Config(format!("自动直连投影 Codex config.toml 无效: {error}"))
+    })?;
+    current_document
+        .as_table_mut()
+        .remove(CODEX_MCP_SERVERS_TABLE);
+    merge_automatic_projection_table(
+        current_document.as_table_mut(),
+        projected_document.as_table(),
+        true,
+    );
+    Ok(current_document.to_string())
+}
+
+/// 递归合并目标明确声明的派生字段，并保留当前文档的未知扩展字段。
+fn merge_automatic_projection_table(
+    current: &mut toml_edit::Table,
+    projected: &toml_edit::Table,
+    top_level: bool,
+) {
+    for (key, projected_item) in projected.iter() {
+        if top_level
+            && (key == CODEX_MODEL_FIELD || key.starts_with(CODEX_MODEL_REASONING_FIELD_PREFIX))
+        {
+            continue;
+        }
+        match (current.get_mut(key), projected_item.as_table()) {
+            (Some(Item::Table(current_table)), Some(projected_table)) => {
+                merge_automatic_projection_table(current_table, projected_table, false);
+            }
+            _ => {
+                current.insert(key, projected_item.clone());
+            }
+        }
     }
 }
 

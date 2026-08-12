@@ -683,7 +683,7 @@ impl CodexRouteManager {
                         })?;
                     CodexProviderHomeProjectionPlan::Direct(
                         self.home_config
-                            .build_direct_provider_plan(&home_path, &home_provider)
+                            .build_automatic_direct_provider_plan(&home_path, &home_provider)
                             .map_err(|_| {
                                 Self::provider_projection_prepare_error(reference, &home_path)
                             })?,
@@ -2091,7 +2091,7 @@ impl CodexRouteManager {
                 if db.is_some() && !route.enabled {
                     let plan = self
                         .home_config
-                        .build_direct_provider_plan(home, &provider)?;
+                        .build_automatic_direct_provider_plan(home, &provider)?;
                     self.home_config.apply_direct_provider_plan(&plan)
                 } else {
                     let plan = self
@@ -5730,6 +5730,77 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 共享供应商保存属于自动投影，不得覆盖关闭态托管 Home 的用户模型。
+    #[tokio::test]
+    async fn shared_provider_save_preserves_disabled_managed_user_model_and_non_route_fields(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("创建共享供应商关闭态 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let mut old_provider = provider_with_route_catalog("provider-shared-model", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\nmodel = \"old-default-model\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut new_provider = provider_with_route_catalog("provider-shared-model", "new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-shared-preserve-model",
+            16_001,
+            &old_provider,
+        )?;
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let mut document = fs::read_to_string(&config_path)
+            .expect("读取共享供应商保存前配置")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析共享供应商保存前配置");
+        document["model"] = toml_edit::value("user-selected-model");
+        document["model_reasoning_effort"] = toml_edit::value("medium");
+        document["user_unknown_setting"] = toml_edit::value("keep-me");
+        fs::write(&config_path, document.to_string()).expect("写入用户非路由修改");
+        save_codex_mcp_server(db.as_ref())?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared-model"))
+            .await?;
+
+        let updated = fs::read_to_string(&config_path).expect("读取共享供应商保存后配置");
+        assert!(updated.contains("model = \"user-selected-model\""));
+        assert!(updated.contains("model_reasoning_effort = \"medium\""));
+        assert!(updated.contains("user_unknown_setting = \"keep-me\""));
+        assert!(updated.contains("https://new.example.com/v1"));
+        assert!(updated.contains("[mcp_servers.playwright]"));
+        let catalog = fs::read_to_string(
+            home.path()
+                .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .expect("读取共享供应商保存后的模型目录");
+        assert!(catalog.contains("new-model"));
+        let stored = db
+            .get_provider_by_id("provider-shared-model", AppType::Codex.as_str())?
+            .expect("共享供应商已提交");
+        assert!(stored
+            .settings_config
+            .to_string()
+            .contains("new-default-model"));
+        Ok(())
+    }
+
     /// 共享供应商保存不得覆盖已由用户外部接管的 Home，其他托管 Profile 仍应正常收敛。
     #[tokio::test]
     async fn shared_provider_save_skips_external_home_and_updates_managed_profile(
@@ -7218,6 +7289,71 @@ mod codex_route_manager {
             fs::read(home_c.path().join(catalog_name)).expect("读取 C 恢复目录"),
             original_c
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disabled_managed_startup_reconcile_preserves_user_model_and_non_route_fields(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建关闭态托管 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let mut old_provider = provider_with_route_catalog("provider-preserve-model", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\nmodel = \"old-default-model\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut new_provider = provider_with_route_catalog("provider-preserve-model", "new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-preserve-startup-model",
+            16_001,
+            &old_provider,
+        )?;
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let mut document = fs::read_to_string(&config_path)
+            .expect("读取初始直连配置")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析初始直连配置");
+        document["model"] = toml_edit::value("user-selected-model");
+        document["model_reasoning_effort"] = toml_edit::value("high");
+        document["user_unknown_setting"] = toml_edit::value("keep-me");
+        document["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
+        fs::write(&config_path, document.to_string()).expect("写入用户非路由修改");
+        save_codex_mcp_server(db.as_ref())?;
+        db.save_provider(AppType::Codex.as_str(), &new_provider)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+
+        let reconciled = fs::read_to_string(&config_path).expect("读取启动对账后的配置");
+        assert!(reconciled.contains("model = \"user-selected-model\""));
+        assert!(reconciled.contains("model_reasoning_effort = \"high\""));
+        assert!(reconciled.contains("user_unknown_setting = \"keep-me\""));
+        assert!(reconciled.contains("followUpQueueMode = \"queue\""));
+        assert!(reconciled.contains("https://new.example.com/v1"));
+        assert!(reconciled.contains("[mcp_servers.playwright]"));
+        let catalog = fs::read_to_string(
+            home.path()
+                .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .expect("读取启动对账后的模型目录");
+        assert!(catalog.contains("new-model"));
         Ok(())
     }
 

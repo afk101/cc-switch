@@ -14,8 +14,14 @@ pub const MIN_CODEX_ROUTE_PORT: u16 = 1;
 pub const CODEX_ROUTE_LISTEN_HOST: &str = "127.0.0.1";
 /// Codex 当前模型供应商字段。
 pub const CODEX_MODEL_PROVIDER_FIELD: &str = "model_provider";
+/// Codex 用户当前选择的模型字段。
+pub const CODEX_MODEL_FIELD: &str = "model";
+/// Codex 用户模型推理设置字段的统一前缀。
+pub const CODEX_MODEL_REASONING_FIELD_PREFIX: &str = "model_reasoning_";
 /// Codex 模型供应商配置父表。
 pub const CODEX_MODEL_PROVIDERS_TABLE: &str = "model_providers";
+/// Codex MCP 服务器配置父表。
+pub const CODEX_MCP_SERVERS_TABLE: &str = "mcp_servers";
 /// Codex Home 中引用外部模型目录文件的字段。
 pub const CODEX_MODEL_CATALOG_FIELD: &str = "model_catalog_json";
 /// Codex Profile 路由接管的服务地址字段。
