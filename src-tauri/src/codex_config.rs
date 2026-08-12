@@ -1604,9 +1604,9 @@ pub fn extract_codex_experimental_bearer_token(config_text: &str) -> Option<Stri
     let token = match provider_id.as_deref() {
         Some(id) if is_custom_codex_model_provider_id(id) => doc
             .get("model_providers")
-            .and_then(|item| item.as_table())
+            .and_then(|item| item.as_table_like())
             .and_then(|table| table.get(id))
-            .and_then(|item| item.as_table())
+            .and_then(|item| item.as_table_like())
             .and_then(|table| table.get("experimental_bearer_token"))
             .and_then(|item| item.as_str())
             .or_else(top_level_token),
@@ -1650,13 +1650,13 @@ pub(crate) fn set_codex_experimental_bearer_token(
 
     if let Some(model_providers) = doc
         .get_mut("model_providers")
-        .and_then(|item| item.as_table_mut())
+        .and_then(|item| item.as_table_like_mut())
     {
         if let Some(provider_table) = model_providers
             .get_mut(provider_id.as_str())
-            .and_then(|item| item.as_table_mut())
+            .and_then(|item| item.as_table_like_mut())
         {
-            provider_table["experimental_bearer_token"] = toml_edit::value(token);
+            provider_table.insert("experimental_bearer_token", toml_edit::value(token));
             return Ok(doc.to_string());
         }
     }

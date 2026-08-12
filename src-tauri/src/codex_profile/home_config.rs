@@ -5,9 +5,9 @@ use crate::codex_profile::{
     CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD,
     CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION, CODEX_ROUTE_BACKUP_VERSION,
     CODEX_ROUTE_FIELD_BASE_URL, CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API,
-    CODEX_ROUTE_LISTEN_HOST, CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION,
-    CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_TOKEN_PROOF_DOMAIN,
-    CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
+    CODEX_ROUTE_LEGACY_BACKUP_VERSION, CODEX_ROUTE_LISTEN_HOST,
+    CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION, CODEX_ROUTE_TOKEN_MISMATCH_DETAIL,
+    CODEX_ROUTE_TOKEN_PROOF_DOMAIN, CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
 };
 use crate::error::AppError;
 use crate::provider::Provider;
@@ -906,7 +906,7 @@ fn parse_codex_document(content: &[u8], context: &str) -> Result<DocumentMut, Ap
 
 /// 为无版本字段的旧备份提供兼容版本号。
 fn legacy_route_backup_version() -> u8 {
-    1
+    CODEX_ROUTE_LEGACY_BACKUP_VERSION
 }
 
 /// 对 listener token 计算域分离摘要，避免与普通 SHA-256 摘要混用。
@@ -973,9 +973,9 @@ fn route_field_item<'a>(document: &'a DocumentMut, path: &CodexRouteFieldPath) -
         CodexRouteFieldPath::TopLevel(field) => document.get(field),
         CodexRouteFieldPath::Provider { provider_id, field } => document
             .get(CODEX_MODEL_PROVIDERS_TABLE)
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|providers| providers.get(provider_id))
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|provider| provider.get(field)),
     }
 }
@@ -1029,15 +1029,15 @@ fn read_managed_route_state(
 fn created_provider_tables(previous: &DocumentMut, target: &DocumentMut) -> Vec<String> {
     let previous_providers = previous
         .get(CODEX_MODEL_PROVIDERS_TABLE)
-        .and_then(Item::as_table);
+        .and_then(Item::as_table_like);
     target
         .get(CODEX_MODEL_PROVIDERS_TABLE)
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
         .map(|providers| {
             providers
                 .iter()
                 .filter(|(provider_id, item)| {
-                    item.as_table().is_some()
+                    item.as_table_like().is_some()
                         && previous_providers
                             .map(|previous| !previous.contains_key(provider_id))
                             .unwrap_or(true)
@@ -1084,7 +1084,7 @@ fn build_managed_route_projection(
         previous_document.get(CODEX_MODEL_PROVIDERS_TABLE).is_none()
             && target_document
                 .get(CODEX_MODEL_PROVIDERS_TABLE)
-                .and_then(Item::as_table)
+                .and_then(Item::as_table_like)
                 .is_some();
     let mut previous = CodexManagedRouteState {
         base_url: read_route_field_state(&previous_document, &base_url_path),
@@ -1200,9 +1200,9 @@ fn apply_route_field_state(
         CodexRouteFieldPath::Provider { provider_id, field } => {
             let provider = document
                 .get_mut(CODEX_MODEL_PROVIDERS_TABLE)
-                .and_then(Item::as_table_mut)
+                .and_then(Item::as_table_like_mut)
                 .and_then(|providers| providers.get_mut(provider_id))
-                .and_then(Item::as_table_mut)
+                .and_then(Item::as_table_like_mut)
                 .ok_or_else(|| {
                     AppError::Config(format!(
                         "Codex Profile 路由字段 {field} 的 provider 表不存在"
@@ -1228,13 +1228,13 @@ fn cleanup_created_provider_tables(
 ) {
     if let Some(providers) = document
         .get_mut(CODEX_MODEL_PROVIDERS_TABLE)
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
     {
         for provider_id in &projection.created_provider_tables {
             let should_remove = providers
                 .get(provider_id)
-                .and_then(Item::as_table)
-                .map(toml_edit::Table::is_empty)
+                .and_then(Item::as_table_like)
+                .map(toml_edit::TableLike::is_empty)
                 .unwrap_or(false);
             if should_remove {
                 providers.remove(provider_id);
@@ -1244,8 +1244,8 @@ fn cleanup_created_provider_tables(
     let should_remove_parent = projection.created_model_providers_table
         && document
             .get(CODEX_MODEL_PROVIDERS_TABLE)
-            .and_then(Item::as_table)
-            .map(toml_edit::Table::is_empty)
+            .and_then(Item::as_table_like)
+            .map(toml_edit::TableLike::is_empty)
             .unwrap_or(false);
     if should_remove_parent {
         document.as_table_mut().remove(CODEX_MODEL_PROVIDERS_TABLE);
@@ -1386,19 +1386,22 @@ fn listener_token_paths(document: &DocumentMut, listener_token: &str) -> Vec<Cod
     }
     if let Some(providers) = document
         .get(CODEX_MODEL_PROVIDERS_TABLE)
-        .and_then(Item::as_table)
+        .and_then(Item::as_table_like)
     {
-        paths.extend(providers.iter().filter_map(|(provider_id, item)| {
-            (item
-                .as_table()
-                .and_then(|provider| provider.get(CODEX_ROUTE_FIELD_BEARER_TOKEN))
-                .and_then(Item::as_str)
-                == Some(listener_token))
-            .then(|| CodexRouteFieldPath::Provider {
-                provider_id: provider_id.to_string(),
-                field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
-            })
-        }));
+        paths.extend(
+            providers
+                .iter()
+                .filter(|(_, item)| {
+                    item.as_table_like()
+                        .and_then(|provider| provider.get(CODEX_ROUTE_FIELD_BEARER_TOKEN))
+                        .and_then(Item::as_str)
+                        == Some(listener_token)
+                })
+                .map(|(provider_id, _)| CodexRouteFieldPath::Provider {
+                    provider_id: provider_id.to_string(),
+                    field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
+                }),
+        );
     }
     paths
 }
@@ -1409,9 +1412,9 @@ fn extract_active_codex_route_string(content: &str, field: &str) -> Option<Strin
     if let Some(provider_id) = active_codex_provider_id(&document) {
         if let Some(value) = document
             .get(CODEX_MODEL_PROVIDERS_TABLE)
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|providers| providers.get(&provider_id))
-            .and_then(Item::as_table)
+            .and_then(Item::as_table_like)
             .and_then(|provider| provider.get(field))
             .and_then(Item::as_str)
         {
@@ -2393,6 +2396,72 @@ experimental_bearer_token = "{ordinary_token}"
         service.restore_profile_backup(home.path(), &backup, 15_722, listener_token)?;
         assert_eq!(
             fs::read_to_string(config_path).expect("读取关闭恢复配置"),
+            original
+        );
+        Ok(())
+    }
+
+    /// inline table 中的全部 listener token 也必须不可逆处理，且不得破坏普通字段。
+    #[test]
+    fn backup_redacts_listener_token_from_inline_provider_tables() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let listener_token = "profile-listener-token-inline-must-not-be-reversible";
+        let ordinary_token = "ordinary-inline-token-must-be-preserved";
+        let original = format!(
+            r#"model_provider = "active"
+experimental_bearer_token = "{listener_token}"
+model_providers = {{ active = {{ base_url = "https://active.example/v1", wire_api = "responses", experimental_bearer_token = "{listener_token}", label = "keep-active" }}, inactive = {{ base_url = "https://inactive.example/v1", wire_api = "responses", experimental_bearer_token = "{listener_token}", note = "keep-inactive" }}, ordinary = {{ experimental_bearer_token = "{ordinary_token}", marker = "keep-ordinary" }} }}
+"#
+        );
+        fs::write(&config_path, &original).expect("写入 inline provider token 配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let backup = service.serialize_backup(&plan)?;
+        let backup_json: serde_json::Value = serde_json::from_str(&backup).expect("解析备份");
+        let previous: Vec<u8> = serde_json::from_value(backup_json["previous_content"].clone())
+            .expect("解码接管前正文");
+        let previous_toml = String::from_utf8(previous).expect("备份正文应为 UTF-8");
+
+        assert_eq!(backup_json["version"], CODEX_ROUTE_BACKUP_VERSION);
+        assert!(!previous_toml.contains(listener_token));
+        assert!(previous_toml.contains(ordinary_token));
+        assert!(previous_toml.contains("model_providers = {"));
+        assert!(previous_toml.contains("label = \"keep-active\""));
+        assert!(previous_toml.contains("note = \"keep-inactive\""));
+        assert!(previous_toml.contains("marker = \"keep-ordinary\""));
+        service.apply_route_plan(&plan)?;
+        service.restore_profile_backup(home.path(), &backup, 15_722, listener_token)?;
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取恢复后的 inline 配置"),
+            original
+        );
+        Ok(())
+    }
+
+    /// inline 非活动 provider 独占 listener token 时必须拒绝有损备份。
+    #[test]
+    fn backup_fails_closed_for_listener_token_only_on_inline_inactive_provider(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let listener_token = "profile-listener-token-inline-inactive";
+        let original = format!(
+            r#"model_provider = "active"
+model_providers = {{ active = {{ base_url = "https://active.example/v1", wire_api = "responses", experimental_bearer_token = "ordinary-active-token" }}, inactive = {{ experimental_bearer_token = "{listener_token}", note = "keep-inactive" }} }}
+"#
+        );
+        fs::write(&config_path, &original).expect("写入 inline 非活动 token 配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+        let error = service
+            .serialize_backup(&plan)
+            .expect_err("必须拒绝有损备份");
+
+        assert!(error.to_string().contains("无法无损表达"));
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取未修改配置"),
             original
         );
         Ok(())
