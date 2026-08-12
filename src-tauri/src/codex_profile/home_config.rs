@@ -168,6 +168,8 @@ struct CodexRouteBackup {
     model_catalog: Option<CodexRouteCatalogBackup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_live_backup: Option<Box<CodexRouteBackup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_backup: Option<Box<CodexRouteBackup>>,
 }
 
 /// 路由生命周期写入模型目录前持久化的精确文件前态。
@@ -496,28 +498,29 @@ impl CodexHomeConfigService {
         listen_port: u16,
         listener_token: &str,
     ) -> Result<(CodexModelCatalogProjectionPlan, CodexRouteConfigPlan), AppError> {
-        let current = self.inspect(home)?;
-        let catalog_plan = self.build_model_catalog_projection_plan_from_snapshot(
-            home,
-            provider,
-            current.clone(),
-        )?;
-        let projected_content = catalog_plan
-            .config
-            .as_ref()
-            .map(|plan| plan.target_content.as_slice())
-            .or(current.content.as_deref())
-            .unwrap_or_default();
-        let projected_toml = std::str::from_utf8(projected_content)
-            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?;
-        let target =
-            build_codex_profile_route_toml(projected_toml, listen_port, None, listener_token);
-        let route_plan = self.build_route_plan_from_snapshot(home, current, &target)?;
-        Ok((catalog_plan, route_plan))
+        self.build_profile_lifecycle_plans(home, provider, listen_port, None, listener_token)
     }
 
     /// 从同一原始 Home 快照构造显式切换的目录与路由组合计划。
     pub fn build_profile_switch_plans(
+        &self,
+        home: &Path,
+        provider: &Provider,
+        listen_port: u16,
+        route_provider: Option<&Provider>,
+        listener_token: &str,
+    ) -> Result<(CodexModelCatalogProjectionPlan, CodexRouteConfigPlan), AppError> {
+        self.build_profile_lifecycle_plans(
+            home,
+            provider,
+            listen_port,
+            route_provider,
+            listener_token,
+        )
+    }
+
+    /// 从单次 Home 快照组合构造模型目录与路由目标，避免启用和切换语义漂移。
+    fn build_profile_lifecycle_plans(
         &self,
         home: &Path,
         provider: &Provider,
@@ -926,6 +929,9 @@ impl CodexHomeConfigService {
             .map(Self::decode_route_backup)
             .transpose()?
             .map(Box::new);
+        backup.operation_backup = Some(Box::new(Self::decode_route_backup(
+            &self.serialize_backup(plan)?,
+        )?));
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
@@ -1018,6 +1024,73 @@ impl CodexHomeConfigService {
         self.restore_catalog_backup(home, backup.model_catalog.as_ref())
     }
 
+    /// 使用显式切换持久化的操作前精确快照恢复 Home 与模型目录。
+    pub fn restore_switch_recovery_backup(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listener_token: Option<&str>,
+    ) -> Result<(), AppError> {
+        let backup = Self::decode_route_backup(backup_json)?;
+        let operation_backup = backup
+            .operation_backup
+            .map(|backup| *backup)
+            .ok_or_else(|| {
+                AppError::Config("Codex Profile 切换残留缺少操作前 Home 备份".to_string())
+            })?;
+        let catalog_backup = backup.model_catalog;
+        self.restore_exact_operation_backup(home, operation_backup, listener_token)?;
+        self.restore_catalog_backup(home, catalog_backup.as_ref())
+    }
+
+    /// 按 CAS 恢复操作前整份 Home，并仅从私有密钥库重建已脱敏的 listener token。
+    fn restore_exact_operation_backup(
+        &self,
+        home: &Path,
+        backup: CodexRouteBackup,
+        listener_token: Option<&str>,
+    ) -> Result<(), AppError> {
+        let current = self.inspect(home)?;
+        if current.fingerprint == backup.previous_fingerprint {
+            return Ok(());
+        }
+        ensure_fingerprint(&backup.target_fingerprint, &current.fingerprint)?;
+        let previous_content = match backup.previous_token_state {
+            CodexRouteBackupTokenState::Embedded => backup.previous_content,
+            CodexRouteBackupTokenState::ListenerTokenReference => {
+                let listener_token = listener_token.ok_or_else(|| {
+                    AppError::Config("Codex Profile 本地路由凭证缺失，无法恢复切换残留".to_string())
+                })?;
+                let origin =
+                    resolve_previous_token_origin(&backup, listener_token)?.ok_or_else(|| {
+                        AppError::Config(
+                            "Codex Profile 切换残留缺少 listener token 原始路径".to_string(),
+                        )
+                    })?;
+                let content = backup.previous_content.ok_or_else(|| {
+                    AppError::Config("Codex Profile 切换残留缺少 Home 正文".to_string())
+                })?;
+                let mut document = parse_codex_document(&content, "操作前")?;
+                apply_route_field_state(
+                    &mut document,
+                    &token_origin_path(&origin),
+                    &CodexRouteFieldState::Present(toml_edit::value(listener_token)),
+                )?;
+                let restored = document.to_string().into_bytes();
+                ensure_fingerprint(
+                    &backup.previous_fingerprint,
+                    &fingerprint_content(Some(&restored)),
+                )?;
+                Some(restored)
+            }
+        };
+        let config_path = codex_config_path_for_home(home);
+        match previous_content {
+            Some(content) => self.file_ops.write_atomic(&config_path, &content),
+            None => self.file_ops.remove_file(&config_path),
+        }
+    }
+
     /// 从显式切换组合备份中取回本次操作前的路由备份。
     pub fn previous_route_backup_from_switch_backup(
         &self,
@@ -1037,6 +1110,7 @@ impl CodexHomeConfigService {
         let mut backup = Self::decode_route_backup(backup_json)?;
         backup.model_catalog = None;
         backup.previous_live_backup = None;
+        backup.operation_backup = None;
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
@@ -1933,6 +2007,7 @@ fn serialize_route_backup(
         previous_token_origin: redacted.origin,
         model_catalog: None,
         previous_live_backup: None,
+        operation_backup: None,
     })
     .map_err(|source| AppError::JsonSerialize { source })
 }

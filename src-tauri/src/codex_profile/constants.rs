@@ -84,6 +84,14 @@ pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED: &str = "switch_route_sa
 pub const CODEX_ROUTE_RECOVERY_PHASE_SWITCH_FAILOVERS_SAVED: &str = "switch_failovers_saved";
 /// 启动对账的补偿操作名称。
 pub const CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE: &str = "reconcile";
+/// 显式启用路由的补偿操作名称。
+pub const CODEX_ROUTE_RECOVERY_OPERATION_ENABLE: &str = "enable";
+/// 显式关闭路由的补偿操作名称。
+pub const CODEX_ROUTE_RECOVERY_OPERATION_DISABLE: &str = "disable";
+/// 删除 Profile 的补偿操作名称。
+pub const CODEX_ROUTE_RECOVERY_OPERATION_DELETE: &str = "delete";
+/// 显式切换供应商的补偿操作名称。
+pub const CODEX_ROUTE_RECOVERY_OPERATION_SWITCH: &str = "switch";
 /// 启动对账已记录旧、新目标指纹，尚未改写 Home。
 pub const CODEX_ROUTE_RECOVERY_PHASE_RECONCILE_PREPARED: &str = "reconcile_prepared";
 /// 启动对账已改写 Home，尚未重定位备份目标指纹。
