@@ -1317,27 +1317,20 @@ fn serialize_route_backup(
     target_content: &[u8],
     target_fingerprint: &str,
 ) -> Result<String, AppError> {
-    let ownership_proof = build_route_ownership_proof(target_content).ok();
-    let listener_token = std::str::from_utf8(target_content)
-        .ok()
-        .and_then(|content| {
-            extract_active_codex_route_string(content, CODEX_ROUTE_FIELD_BEARER_TOKEN)
-        });
-    let (previous_content, previous_token_state) = match listener_token {
-        Some(listener_token) => redact_previous_listener_token(previous_content, &listener_token)?,
-        None => (previous_content, CodexRouteBackupTokenState::Embedded),
-    };
-    let version = if ownership_proof.is_some() {
-        CODEX_ROUTE_BACKUP_VERSION
-    } else {
-        legacy_route_backup_version()
-    };
+    let ownership_proof = build_route_ownership_proof(target_content)?;
+    let target_text = std::str::from_utf8(target_content)
+        .map_err(|error| AppError::Config(format!("Codex Profile 路由目标不是 UTF-8: {error}")))?;
+    let listener_token =
+        extract_active_codex_route_string(target_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
+            .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
+    let (previous_content, previous_token_state) =
+        redact_previous_listener_token(previous_content, &listener_token)?;
     serde_json::to_string(&CodexRouteBackup {
-        version,
+        version: CODEX_ROUTE_BACKUP_VERSION,
         previous_content,
         previous_fingerprint,
         target_fingerprint: target_fingerprint.to_string(),
-        ownership_proof,
+        ownership_proof: Some(ownership_proof),
         previous_token_state,
     })
     .map_err(|source| AppError::JsonSerialize { source })
@@ -2284,6 +2277,70 @@ wire_api = "chat"
         assert_eq!(backup_json["version"], CODEX_ROUTE_BACKUP_VERSION);
         assert!(backup_json.get("ownership_proof").is_some());
         assert!(!backup.contains(listener_token));
+        Ok(())
+    }
+
+    /// 当前备份 writer 缺少严格字段时必须拒绝，不能伪装成历史 v1 备份。
+    #[test]
+    fn current_backup_writer_rejects_missing_strict_route_fields() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original = b"model = \"keep-user-model\"\n";
+        fs::write(&config_path, original).expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_route_plan(
+            home.path(),
+            "model_provider = \"custom\"\n[model_providers.custom]\nwire_api = \"responses\"\nexperimental_bearer_token = \"listener-token\"\n",
+        )?;
+
+        let error = service
+            .serialize_backup(&plan)
+            .expect_err("缺少 base_url 的当前目标必须拒绝序列化");
+
+        assert!(error.to_string().contains("缺少 base_url"));
+        assert_eq!(fs::read(&config_path).expect("读取原配置"), original);
+        Ok(())
+    }
+
+    /// 当前备份 writer 收到非 UTF-8 目标时必须传播错误，不能创建历史版本。
+    #[test]
+    fn current_backup_writer_rejects_non_utf8_route_target() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original = b"model = \"keep-user-model\"\n";
+        fs::write(&config_path, original).expect("写入接管前配置");
+        let service = CodexHomeConfigService::system();
+        let mut plan = service.build_route_plan(
+            home.path(),
+            "base_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"listener-token\"\n",
+        )?;
+        plan.target_content = vec![0xff, 0xfe];
+
+        let error = service
+            .serialize_backup(&plan)
+            .expect_err("非 UTF-8 当前目标必须拒绝序列化");
+
+        assert!(error.to_string().contains("不是 UTF-8"));
+        assert_eq!(fs::read(&config_path).expect("读取原配置"), original);
+        Ok(())
+    }
+
+    /// 当前备份 writer 缺 listener token 时必须传播错误，不能创建历史版本。
+    #[test]
+    fn current_backup_writer_rejects_missing_listener_token() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_route_plan(
+            home.path(),
+            "base_url = \"http://127.0.0.1:15722/v1\"\nwire_api = \"responses\"\n",
+        )?;
+
+        let error = service
+            .serialize_backup(&plan)
+            .expect_err("缺 listener token 的当前目标必须拒绝序列化");
+
+        assert!(error.to_string().contains("缺少本地凭证"));
+        assert!(!codex_config_path_for_home(home.path()).exists());
         Ok(())
     }
 

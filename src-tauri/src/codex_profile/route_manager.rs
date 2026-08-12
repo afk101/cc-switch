@@ -924,17 +924,6 @@ impl CodexRouteManager {
             enabled: true,
             failover_ids: failover_ids.clone(),
         };
-        self.persist_operation(
-            &previous,
-            "enable",
-            RouteRecoverySnapshot::from_route(
-                &previous,
-                self.persistence.list_failovers(profile_id)?,
-            ),
-            target_snapshot,
-            CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
-            None,
-        )?;
         self.home_config
             .apply_model_catalog_projection_plan(&catalog_plan)?;
         let plan =
@@ -947,17 +936,43 @@ impl CodexRouteManager {
                     let compensation_error = self
                         .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
                         .await;
-                    let _ = self.persist_enable_recovery_error(
-                        profile_id,
-                        CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
-                        &error,
-                    );
                     return Err(Self::compensation_failure_error(
                         &error,
                         compensation_error.as_ref(),
                     ));
                 }
             };
+        let backup = match self.home_config.serialize_backup(&plan) {
+            Ok(backup) => backup,
+            Err(error) => {
+                let compensation_error = self
+                    .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
+                    .await;
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
+        };
+        if let Err(error) = self.persist_operation(
+            &previous,
+            "enable",
+            RouteRecoverySnapshot::from_route(
+                &previous,
+                self.persistence.list_failovers(profile_id)?,
+            ),
+            target_snapshot,
+            CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+            None,
+        ) {
+            let compensation_error = self
+                .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
+                .await;
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
                 profile_id: profile.id.clone(),
@@ -1014,18 +1029,6 @@ impl CodexRouteManager {
                 compensation_error.as_ref(),
             ));
         }
-        let backup = match self.home_config.serialize_backup(&plan) {
-            Ok(backup) => backup,
-            Err(error) => {
-                let compensation_error = self
-                    .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
-                    .await;
-                return Err(Self::compensation_failure_error(
-                    &error,
-                    compensation_error.as_ref(),
-                ));
-            }
-        };
         if let Err(error) = self.persist_enable_backup(profile_id, backup.clone()) {
             let compensation_error = self
                 .compensate_enable_side_effects(profile_id, Some(&runtime), None, &catalog_plan)
@@ -6795,6 +6798,91 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 当前 writer 拒绝有损 token 备份时，启用必须保持 Home 与路由完全不变。
+    #[tokio::test]
+    async fn enable_writer_failure_leaves_home_backup_and_route_unchanged() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original_home = r#"model_provider = "active"
+
+[model_providers.active]
+base_url = "https://active.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "ordinary-active-token"
+
+[model_providers.inactive]
+experimental_bearer_token = "test-local-token"
+keep = true
+"#;
+        fs::write(&config_path, original_home).expect("写入接管前配置");
+        let provider = Provider::with_id(
+            "provider-a".to_string(),
+            "provider-a".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-writer-failure".to_string(),
+            name: "profile-writer-failure".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let original_route = CodexProfileRoute {
+            profile_id: "profile-writer-failure".to_string(),
+            current_provider_id: Some(provider.id.clone()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        };
+        db.save_codex_profile_route(&original_route)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .enable("profile-writer-failure", &provider.id, vec![])
+            .await
+            .expect_err("无法无损表达 token 时必须拒绝启用");
+
+        assert!(error.to_string().contains("无法无损表达"));
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("读取失败后的 Home"),
+            original_home
+        );
+        let route = db
+            .get_codex_profile_route("profile-writer-failure")?
+            .expect("读取失败后的路由");
+        assert_eq!(
+            route.current_provider_id,
+            original_route.current_provider_id
+        );
+        assert_eq!(route.enabled, original_route.enabled);
+        assert_eq!(route.live_backup_json, original_route.live_backup_json);
+        assert_eq!(route.last_error, original_route.last_error);
+        assert_eq!(route.recovery_json, original_route.recovery_json);
+        assert!(manager
+            .runtimes
+            .lock()
+            .expect("运行时映射锁")
+            .get("profile-writer-failure")
+            .is_none());
+        Ok(())
+    }
+
     /// 旧占位 token 与备份指纹可证明的旧 listener token 都应自愈为当前本地凭证。
     #[tokio::test]
     async fn restoring_enabled_profile_home_repairs_legacy_and_stale_listener_tokens(
@@ -8439,7 +8527,15 @@ experimental_bearer_token = "PROXY_MANAGED"
         fs::write(&config_path, "model = \"before\"\n").expect("写入原始配置");
         let plan = home_config.build_route_plan(home.path(), "model = \"route\"\n")?;
         home_config.apply_route_plan(&plan)?;
-        let backup = home_config.serialize_backup(&plan)?;
+        // 此恢复场景模拟历史 writer 产生的 v1；当前 writer 不得再用于创建旧版本。
+        let backup = serde_json::json!({
+            "version": crate::codex_profile::CODEX_ROUTE_LEGACY_BACKUP_VERSION,
+            "previous_content": b"model = \"before\"\n".to_vec(),
+            "previous_fingerprint": plan.previous_fingerprint(),
+            "target_fingerprint": plan.target_fingerprint(),
+            "previous_token_state": "embedded"
+        });
+        let backup = serde_json::to_string(&backup).expect("编码显式 v1 夹具");
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
