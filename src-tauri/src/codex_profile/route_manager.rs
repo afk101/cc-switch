@@ -936,28 +936,27 @@ impl CodexRouteManager {
         )?;
         self.home_config
             .apply_model_catalog_projection_plan(&catalog_plan)?;
-        let plan = match self.home_config.build_profile_route_plan(
-            home,
-            profile.listen_port,
-            Some(&selected_provider),
-            &token,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                let compensation_error = self
-                    .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
-                    .await;
-                let _ = self.persist_enable_recovery_error(
-                    profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
-                    &error,
-                );
-                return Err(Self::compensation_failure_error(
-                    &error,
-                    compensation_error.as_ref(),
-                ));
-            }
-        };
+        let plan =
+            match self
+                .home_config
+                .build_profile_route_plan(home, profile.listen_port, None, &token)
+            {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let compensation_error = self
+                        .compensate_enable_side_effects(profile_id, None, None, &catalog_plan)
+                        .await;
+                    let _ = self.persist_enable_recovery_error(
+                        profile_id,
+                        CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+                        &error,
+                    );
+                    return Err(Self::compensation_failure_error(
+                        &error,
+                        compensation_error.as_ref(),
+                    ));
+                }
+            };
         let runtime = self.runtime_factory.create(
             CodexProfileScope {
                 profile_id: profile.id.clone(),
@@ -1231,6 +1230,7 @@ impl CodexRouteManager {
         let runtime = self.runtime(profile_id)?;
         let changed = crate::codex_profile::CodexProfileRoute {
             current_provider_id: Some(provider_id.to_string()),
+            home_ownership: CodexHomeOwnership::Managed,
             last_error: None,
             updated_at: Utc::now().timestamp_millis(),
             ..route.clone()
@@ -1243,18 +1243,76 @@ impl CodexRouteManager {
             last_error: None,
             reconcile: None,
         };
-        let prepared = self.route_with_recovery(route.clone(), &recovery)?;
-        let catalog_plan = self.home_config.build_model_catalog_projection_plan(
-            std::path::Path::new(&profile.canonical_home_path),
-            &selected_provider,
-        )?;
-        self.home_config
-            .apply_model_catalog_projection_plan(&catalog_plan)?;
+        let listener_token = self.secret_store.read_token(profile_id)?.ok_or_else(|| {
+            AppError::Config("Codex Profile 本地路由凭证缺失，无法显式切换供应商".to_string())
+        })?;
+        let home = std::path::Path::new(&profile.canonical_home_path);
+        let catalog_plan = self
+            .home_config
+            .build_model_catalog_projection_plan(home, &selected_provider)?;
+        if let Err(error) = self
+            .home_config
+            .apply_model_catalog_projection_plan(&catalog_plan)
+        {
+            return Err(error);
+        }
+        let route_model_provider = (route.current_provider_id.as_deref() != Some(provider_id))
+            .then_some(&selected_provider);
+        let route_plan = match self.home_config.build_profile_route_plan(
+            home,
+            profile.listen_port,
+            route_model_provider,
+            &listener_token,
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let compensation_error = self
+                    .home_config
+                    .restore_model_catalog_projection_plan(&catalog_plan)
+                    .err();
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
+        };
+        let latest_backup = match self.home_config.serialize_backup(&route_plan) {
+            Ok(backup) => backup,
+            Err(error) => {
+                let compensation_error = self
+                    .home_config
+                    .restore_model_catalog_projection_plan(&catalog_plan)
+                    .err();
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
+        };
+        let mut prepared = self.route_with_recovery(route.clone(), &recovery)?;
+        prepared.home_ownership = CodexHomeOwnership::Managed;
+        prepared.live_backup_json = Some(latest_backup.clone());
         if let Err(error) = self.persistence.save_route(&prepared) {
             let compensation_error = self
                 .home_config
                 .restore_model_catalog_projection_plan(&catalog_plan)
                 .err();
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
+        if let Err(error) = self.home_config.apply_route_plan(&route_plan) {
+            let mut compensation_errors = self
+                .home_config
+                .restore_model_catalog_projection_plan(&catalog_plan)
+                .err()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(persist_error) = self.persistence.save_route(&route) {
+                compensation_errors.push(persist_error);
+            }
+            let compensation_error = Self::combine_compensation_errors(compensation_errors);
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
@@ -1272,6 +1330,7 @@ impl CodexRouteManager {
                     &route,
                     &old_failovers,
                     old_snapshot,
+                    &route_plan,
                     &catalog_plan,
                 )
                 .await;
@@ -1282,6 +1341,7 @@ impl CodexRouteManager {
         }
         let changing = CodexProfileRoute {
             recovery_json: self.operation_json_from_route(profile_id)?,
+            live_backup_json: Some(latest_backup),
             ..changed.clone()
         };
         if let Err(error) = self.persistence.save_route(&changing) {
@@ -1291,6 +1351,7 @@ impl CodexRouteManager {
                     &route,
                     &old_failovers,
                     old_snapshot,
+                    &route_plan,
                     &catalog_plan,
                 )
                 .await;
@@ -1310,6 +1371,7 @@ impl CodexRouteManager {
                     &route,
                     &old_failovers,
                     old_snapshot,
+                    &route_plan,
                     &catalog_plan,
                 )
                 .await;
@@ -1328,6 +1390,7 @@ impl CodexRouteManager {
                     &route,
                     &old_failovers,
                     old_snapshot,
+                    &route_plan,
                     &catalog_plan,
                 )
                 .await;
@@ -1347,6 +1410,7 @@ impl CodexRouteManager {
                     &route,
                     &old_failovers,
                     old_snapshot,
+                    &route_plan,
                     &catalog_plan,
                 )
                 .await;
@@ -1355,7 +1419,7 @@ impl CodexRouteManager {
                 compensation_error.as_ref(),
             ));
         }
-        if let Err(error) = self.clear_operation(&changed) {
+        if let Err(error) = self.clear_operation(&changing) {
             let persistence_error = self
                 .persist_operation_error(
                     profile_id,
@@ -1458,6 +1522,14 @@ impl CodexRouteManager {
         profile: &crate::codex_profile::CodexProfile,
         route: crate::codex_profile::CodexProfileRoute,
     ) -> Result<(), AppError> {
+        let route = if route.home_ownership == CodexHomeOwnership::External {
+            CodexProfileRoute {
+                live_backup_json: None,
+                ..route
+            }
+        } else {
+            route
+        };
         let failovers = self.persistence.list_failovers(profile_id)?;
         self.persist_operation(
             &route,
@@ -1494,7 +1566,6 @@ impl CodexRouteManager {
         self.advance_operation(profile_id, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, None)?;
         let disabled = crate::codex_profile::CodexProfileRoute {
             enabled: false,
-            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
             last_error: None,
             recovery_json: self.operation_json_from_route(profile_id)?,
             updated_at: Utc::now().timestamp_millis(),
@@ -2373,9 +2444,13 @@ impl CodexRouteManager {
         route: &CodexProfileRoute,
         failovers: &[String],
         old_snapshot: CodexRouteProviderSnapshot,
+        route_plan: &CodexRouteConfigPlan,
         catalog_plan: &CodexModelCatalogProjectionPlan,
     ) -> Option<AppError> {
         let mut errors = Vec::new();
+        if let Err(error) = self.home_config.restore(route_plan) {
+            errors.push(error);
+        }
         if let Err(error) = self
             .restore_switch_locked(profile_id, route, failovers, old_snapshot)
             .await
@@ -5661,6 +5736,238 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 显式切换供应商必须以操作当刻的 Home 重建恢复基线。
+    #[tokio::test]
+    async fn switching_enabled_profile_rebases_latest_home_before_disable() -> Result<(), AppError>
+    {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        for (id, config) in [
+            ("provider-old", ""),
+            ("provider-new", "model = \"provider-model\"\n"),
+        ] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    id.to_string(),
+                    id.to_string(),
+                    json!({"auth": {}, "config": config}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"initial-model\"\nbase_url = \"https://initial.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"initial-token\"\n",
+        )
+        .expect("写入初始 Home");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-old", vec![]).await?;
+        fs::write(
+            &config_path,
+            "model = \"user-latest\"\nbase_url = \"https://latest.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"latest-token\"\n\n[features]\njs_repl = true\n",
+        )
+        .expect("写入用户最新配置");
+
+        manager
+            .switch_provider("profile-a", "provider-new", vec![])
+            .await?;
+        manager.disable("profile-a").await?;
+
+        let restored = fs::read_to_string(config_path).expect("读取关闭后的 Home");
+        assert!(restored.contains("model = \"provider-model\""));
+        assert!(restored.contains("base_url = \"https://latest.example/v1\""));
+        assert!(restored.contains("wire_api = \"chat\""));
+        assert!(restored.contains("experimental_bearer_token = \"latest-token\""));
+        assert!(restored.contains("js_repl = true"));
+        Ok(())
+    }
+
+    /// 外部接管后重新启用同一供应商只能重建基线，不得修改用户模型。
+    #[tokio::test]
+    async fn reenabling_same_provider_rebases_home_without_changing_model() -> Result<(), AppError>
+    {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model = \"provider-default\"\n"
+                }),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: Some("provider-a".to_string()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::External,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        let latest_config = "model = \"user-selected\"\nbase_url = \"https://latest.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"latest-token\"\n";
+        fs::write(&config_path, latest_config).expect("写入用户最新配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .enable_preserving_failovers("profile-a", "provider-a")
+            .await?;
+        let routed = fs::read_to_string(&config_path).expect("读取重新接管配置");
+        assert!(routed.contains("model = \"user-selected\""));
+        manager.disable("profile-a").await?;
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取恢复配置"),
+            latest_config
+        );
+        Ok(())
+    }
+
+    /// 显式选择当前供应商不是供应商切换，不得修改用户模型。
+    #[tokio::test]
+    async fn switching_to_same_provider_preserves_user_model() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({"auth": {}, "config": "model = \"provider-default\"\n"}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, "model = \"user-selected\"\n").expect("写入用户模型");
+        let manager = CodexRouteManager::new(
+            db,
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-a", vec![]).await?;
+        manager
+            .switch_provider("profile-a", "provider-a", vec![])
+            .await?;
+
+        let routed = fs::read_to_string(config_path).expect("读取切换后配置");
+        assert!(routed.contains("model = \"user-selected\""));
+        Ok(())
+    }
+
+    /// 外部接管后的显式关闭不得使用残留备份改写用户 Home。
+    #[tokio::test]
+    async fn disabling_external_home_keeps_latest_content_and_clears_stale_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-a",
+            16001,
+            "test-local-token",
+        )?;
+        let mut route = db
+            .get_codex_profile_route("profile-a")?
+            .expect("已启用路由");
+        route.home_ownership = CodexHomeOwnership::External;
+        db.save_codex_profile_route(&route)?;
+        let config_path = codex_config_path_for_home(home.path());
+        let latest_config = "model = \"user-selected\"\nbase_url = \"https://external.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"external-token\"\n";
+        fs::write(&config_path, latest_config).expect("写入外部接管配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        manager.runtimes.lock().expect("运行时锁").insert(
+            "profile-a".to_string(),
+            Arc::new(FakeRuntime {
+                provider: AsyncMutex::new("provider-profile-a".to_string()),
+                port: 16001,
+            }),
+        );
+
+        manager.disable("profile-a").await?;
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取关闭后配置"),
+            latest_config
+        );
+        let disabled = db.get_codex_profile_route("profile-a")?.expect("关闭路由");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.home_ownership, CodexHomeOwnership::External);
+        assert!(disabled.live_backup_json.is_none());
+        Ok(())
+    }
+
     /// 用户显式关闭必须立即停接，不得等待永不结束的在途路由请求。
     #[tokio::test]
     async fn disabling_route_does_not_wait_for_in_flight_request() -> Result<(), AppError> {
@@ -6938,36 +7245,40 @@ experimental_bearer_token = "PROXY_MANAGED"
     #[tokio::test]
     async fn switching_clear_operation_save_failure_keeps_pending_phase() -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
-        for id in ["provider-a", "provider-a-next", "provider-b"] {
+        let home_a = tempfile::tempdir().expect("Profile A Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home_a.path(),
+            "profile-a",
+            16001,
+            "test-local-token",
+        )?;
+        for id in ["provider-a-next", "provider-b"] {
             db.save_provider(
                 AppType::Codex.as_str(),
                 &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
             )?;
         }
-        for (id, port) in [("profile-a", 16001), ("profile-b", 16002)] {
-            db.insert_codex_profile(&CodexProfile {
-                id: id.to_string(),
-                name: id.to_string(),
-                canonical_home_path: format!("/tmp/{id}"),
-                listen_port: port,
-                created_at: 1,
-                updated_at: 1,
-            })?;
-            db.save_codex_profile_route(&CodexProfileRoute {
-                profile_id: id.to_string(),
-                current_provider_id: Some(if id == "profile-a" {
-                    "provider-a".to_string()
-                } else {
-                    "provider-b".to_string()
-                }),
-                enabled: true,
-                home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
-                live_backup_json: None,
-                last_error: None,
-                recovery_json: None,
-                updated_at: 1,
-            })?;
-        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-b".to_string(),
+            name: "profile-b".to_string(),
+            canonical_home_path: "/tmp/profile-b".to_string(),
+            listen_port: 16002,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-b".to_string(),
+            current_provider_id: Some("provider-b".to_string()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
         let manager = CodexRouteManager::new(
             Arc::new(SaveFailingPersistence {
                 db: db.clone(),
@@ -6975,14 +7286,15 @@ experimental_bearer_token = "PROXY_MANAGED"
                 fail_on_save: 6,
                 fail_replace: false,
             }),
-            Arc::new(CodexHomeConfigService::system()),
-            Arc::new(CodexProfileSecretStore::with_root(
-                tempfile::tempdir().expect("临时 token 目录").keep(),
-            )),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
             Arc::new(FakeFactory),
         );
         let runtime_a = Arc::new(FakeRuntime {
-            provider: AsyncMutex::new("provider-a".to_string()),
+            provider: AsyncMutex::new("provider-profile-a".to_string()),
             port: 16001,
         });
         let runtime_b = Arc::new(FakeRuntime {
@@ -7027,30 +7339,25 @@ experimental_bearer_token = "PROXY_MANAGED"
     async fn switching_failover_save_failure_keeps_recovery_and_rejects_next_mutation(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
-        for id in ["provider-old", "provider-new", "provider-failover"] {
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-a",
+            16001,
+            "test-local-token",
+        )?;
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let latest_before_switch = "model = \"user-latest\"\nbase_url = \"https://latest.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"latest-token\"\n";
+        fs::write(&config_path, latest_before_switch).expect("写入切换前最新 Home");
+        for id in ["provider-new", "provider-failover"] {
             db.save_provider(
                 AppType::Codex.as_str(),
                 &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
             )?;
         }
-        db.insert_codex_profile(&CodexProfile {
-            id: "profile-a".to_string(),
-            name: "Profile A".to_string(),
-            canonical_home_path: "/tmp/profile-a".to_string(),
-            listen_port: 16001,
-            created_at: 1,
-            updated_at: 1,
-        })?;
-        db.save_codex_profile_route(&CodexProfileRoute {
-            profile_id: "profile-a".to_string(),
-            current_provider_id: Some("provider-old".to_string()),
-            enabled: true,
-            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
-            live_backup_json: None,
-            last_error: None,
-            recovery_json: None,
-            updated_at: 1,
-        })?;
         db.replace_codex_profile_failovers("profile-a", &["provider-failover".to_string()])?;
         let persistence = Arc::new(SaveFailingPersistence {
             db: db.clone(),
@@ -7060,14 +7367,15 @@ experimental_bearer_token = "PROXY_MANAGED"
         });
         let manager = CodexRouteManager::new(
             persistence,
-            Arc::new(CodexHomeConfigService::system()),
-            Arc::new(CodexProfileSecretStore::with_root(
-                tempfile::tempdir().expect("临时 token 目录").keep(),
-            )),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
             Arc::new(FakeFactory),
         );
         let runtime = Arc::new(FakeRuntime {
-            provider: AsyncMutex::new("provider-old".to_string()),
+            provider: AsyncMutex::new("provider-profile-a".to_string()),
             port: 16001,
         });
         manager
@@ -7080,7 +7388,11 @@ experimental_bearer_token = "PROXY_MANAGED"
             .switch_provider("profile-a", "provider-new", vec![])
             .await
             .is_err());
-        assert_eq!(*runtime.provider.lock().await, "provider-old");
+        assert_eq!(*runtime.provider.lock().await, "provider-profile-a");
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取补偿后的 Home"),
+            latest_before_switch
+        );
         let route = db
             .get_codex_profile_route("profile-a")?
             .expect("路由仍存在");
