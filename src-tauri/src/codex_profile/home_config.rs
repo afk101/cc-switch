@@ -128,6 +128,18 @@ pub enum CodexHomeMissingTokenPreflight {
     ExternalTakeover,
 }
 
+/// 本地凭证已存在时，启动预检对 Home 中不同 token 的只读判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexHomeExistingTokenPreflight {
+    /// Home 仍由路由持有；只有 Home 使用已证明旧 token 时才携带短生命周期证明。
+    Managed {
+        backup_json: String,
+        proven_previous_listener_token: Option<CodexProvenPreviousListenerToken>,
+    },
+    /// Home 中不同 token 无法证明属于该 Profile 路由。
+    ExternalTakeover,
+}
+
 /// 只能由 Home 所有权预检产生的旧 listener token，生命周期仅限本次启动对账。
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexProvenPreviousListenerToken(String);
@@ -383,6 +395,47 @@ impl CodexHomeConfigService {
             backup_json,
             proven_previous_listener_token: CodexProvenPreviousListenerToken(listener_token),
         })
+    }
+
+    /// 仅在 Home token 不同于当前 secret 时证明并携带历史 listener token。
+    pub fn preflight_existing_listener_token(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+        current_listener_token: &str,
+    ) -> Result<CodexHomeExistingTokenPreflight, AppError> {
+        let current = self.inspect(home)?;
+        let Some(current_content) = current.content.as_deref() else {
+            return Ok(CodexHomeExistingTokenPreflight::ExternalTakeover);
+        };
+        let current_text = match std::str::from_utf8(current_content) {
+            Ok(content) => content,
+            Err(_) => return Ok(CodexHomeExistingTokenPreflight::ExternalTakeover),
+        };
+        let Some(home_listener_token) =
+            extract_active_codex_route_string(current_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        else {
+            return Ok(CodexHomeExistingTokenPreflight::ExternalTakeover);
+        };
+        if home_listener_token == current_listener_token {
+            return Ok(CodexHomeExistingTokenPreflight::Managed {
+                backup_json: backup_json.to_string(),
+                proven_previous_listener_token: None,
+            });
+        }
+        match self.preflight_missing_listener_token(home, backup_json, listen_port)? {
+            CodexHomeMissingTokenPreflight::Managed {
+                backup_json,
+                proven_previous_listener_token,
+            } => Ok(CodexHomeExistingTokenPreflight::Managed {
+                backup_json,
+                proven_previous_listener_token: Some(proven_previous_listener_token),
+            }),
+            CodexHomeMissingTokenPreflight::ExternalTakeover => {
+                Ok(CodexHomeExistingTokenPreflight::ExternalTakeover)
+            }
+        }
     }
 
     /// 构造路由接管计划，不在此阶段写入任何文件。

@@ -17,9 +17,10 @@ mod secret_store;
 pub use constants::*;
 pub use home_config::{
     build_codex_profile_route_toml, CodexDirectProviderConfigPlan, CodexHomeConfigService,
-    CodexHomeFileOps, CodexHomeMissingTokenPreflight, CodexHomeReconcileOwnership,
-    CodexHomeRouteReadiness, CodexLiveConfigSnapshot, CodexModelCatalogProjectionPlan,
-    CodexProvenPreviousListenerToken, CodexRouteConfigPlan, SystemCodexHomeFileOps,
+    CodexHomeExistingTokenPreflight, CodexHomeFileOps, CodexHomeMissingTokenPreflight,
+    CodexHomeReconcileOwnership, CodexHomeRouteReadiness, CodexLiveConfigSnapshot,
+    CodexModelCatalogProjectionPlan, CodexProvenPreviousListenerToken, CodexRouteConfigPlan,
+    SystemCodexHomeFileOps,
 };
 pub use migration::{
     CodexProfileMigrationResult, CodexProfileMigrationService, LegacyCodexProfileSnapshot,
