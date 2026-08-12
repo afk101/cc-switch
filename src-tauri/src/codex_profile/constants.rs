@@ -42,6 +42,10 @@ pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 pub const CODEX_ROUTE_BACKUP_VERSION: u8 = 2;
 /// listener token 所有权摘要的域分离标签。
 pub const CODEX_ROUTE_TOKEN_PROOF_DOMAIN: &[u8] = b"cc-switch/codex-route-token-proof/v1";
+/// Home 仍处于 CC Switch Profile 路由管理域。
+pub const CODEX_HOME_OWNERSHIP_MANAGED: &str = "managed";
+/// Home 已由用户或其他程序接管，派生状态不得写入。
+pub const CODEX_HOME_OWNERSHIP_EXTERNAL: &str = "external";
 /// 已迁移旧路由等待创建兼容本地凭证时使用的数据库设置键。
 pub const CODEX_LEGACY_TOKEN_PENDING_PROFILE_SETTING: &str =
     "codex_legacy_token_pending_profile_id";

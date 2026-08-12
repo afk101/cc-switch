@@ -28,6 +28,7 @@ export interface CodexProfileRoute {
   profileId: string;
   currentProviderId: string | null;
   enabled: boolean;
+  homeOwnership: "managed" | "external";
   lastError: string | null;
   recoveryJson: string | null;
   updatedAt: number;

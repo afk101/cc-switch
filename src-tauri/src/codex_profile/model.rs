@@ -7,6 +7,38 @@ use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Profile Home 当前是否仍由 CC Switch 派生状态管理。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CodexHomeOwnership {
+    /// Home 仍属于 CC Switch 管理域。
+    #[default]
+    Managed,
+    /// Home 已由用户或其他程序接管。
+    External,
+}
+
+impl CodexHomeOwnership {
+    /// 返回数据库使用的稳定字符串。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => crate::codex_profile::CODEX_HOME_OWNERSHIP_MANAGED,
+            Self::External => crate::codex_profile::CODEX_HOME_OWNERSHIP_EXTERNAL,
+        }
+    }
+
+    /// 从数据库稳定字符串恢复领域状态。
+    pub fn from_db(value: &str) -> Result<Self, AppError> {
+        match value {
+            crate::codex_profile::CODEX_HOME_OWNERSHIP_MANAGED => Ok(Self::Managed),
+            crate::codex_profile::CODEX_HOME_OWNERSHIP_EXTERNAL => Ok(Self::External),
+            _ => Err(AppError::Database(format!(
+                "未知的 Codex Profile Home 所有权状态: {value}"
+            ))),
+        }
+    }
+}
+
 /// 一个独立 CODEX_HOME 的持久化描述。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +58,9 @@ pub struct CodexProfileRoute {
     pub profile_id: String,
     pub current_provider_id: Option<String>,
     pub enabled: bool,
+    /// Home 是否仍允许数据库派生状态自动写入。
+    #[serde(default)]
+    pub home_ownership: CodexHomeOwnership,
     /// 该 Profile 接管前的 Live 配置备份，仅保存在所属 Profile 关系中。
     pub live_backup_json: Option<String>,
     /// 该 Profile 最近一次独立路由生命周期失败摘要，绝不保存本地凭证。

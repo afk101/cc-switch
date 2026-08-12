@@ -497,6 +497,11 @@ impl Database {
                         Self::migrate_v16_to_v17(conn)?;
                         Self::set_user_version(conn, 17)?;
                     }
+                    17 => {
+                        log::info!("迁移数据库从 v17 到 v18（增加 Codex Profile Home 所有权状态）");
+                        Self::migrate_v17_to_v18(conn)?;
+                        Self::set_user_version(conn, 18)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1391,6 +1396,8 @@ impl Database {
                 live_backup_json TEXT,
                 last_error TEXT,
                 recovery_json TEXT,
+                home_ownership TEXT NOT NULL DEFAULT 'managed'
+                    CHECK (home_ownership IN ('managed', 'external')),
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 FOREIGN KEY (profile_id) REFERENCES codex_profiles(id) ON DELETE CASCADE,
                 FOREIGN KEY (current_provider_id, provider_app_type)
@@ -1746,6 +1753,17 @@ impl Database {
     /// v16 -> v17：补齐被历史同版本分支跳过的 Grok Build Skills/MCP 开关。
     fn migrate_v16_to_v17(conn: &Connection) -> Result<(), AppError> {
         Self::ensure_grokbuild_skill_mcp_schema(conn)
+    }
+
+    /// v17 -> v18：增加 Codex Profile Home 所有权状态。
+    fn migrate_v17_to_v18(conn: &Connection) -> Result<(), AppError> {
+        Self::add_column_if_missing(
+            conn,
+            "codex_profile_routes",
+            "home_ownership",
+            "TEXT NOT NULL DEFAULT 'managed' CHECK (home_ownership IN ('managed', 'external'))",
+        )?;
+        Ok(())
     }
 
     /// 插入默认模型定价数据

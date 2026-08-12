@@ -104,6 +104,15 @@ pub enum CodexHomeReconcileOwnership {
     ExternalTakeover,
 }
 
+/// 启动阶段读取 Home 后得到的可判定状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHomeRouteReadiness {
+    /// 配置可读取且能定位当前活动连接路径。
+    Readable,
+    /// 配置缺失或结构损坏，必须保护性放弃路由所有权。
+    ExternalTakeover,
+}
+
 /// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
 #[derive(Serialize, Deserialize)]
 struct CodexRouteBackup {
@@ -231,6 +240,21 @@ impl CodexHomeConfigService {
             fingerprint: fingerprint_content(content.as_deref()),
             content,
         })
+    }
+
+    /// 区分可重试文件 I/O 与能够确定的外部接管状态。
+    pub fn classify_profile_home_readiness(
+        &self,
+        home: &Path,
+    ) -> Result<CodexHomeRouteReadiness, AppError> {
+        let snapshot = self.inspect(home)?;
+        let Some(content) = snapshot.content.as_deref() else {
+            return Ok(CodexHomeRouteReadiness::ExternalTakeover);
+        };
+        if build_route_ownership_proof(content).is_err() {
+            return Ok(CodexHomeRouteReadiness::ExternalTakeover);
+        }
+        Ok(CodexHomeRouteReadiness::Readable)
     }
 
     /// 构造路由接管计划，不在此阶段写入任何文件。

@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::app_config::MultiAppConfig;
-use crate::codex_profile::{CodexProfile, CodexProfileRoute};
+use crate::codex_profile::{CodexHomeOwnership, CodexProfile, CodexProfileRoute};
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderManager};
 use indexmap::IndexMap;
@@ -226,6 +226,37 @@ fn schema_migration_adds_codex_profile_route_last_error() {
         get_column_info(&conn, "codex_profile_routes", "last_error").r#type,
         "TEXT"
     );
+    assert_eq!(
+        Database::get_user_version(&conn).expect("read version"),
+        SCHEMA_VERSION
+    );
+}
+
+/// 从 v17 升级时，Profile 路由必须获得稳定的 Home 所有权状态。
+#[test]
+fn schema_migration_adds_codex_profile_route_home_ownership() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute_batch(
+        "CREATE TABLE codex_profiles (id TEXT PRIMARY KEY);
+         CREATE TABLE codex_profile_routes (
+             profile_id TEXT PRIMARY KEY,
+             current_provider_id TEXT,
+             enabled BOOLEAN NOT NULL DEFAULT 0,
+             live_backup_json TEXT,
+             last_error TEXT,
+             recovery_json TEXT,
+             updated_at INTEGER NOT NULL DEFAULT 0
+         );",
+    )
+    .expect("create v17 tables");
+    Database::set_user_version(&conn, 17).expect("set v17");
+
+    Database::apply_schema_migrations_on_conn(&conn).expect("migrate v17");
+
+    let ownership = get_column_info(&conn, "codex_profile_routes", "home_ownership");
+    assert_eq!(ownership.r#type, "TEXT");
+    assert_eq!(ownership.notnull, 1);
+    assert_eq!(ownership.default.as_deref(), Some("'managed'"));
     assert_eq!(
         Database::get_user_version(&conn).expect("read version"),
         SCHEMA_VERSION
@@ -757,6 +788,7 @@ fn codex_profile_dao_persists_route_failover_order_and_provider_refs() -> Result
         profile_id: "profile-a".to_string(),
         current_provider_id: Some("provider-a".to_string()),
         enabled: true,
+        home_ownership: CodexHomeOwnership::External,
         live_backup_json: Some("{\"config\":\"profile\"}".to_string()),
         last_error: None,
         recovery_json: None,

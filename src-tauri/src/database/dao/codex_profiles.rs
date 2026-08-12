@@ -3,7 +3,7 @@
 //! 本模块仅负责 SQL 执行和行映射，不处理路径、端口、文件或运行时控制。
 
 use crate::app_config::AppType;
-use crate::codex_profile::{CodexProfile, CodexProfileRef, CodexProfileRoute};
+use crate::codex_profile::{CodexHomeOwnership, CodexProfile, CodexProfileRef, CodexProfileRoute};
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use rusqlite::{params, Connection, Row};
@@ -22,14 +22,19 @@ fn map_codex_profile(row: &Row<'_>) -> rusqlite::Result<CodexProfile> {
 
 /// 将 Route 查询行映射为领域数据。
 fn map_codex_profile_route(row: &Row<'_>) -> rusqlite::Result<CodexProfileRoute> {
+    let home_ownership = row.get::<_, String>(3)?;
+    let home_ownership = CodexHomeOwnership::from_db(&home_ownership).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
     Ok(CodexProfileRoute {
         profile_id: row.get(0)?,
         current_provider_id: row.get(1)?,
         enabled: row.get(2)?,
-        live_backup_json: row.get(3)?,
-        last_error: row.get(4)?,
-        recovery_json: row.get(5)?,
-        updated_at: row.get(6)?,
+        home_ownership,
+        live_backup_json: row.get(4)?,
+        last_error: row.get(5)?,
+        recovery_json: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
@@ -189,7 +194,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
         ensure_codex_profile_exists(&conn, profile_id)?;
         match conn.query_row(
-            "SELECT profile_id, current_provider_id, enabled, live_backup_json, last_error, recovery_json, updated_at
+            "SELECT profile_id, current_provider_id, enabled, home_ownership, live_backup_json, last_error, recovery_json, updated_at
              FROM codex_profile_routes WHERE profile_id = ?1",
             [profile_id],
             map_codex_profile_route,
@@ -206,12 +211,13 @@ impl Database {
         ensure_codex_profile_exists(&conn, &route.profile_id)?;
         conn.execute(
             "INSERT INTO codex_profile_routes
-             (profile_id, current_provider_id, provider_app_type, enabled, live_backup_json, last_error, recovery_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             (profile_id, current_provider_id, provider_app_type, enabled, home_ownership, live_backup_json, last_error, recovery_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(profile_id) DO UPDATE SET
                  current_provider_id = excluded.current_provider_id,
                  provider_app_type = excluded.provider_app_type,
                  enabled = excluded.enabled,
+                 home_ownership = excluded.home_ownership,
                  live_backup_json = excluded.live_backup_json,
                  last_error = excluded.last_error,
                  recovery_json = excluded.recovery_json,
@@ -221,6 +227,7 @@ impl Database {
                 route.current_provider_id,
                 AppType::Codex.as_str(),
                 route.enabled,
+                route.home_ownership.as_str(),
                 route.live_backup_json,
                 route.last_error,
                 route.recovery_json,

@@ -27,7 +27,8 @@ const enabledState: CodexProfileState = {
   route: {
     profileId: "profile-a",
     currentProviderId: "provider-a",
-    enabled: true,
+  enabled: true,
+  homeOwnership: "managed",
     lastError: null,
     recoveryJson: null,
     updatedAt: 3,
@@ -47,7 +48,8 @@ const disabledState: CodexProfileState = {
   route: {
     profileId: "profile-b",
     currentProviderId: "provider-b",
-    enabled: false,
+  enabled: false,
+  homeOwnership: "managed",
     lastError: null,
     recoveryJson: null,
     updatedAt: 6,

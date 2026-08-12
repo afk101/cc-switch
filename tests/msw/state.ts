@@ -108,6 +108,7 @@ const createDefaultCodexProfileStates = (): CodexProfileStateById => {
         profileId: CODEX_DEFAULT_PROFILE_ID,
         currentProviderId: "codex-1",
         enabled: false,
+        homeOwnership: "managed",
         lastError: null,
         recoveryJson: null,
         updatedAt: now,

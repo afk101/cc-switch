@@ -1,6 +1,6 @@
 # 02 — 启动恢复安全收敛外部接管
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 应用启动时先验证 enabled Profile 的有效路由所有权；正常非路由变化继续启动服务，真实外部接管则保护Home并静默关闭，临时I/O错误保持可重试状态。
 
@@ -13,12 +13,12 @@ Status: ready-for-agent
 
 ## Acceptance Criteria
 
-- [ ] 正常模型及非路由字段变化后，真实启动序列成功创建一个listener且Home相关字段不被覆盖。
-- [ ] selector或严格字段外部修改、配置缺失/损坏时，Home原样、runtime不启动、route静默关闭并进入稳定外部接管状态。
-- [ ] 外部接管状态保留主/故障转移供应商引用、清旧backup，并阻止后续关闭态派生对账写Home。
-- [ ] 临时I/O与DB保存失败不会销毁enabled、backup或ownership状态，也不会启动runtime。
-- [ ] 所有权检测先于enabled Home派生写入；单Profile失败不影响其他Profile。
-- [ ] UI可观察route开关为关闭且没有持久提示，应用日志保持脱敏。
+- [x] 正常模型及非路由字段变化后，真实启动序列成功创建一个listener且Home相关字段不被覆盖。
+- [x] selector或严格字段外部修改、配置缺失/损坏时，Home原样、runtime不启动、route静默关闭并进入稳定外部接管状态。
+- [x] 外部接管状态保留主/故障转移供应商引用、清旧backup，并阻止后续关闭态派生对账写Home。
+- [x] 临时I/O与DB保存失败不会销毁enabled、backup或ownership状态，也不会启动runtime。
+- [x] 所有权检测先于enabled Home派生写入；单Profile失败不影响其他Profile。
+- [x] UI可观察route开关为关闭且没有持久提示，应用日志保持脱敏。
 
 ## 验证方式
 
@@ -37,3 +37,10 @@ Status: ready-for-agent
 
 - 不增加后台watcher、轮询或UI提示。
 - 不完成显式切换供应商的新基线行为。
+
+## Comments
+
+- 实现增加 `managed` / `external` 稳定 Home 所有权状态与 v18 Schema 迁移；外部接管采用独立 route 保存，不复用正常关闭恢复流程。
+- 真实两阶段启动先执行只读所有权检查；外部接管、配置缺失/损坏静默关闭，临时 I/O 与 DB 保存失败在本次启动阻断后续阶段并保留可重试状态。
+- 验证：Codex Profile 156/156、数据库 24/24、TypeScript typecheck、renderer build、格式检查均通过；`cargo clippy --lib -- -D warnings` 只剩未修改文件中的 8 个既有 lint，本 issue 修改文件无报告。
+- 前端定向测试 12/13；唯一失败为既有测试要求 `enableRoute` 第三个参数 `[]`，但基线组件始终只传两个参数，与本 issue 改动无关。
