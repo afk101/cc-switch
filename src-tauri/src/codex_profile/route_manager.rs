@@ -1220,6 +1220,9 @@ impl CodexRouteManager {
                 "官方订阅供应商不能经过 Profile 路由，请先关闭路由".to_string(),
             ));
         }
+        if let Some(backup) = route.live_backup_json.as_deref() {
+            self.home_config.validate_route_backup(backup)?;
+        }
         let old_failovers = self.persistence.list_failovers(profile_id)?;
         let old_snapshot = self.provider_snapshot(
             route
@@ -1537,6 +1540,9 @@ impl CodexRouteManager {
         } else {
             route
         };
+        if let Some(backup) = route.live_backup_json.as_deref() {
+            self.home_config.validate_route_backup(backup)?;
+        }
         let failovers = self.persistence.list_failovers(profile_id)?;
         self.persist_operation(
             &route,
@@ -1708,16 +1714,22 @@ impl CodexRouteManager {
                     Err(failure) => {
                         let failure = *failure;
                         self.block_profile_for_current_startup(&profile.id)?;
-                        route.last_error = Some(format!(
-                            "{error_prefix}: Profile {} ({})，Home {}",
-                            profile.id, profile.name, profile.canonical_home_path
-                        ));
-                        if let Err(save_error) = self.persistence.save_route(&route) {
-                            log::warn!(
-                                "记录 Codex Profile {} 启动所有权错误失败: {}",
-                                profile.id,
-                                save_error
-                            );
+                        let future_backup = route
+                            .live_backup_json
+                            .as_deref()
+                            .is_some_and(|backup| self.home_config.is_future_route_backup(backup));
+                        if !future_backup {
+                            route.last_error = Some(format!(
+                                "{error_prefix}: Profile {} ({})，Home {}",
+                                profile.id, profile.name, profile.canonical_home_path
+                            ));
+                            if let Err(save_error) = self.persistence.save_route(&route) {
+                                log::warn!(
+                                    "记录 Codex Profile {} 启动所有权错误失败: {}",
+                                    profile.id,
+                                    save_error
+                                );
+                            }
                         }
                         self.startup_restore_diagnostic_logger.warn(
                             &CodexStartupRestoreDiagnostic::from_failure(&profile, &failure)
@@ -2816,6 +2828,7 @@ impl CodexRouteManager {
                     "{CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR}: 启用残留缺少 Home 备份"
                 )));
             };
+            self.home_config.validate_route_backup(backup)?;
             let profile = self.persistence.get_profile(profile_id)?;
             let listener_token = self.secret_store.read_token(profile_id)?;
             let restore_result = self.home_config.restore_enable_recovery_backup(
@@ -3836,6 +3849,29 @@ mod codex_route_manager {
             serde_json::to_string(backup).map_err(|source| AppError::JsonSerialize { source })?,
         );
         db.save_codex_profile_route(&route)
+    }
+
+    /// 将测试路由备份改为未知未来版本，保留其余可反序列化结构。
+    fn upgrade_route_backup_to_future_version(
+        db: &Database,
+        profile_id: &str,
+    ) -> Result<CodexProfileRoute, AppError> {
+        let mut route = db
+            .get_codex_profile_route(profile_id)?
+            .ok_or_else(|| AppError::InvalidInput("测试路由不存在".to_string()))?;
+        let mut backup: serde_json::Value = serde_json::from_str(
+            route
+                .live_backup_json
+                .as_deref()
+                .ok_or_else(|| AppError::InvalidInput("测试路由缺少备份".to_string()))?,
+        )
+        .map_err(|source| AppError::Config(format!("测试备份 JSON 无效: {source}")))?;
+        backup["version"] = serde_json::json!(4);
+        route.live_backup_json = Some(
+            serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })?,
+        );
+        db.save_codex_profile_route(&route)?;
+        Ok(route)
     }
 
     /// 构造包含路由模型目录的测试供应商。
@@ -5841,6 +5877,170 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert_eq!(
             fs::read_to_string(codex_config_path_for_home(home.path())).expect("读取恢复配置"),
             original_config
+        );
+        Ok(())
+    }
+
+    /// 未知未来备份版本必须在关闭记录任何 recovery 前失败并保持路由与 Home 原样。
+    #[tokio::test]
+    async fn disabling_future_backup_version_has_no_home_or_route_side_effect(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-future-backup",
+            16_001,
+            "test-local-token",
+        )?;
+        let mut route = db
+            .get_codex_profile_route("profile-future-backup")?
+            .expect("路由存在");
+        let mut backup: serde_json::Value =
+            serde_json::from_str(route.live_backup_json.as_deref().expect("备份存在"))
+                .expect("解析备份");
+        backup["version"] = serde_json::json!(4);
+        route.live_backup_json = Some(serde_json::to_string(&backup).expect("编码未来备份"));
+        db.save_codex_profile_route(&route)?;
+        let config_path = codex_config_path_for_home(home.path());
+        let home_before = fs::read(&config_path).expect("读取关闭前 Home");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .disable("profile-future-backup")
+            .await
+            .expect_err("未知未来备份必须拒绝关闭");
+
+        assert!(error.to_string().contains("版本"));
+        assert_eq!(fs::read(config_path).expect("读取关闭后 Home"), home_before);
+        let after = db
+            .get_codex_profile_route("profile-future-backup")?
+            .expect("路由仍存在");
+        assert!(after.enabled);
+        assert_eq!(after.live_backup_json, route.live_backup_json);
+        assert_eq!(after.recovery_json, route.recovery_json);
+        assert_eq!(after.last_error, route.last_error);
+        Ok(())
+    }
+
+    /// 启动恢复遇到未知未来备份版本时必须隔离失败并保持 Home 与路由记录不变。
+    #[tokio::test]
+    async fn startup_future_backup_version_has_no_home_or_route_side_effect() -> Result<(), AppError>
+    {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-future-startup",
+            16_001,
+            "test-local-token",
+        )?;
+        let route_before =
+            upgrade_route_backup_to_future_version(db.as_ref(), "profile-future-startup")?;
+        let config_path = codex_config_path_for_home(home.path());
+        let home_before = fs::read(&config_path).expect("读取启动前 Home");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+
+        assert_eq!(fs::read(config_path).expect("读取启动后 Home"), home_before);
+        assert_eq!(
+            db.get_codex_profile_route("profile-future-startup")?
+                .expect("路由仍存在"),
+            route_before
+        );
+        assert!(manager.status("profile-future-startup").await.is_err());
+        Ok(())
+    }
+
+    /// 显式切换遇到未知未来备份版本时不得修改 Home、路由、runtime 或 recovery。
+    #[tokio::test]
+    async fn switching_future_backup_version_has_no_lifecycle_side_effect() -> Result<(), AppError>
+    {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-future-switch",
+            16_001,
+            "test-local-token",
+        )?;
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-new".to_string(),
+                "Provider New".to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        let route_before =
+            upgrade_route_backup_to_future_version(db.as_ref(), "profile-future-switch")?;
+        let config_path = codex_config_path_for_home(home.path());
+        let home_before = fs::read(&config_path).expect("读取切换前 Home");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let runtime = Arc::new(FakeRuntime {
+            provider: AsyncMutex::new("provider-profile-future-switch".to_string()),
+            port: 16_001,
+        });
+        manager.track_runtime("profile-future-switch".to_string(), runtime.clone())?;
+
+        let error = manager
+            .switch_provider("profile-future-switch", "provider-new", vec![])
+            .await
+            .expect_err("未知未来备份必须拒绝切换");
+
+        assert!(error.to_string().contains("版本"));
+        assert_eq!(fs::read(config_path).expect("读取切换后 Home"), home_before);
+        assert_eq!(
+            db.get_codex_profile_route("profile-future-switch")?
+                .expect("路由仍存在"),
+            route_before
+        );
+        assert_eq!(
+            *runtime.provider.lock().await,
+            "provider-profile-future-switch"
         );
         Ok(())
     }

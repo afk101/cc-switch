@@ -40,6 +40,8 @@ pub const CODEX_PROFILE_TOKEN_FILENAME: &str = "listener-token";
 pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 /// 当前 Codex Profile Home 路由备份格式版本。
 pub const CODEX_ROUTE_BACKUP_VERSION: u8 = 3;
+/// Codex Profile Home 路由备份仍支持消费的最早版本。
+pub const CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION: u8 = 1;
 /// 首个包含字段级所有权证明的路由备份版本。
 pub const CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION: u8 = 2;
 /// listener token 所有权摘要的域分离标签。

@@ -2,7 +2,8 @@ use crate::codex_config::{
     codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
 use crate::codex_profile::{
-    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_ROUTE_BACKUP_VERSION,
+    CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD,
+    CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION, CODEX_ROUTE_BACKUP_VERSION,
     CODEX_ROUTE_FIELD_BASE_URL, CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API,
     CODEX_ROUTE_LISTEN_HOST, CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION,
     CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_TOKEN_PROOF_DOMAIN,
@@ -126,6 +127,13 @@ struct CodexRouteBackup {
     ownership_proof: Option<CodexRouteOwnershipProof>,
     #[serde(default)]
     previous_token_state: CodexRouteBackupTokenState,
+}
+
+/// 只读取备份版本的最小 envelope，用于副作用前区分未知未来格式。
+#[derive(Deserialize)]
+struct CodexRouteBackupVersionEnvelope {
+    #[serde(default = "legacy_route_backup_version")]
+    version: u8,
 }
 
 /// 备份中接管前 listener token 的不可逆表达。
@@ -633,6 +641,17 @@ impl CodexHomeConfigService {
         self.restore_decoded_backup(home, backup, None)
     }
 
+    /// 在生命周期副作用前校验备份 envelope 可由当前版本安全消费。
+    pub fn validate_route_backup(&self, backup_json: &str) -> Result<(), AppError> {
+        Self::decode_route_backup(backup_json).map(|_| ())
+    }
+
+    /// 判断可解析 envelope 是否来自当前程序无法消费的未来版本。
+    pub fn is_future_route_backup(&self, backup_json: &str) -> bool {
+        serde_json::from_str::<CodexRouteBackupVersionEnvelope>(backup_json)
+            .is_ok_and(|backup| backup.version > CODEX_ROUTE_BACKUP_VERSION)
+    }
+
     /// 启用崩溃补偿按备份语义选择旧整份恢复或私有 token 引用恢复。
     pub fn restore_enable_recovery_backup(
         &self,
@@ -848,8 +867,17 @@ impl CodexHomeConfigService {
 
     /// 解码路由备份，统一拒绝损坏的备份元数据。
     fn decode_route_backup(backup_json: &str) -> Result<CodexRouteBackup, AppError> {
-        serde_json::from_str(backup_json)
-            .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))
+        let backup: CodexRouteBackup = serde_json::from_str(backup_json)
+            .map_err(|error| AppError::Config(format!("Codex 路由备份无效: {error}")))?;
+        if !(CODEX_ROUTE_BACKUP_MIN_SUPPORTED_VERSION..=CODEX_ROUTE_BACKUP_VERSION)
+            .contains(&backup.version)
+        {
+            return Err(AppError::Config(format!(
+                "Codex 路由备份版本 {} 不受支持",
+                backup.version
+            )));
+        }
+        Ok(backup)
     }
 
     /// 仅识别 token 与 Profile 端口都匹配的旧全局占位配置。
@@ -1315,7 +1343,7 @@ fn serialize_route_backup(
     .map_err(|source| AppError::JsonSerialize { source })
 }
 
-/// 当接管前 token 即 Profile listener token 时，删除可逆字段并保留引用语义。
+/// 当接管前存在 Profile listener token 时，删除全部可逆字段并保留引用语义。
 fn redact_previous_listener_token(
     previous_content: Option<Vec<u8>>,
     listener_token: &str,
@@ -1325,31 +1353,54 @@ fn redact_previous_listener_token(
     };
     let mut document = parse_codex_document(&content, "接管前")?;
     let text = document.to_string();
-    if extract_active_codex_route_string(&text, CODEX_ROUTE_FIELD_BEARER_TOKEN).as_deref()
-        != Some(listener_token)
-    {
+    let active_token = extract_active_codex_route_string(&text, CODEX_ROUTE_FIELD_BEARER_TOKEN);
+    let matching_paths = listener_token_paths(&document, listener_token);
+    if matching_paths.is_empty() {
         return Ok((Some(content), CodexRouteBackupTokenState::Embedded));
     }
-    let path = if let Some(provider_id) = active_codex_provider_id(&document) {
-        let provider_path = CodexRouteFieldPath::Provider {
-            provider_id,
-            field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
-        };
-        if route_field_item(&document, &provider_path).and_then(Item::as_str)
-            == Some(listener_token)
-        {
-            provider_path
-        } else {
-            CodexRouteFieldPath::TopLevel(CODEX_ROUTE_FIELD_BEARER_TOKEN)
-        }
-    } else {
-        CodexRouteFieldPath::TopLevel(CODEX_ROUTE_FIELD_BEARER_TOKEN)
-    };
-    apply_route_field_state(&mut document, &path, &CodexRouteFieldState::Missing)?;
+    if active_token.as_deref() != Some(listener_token) {
+        return Err(AppError::Config(
+            "Codex 路由备份包含无法无损表达的非活动 listener token".to_string(),
+        ));
+    }
+    for path in matching_paths {
+        apply_route_field_state(&mut document, &path, &CodexRouteFieldState::Missing)?;
+    }
     Ok((
         Some(document.to_string().into_bytes()),
         CodexRouteBackupTokenState::ListenerTokenReference,
     ))
+}
+
+/// 找出配置中全部精确匹配 listener token 的可持久化路径。
+fn listener_token_paths(document: &DocumentMut, listener_token: &str) -> Vec<CodexRouteFieldPath> {
+    let mut paths = Vec::new();
+    if document
+        .get(CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        .and_then(Item::as_str)
+        == Some(listener_token)
+    {
+        paths.push(CodexRouteFieldPath::TopLevel(
+            CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        ));
+    }
+    if let Some(providers) = document
+        .get(CODEX_MODEL_PROVIDERS_TABLE)
+        .and_then(Item::as_table)
+    {
+        paths.extend(providers.iter().filter_map(|(provider_id, item)| {
+            (item
+                .as_table()
+                .and_then(|provider| provider.get(CODEX_ROUTE_FIELD_BEARER_TOKEN))
+                .and_then(Item::as_str)
+                == Some(listener_token))
+            .then(|| CodexRouteFieldPath::Provider {
+                provider_id: provider_id.to_string(),
+                field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
+            })
+        }));
+    }
+    paths
 }
 
 /// 读取活动 provider 中的字符串字段，缺失时回退顶层。
@@ -2290,6 +2341,152 @@ wire_api = "chat"
             fs::read_to_string(config_path).expect("读取恢复配置"),
             original
         );
+        Ok(())
+    }
+
+    /// v3 备份必须脱敏全部 listener token 路径，并保留普通用户 token 与关闭恢复语义。
+    #[test]
+    fn backup_redacts_listener_token_from_all_paths_and_restores_without_data_loss(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let listener_token = "profile-listener-token-must-not-be-reversible";
+        let ordinary_token = "ordinary-user-token-must-be-preserved";
+        let original = format!(
+            r#"model_provider = "active"
+experimental_bearer_token = "{listener_token}"
+
+[model_providers.active]
+base_url = "https://active.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "{listener_token}"
+
+[model_providers.inactive]
+base_url = "https://inactive.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "{listener_token}"
+
+[model_providers.ordinary]
+base_url = "https://ordinary.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "{ordinary_token}"
+"#
+        );
+        fs::write(&config_path, &original).expect("写入多路径 token 配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let backup = service.serialize_backup(&plan)?;
+        service.apply_route_plan(&plan)?;
+        let desired =
+            service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let backup = service.rebase_route_backup_to_plan(&backup, &desired)?;
+        let backup_json: serde_json::Value = serde_json::from_str(&backup).expect("解析备份");
+        let previous: Vec<u8> = serde_json::from_value(backup_json["previous_content"].clone())
+            .expect("解码接管前正文");
+
+        assert!(!previous
+            .windows(listener_token.len())
+            .any(|window| window == listener_token.as_bytes()));
+        assert!(previous
+            .windows(ordinary_token.len())
+            .any(|window| window == ordinary_token.as_bytes()));
+        service.restore_profile_backup(home.path(), &backup, 15_722, listener_token)?;
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取关闭恢复配置"),
+            original
+        );
+        Ok(())
+    }
+
+    /// 只有非活动路径残留 listener token 时无法无损恢复，必须拒绝持久化备份。
+    #[test]
+    fn backup_fails_closed_for_listener_token_only_on_inactive_path() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let listener_token = "profile-listener-token-on-inactive-path";
+        let original = format!(
+            r#"model_provider = "active"
+
+[model_providers.active]
+base_url = "https://active.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "ordinary-active-token"
+
+[model_providers.inactive]
+base_url = "https://inactive.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "{listener_token}"
+"#
+        );
+        fs::write(&config_path, &original).expect("写入非活动 listener token 配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+        let error = service
+            .serialize_backup(&plan)
+            .expect_err("必须拒绝有损备份");
+
+        assert!(error.to_string().contains("无法无损表达"));
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取未修改配置"),
+            original
+        );
+        Ok(())
+    }
+
+    /// 未知未来备份版本不得被关闭、补偿、切换基线或启动恢复入口消费。
+    #[test]
+    fn future_backup_version_fails_closed_at_every_home_service_entry() -> Result<(), AppError> {
+        let listener_token = "profile-listener-token";
+        for entry in ["disable", "enable_recovery", "switch_baseline", "startup"] {
+            let home = tempfile::tempdir().expect("创建临时 Home");
+            let config_path = codex_config_path_for_home(home.path());
+            fs::write(
+                &config_path,
+                "model_provider = \"custom\"\nmodel = \"user-model\"\n\n[model_providers.custom]\nbase_url = \"https://user.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"user-token\"\n",
+            )
+            .expect("写入用户配置");
+            let service = CodexHomeConfigService::system();
+            let plan =
+                service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+            let backup = service.serialize_backup(&plan)?;
+            let mut future: serde_json::Value =
+                serde_json::from_str(&backup).expect("解析当前备份");
+            future["version"] = serde_json::json!(4);
+            let future = serde_json::to_string(&future).expect("编码未来备份");
+            service.apply_route_plan(&plan)?;
+            let before = fs::read(&config_path).expect("读取入口前配置");
+            let current_plan =
+                service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+            let result = match entry {
+                "disable" => {
+                    service.restore_profile_backup(home.path(), &future, 15_722, listener_token)
+                }
+                "enable_recovery" => service.restore_enable_recovery_backup(
+                    home.path(),
+                    &future,
+                    15_722,
+                    Some(listener_token),
+                ),
+                "switch_baseline" => service
+                    .serialize_explicit_switch_backup(
+                        &current_plan,
+                        Some(&future),
+                        15_722,
+                        listener_token,
+                    )
+                    .map(|_| ()),
+                "startup" => service
+                    .classify_profile_reconcile(&current_plan, &future, 15_722)
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+
+            let error = result.expect_err("未知未来备份版本必须 fail closed");
+            assert!(error.to_string().contains("版本"), "entry={entry}: {error}");
+            assert_eq!(fs::read(&config_path).expect("读取入口后配置"), before);
+        }
         Ok(())
     }
 
