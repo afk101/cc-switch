@@ -39,7 +39,9 @@ pub const CODEX_PROFILE_TOKEN_FILENAME: &str = "listener-token";
 /// 旧单例代理接管配置中使用的兼容占位符。
 pub const LEGACY_PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 /// 当前 Codex Profile Home 路由备份格式版本。
-pub const CODEX_ROUTE_BACKUP_VERSION: u8 = 2;
+pub const CODEX_ROUTE_BACKUP_VERSION: u8 = 3;
+/// 首个包含字段级所有权证明的路由备份版本。
+pub const CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION: u8 = 2;
 /// listener token 所有权摘要的域分离标签。
 pub const CODEX_ROUTE_TOKEN_PROOF_DOMAIN: &[u8] = b"cc-switch/codex-route-token-proof/v1";
 /// Home 仍处于 CC Switch Profile 路由管理域。

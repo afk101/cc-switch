@@ -2817,10 +2817,14 @@ impl CodexRouteManager {
                 )));
             };
             let profile = self.persistence.get_profile(profile_id)?;
-            if let Err(error) = self
-                .home_config
-                .restore_backup(std::path::Path::new(&profile.canonical_home_path), backup)
-            {
+            let listener_token = self.secret_store.read_token(profile_id)?;
+            let restore_result = self.home_config.restore_enable_recovery_backup(
+                std::path::Path::new(&profile.canonical_home_path),
+                backup,
+                profile.listen_port,
+                listener_token.as_deref(),
+            );
+            if let Err(error) = restore_result {
                 self.persist_enable_recovery_error(profile_id, &recovery.phase, &error)?;
                 return Err(AppError::Message(format!(
                     "{CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR}: 恢复 Codex Home 失败: {error}"
@@ -6047,6 +6051,85 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 外部接管后重新启用不得在可逆备份正文中持久化 Profile listener token。
+    #[tokio::test]
+    async fn reenabling_external_base_url_redacts_reversible_listener_token_from_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建外部接管 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            "profile-redacted-backup",
+            16_001,
+            "test-local-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let routed = fs::read_to_string(&config_path).expect("读取已接管配置");
+        let external = routed.replace(
+            "http://127.0.0.1:16001/v1",
+            "https://user-latest.example/v1",
+        );
+        fs::write(&config_path, &external).expect("仅改写用户 base_url");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        let external_route = db
+            .get_codex_profile_route("profile-redacted-backup")?
+            .expect("外部接管路由存在");
+        assert!(!external_route.enabled);
+        assert_eq!(external_route.home_ownership, CodexHomeOwnership::External);
+
+        manager
+            .enable_preserving_failovers(
+                "profile-redacted-backup",
+                "provider-profile-redacted-backup",
+            )
+            .await?;
+        let enabled_route = db
+            .get_codex_profile_route("profile-redacted-backup")?
+            .expect("重新启用路由存在");
+        let backup: serde_json::Value = serde_json::from_str(
+            enabled_route
+                .live_backup_json
+                .as_deref()
+                .expect("重新启用后备份存在"),
+        )
+        .expect("解析路由备份");
+        let previous_content: Vec<u8> = serde_json::from_value(backup["previous_content"].clone())
+            .expect("还原可逆的接管前正文");
+        let previous_toml = String::from_utf8(previous_content).expect("备份正文应为 UTF-8");
+        assert_ne!(
+            extract_codex_experimental_bearer_token(&previous_toml).as_deref(),
+            Some("test-local-token")
+        );
+
+        manager.disable("profile-redacted-backup").await?;
+        let restored = fs::read_to_string(config_path).expect("读取关闭后的 Home");
+        assert!(restored.contains("base_url = \"https://user-latest.example/v1\""));
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&restored).as_deref(),
+            Some("test-local-token")
+        );
+        Ok(())
+    }
+
     /// 显式选择当前供应商不是供应商切换，不得修改用户模型。
     #[tokio::test]
     async fn switching_to_same_provider_preserves_user_model() -> Result<(), AppError> {
@@ -8125,6 +8208,164 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(!route.enabled);
         assert!(route.recovery_json.is_none());
         assert!(manager.status("profile-a").await.is_err());
+        Ok(())
+    }
+
+    /// 启用崩溃补偿必须从 Profile 私有密钥库解析不可逆 token 引用。
+    #[tokio::test]
+    async fn restoring_enable_residue_resolves_listener_reference_from_private_store(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let config_path = codex_config_path_for_home(home.path());
+        let original = "base_url = \"https://user-latest.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"test-local-token\"\n";
+        fs::write(&config_path, original).expect("写入接管前配置");
+        let plan =
+            home_config.build_profile_route_plan(home.path(), 16_001, None, "test-local-token")?;
+        let backup = home_config.serialize_backup(&plan)?;
+        home_config.apply_route_plan(&plan)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-private-reference".to_string(),
+            name: "Profile Private Reference".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery = RouteRecoveryRecord {
+            operation: "enable".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: None,
+                enabled: false,
+                failover_ids: vec![],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-a".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED.to_string(),
+            last_error: None,
+            reconcile: None,
+        };
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-private-reference".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(backup),
+            last_error: None,
+            recovery_json: Some(serde_json::to_string(&recovery).expect("编码恢复记录")),
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        let restored = fs::read_to_string(config_path).expect("读取补偿后 Home");
+        assert!(restored.contains("base_url = \"https://user-latest.example/v1\""));
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&restored).as_deref(),
+            Some("test-local-token")
+        );
+        assert!(db
+            .get_codex_profile_route("profile-private-reference")?
+            .expect("补偿后路由")
+            .recovery_json
+            .is_none());
+        Ok(())
+    }
+
+    /// 不可逆 token 引用对应的私有文件丢失时，补偿必须保留现状与恢复记录。
+    #[tokio::test]
+    async fn restoring_listener_reference_without_private_token_fails_closed(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "base_url = \"https://user.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"lost-private-token\"\n",
+        )
+        .expect("写入接管前配置");
+        let plan = home_config.build_profile_route_plan(
+            home.path(),
+            16_001,
+            None,
+            "lost-private-token",
+        )?;
+        let backup = home_config.serialize_backup(&plan)?;
+        home_config.apply_route_plan(&plan)?;
+        let routed = fs::read(&config_path).expect("读取路由态 Home");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-lost-reference".to_string(),
+            name: "Profile Lost Reference".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let recovery = RouteRecoveryRecord {
+            operation: "enable".to_string(),
+            before: RouteRecoverySnapshot {
+                current_provider_id: None,
+                enabled: false,
+                failover_ids: vec![],
+            },
+            target: RouteRecoverySnapshot {
+                current_provider_id: Some("provider-a".to_string()),
+                enabled: true,
+                failover_ids: vec![],
+            },
+            phase: CODEX_ROUTE_RECOVERY_PHASE_ENABLE_HOME_APPLIED.to_string(),
+            last_error: None,
+            reconcile: None,
+        };
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-lost-reference".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(backup),
+            last_error: None,
+            recovery_json: Some(serde_json::to_string(&recovery).expect("编码恢复记录")),
+            updated_at: 1,
+        })?;
+        let tokens = Arc::new(MissingReadTokenStore {
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            tokens.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager.restore_enabled_profiles().await?;
+
+        assert_eq!(fs::read(config_path).expect("重读路由态 Home"), routed);
+        let route = db
+            .get_codex_profile_route("profile-lost-reference")?
+            .expect("补偿路由存在");
+        assert!(route.recovery_json.is_some());
+        assert!(route.last_error.is_some());
+        assert_eq!(tokens.ensured.load(Ordering::SeqCst), 0);
         Ok(())
     }
 

@@ -4,7 +4,8 @@ use crate::codex_config::{
 use crate::codex_profile::{
     CODEX_MODEL_PROVIDERS_TABLE, CODEX_MODEL_PROVIDER_FIELD, CODEX_ROUTE_BACKUP_VERSION,
     CODEX_ROUTE_FIELD_BASE_URL, CODEX_ROUTE_FIELD_BEARER_TOKEN, CODEX_ROUTE_FIELD_WIRE_API,
-    CODEX_ROUTE_LISTEN_HOST, CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_TOKEN_PROOF_DOMAIN,
+    CODEX_ROUTE_LISTEN_HOST, CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION,
+    CODEX_ROUTE_TOKEN_MISMATCH_DETAIL, CODEX_ROUTE_TOKEN_PROOF_DOMAIN,
     CODEX_ROUTE_WIRE_API_RESPONSES, LEGACY_PROXY_MANAGED_TOKEN,
 };
 use crate::error::AppError;
@@ -123,6 +124,19 @@ struct CodexRouteBackup {
     target_fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ownership_proof: Option<CodexRouteOwnershipProof>,
+    #[serde(default)]
+    previous_token_state: CodexRouteBackupTokenState,
+}
+
+/// 备份中接管前 listener token 的不可逆表达。
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CodexRouteBackupTokenState {
+    /// 旧备份或普通上游 token 仍由原正文表达。
+    #[default]
+    Embedded,
+    /// 接管前字段等于该 Profile 的 listener token，恢复时仅从私有密钥库取值。
+    ListenerTokenReference,
 }
 
 /// 不含凭证明文的活动路由字段所有权证明。
@@ -619,6 +633,24 @@ impl CodexHomeConfigService {
         self.restore_decoded_backup(home, backup, None)
     }
 
+    /// 启用崩溃补偿按备份语义选择旧整份恢复或私有 token 引用恢复。
+    pub fn restore_enable_recovery_backup(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+        listener_token: Option<&str>,
+    ) -> Result<(), AppError> {
+        let backup = Self::decode_route_backup(backup_json)?;
+        if backup.previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+            let listener_token = listener_token.ok_or_else(|| {
+                AppError::Config("Codex Profile 本地路由凭证缺失，无法恢复启用残留".to_string())
+            })?;
+            return self.restore_profile_decoded_backup(home, backup, listen_port, listener_token);
+        }
+        self.restore_decoded_backup(home, backup, None)
+    }
+
     /// 关闭 Profile 时只验证并恢复三个严格路由字段，保留其他当前配置。
     pub fn restore_profile_backup(
         &self,
@@ -641,6 +673,7 @@ impl CodexHomeConfigService {
     ) -> Result<(), AppError> {
         let projection = build_managed_route_projection(
             backup.previous_content.as_deref(),
+            backup.previous_token_state,
             listen_port,
             listener_token,
         )?;
@@ -688,6 +721,11 @@ impl CodexHomeConfigService {
         backup: CodexRouteBackup,
         legacy_listen_port: Option<u16>,
     ) -> Result<(), AppError> {
+        if backup.previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+            return Err(AppError::Config(
+                "Codex 路由备份需要 Profile 私有凭证才能恢复".to_string(),
+            ));
+        }
         let current = self.inspect(home)?;
         if current.fingerprint == backup.previous_fingerprint {
             return Ok(());
@@ -723,7 +761,11 @@ impl CodexHomeConfigService {
         if Self::is_legacy_managed_home(plan.previous.content.as_deref(), listen_port) {
             return Ok(CodexHomeReconcileOwnership::LegacyManaged);
         }
-        if backup.version == CODEX_ROUTE_BACKUP_VERSION {
+        if matches!(
+            backup.version,
+            CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION | CODEX_ROUTE_BACKUP_VERSION
+        ) && backup.ownership_proof.is_some()
+        {
             let Some(proof) = backup.ownership_proof.as_ref() else {
                 return Ok(CodexHomeReconcileOwnership::ExternalTakeover);
             };
@@ -776,7 +818,26 @@ impl CodexHomeConfigService {
         let mut backup = Self::decode_route_backup(backup_json)?;
         backup.version = CODEX_ROUTE_BACKUP_VERSION;
         backup.target_fingerprint = plan.target_fingerprint.clone();
-        backup.ownership_proof = Some(build_route_ownership_proof(&plan.target_content)?);
+        let proof = build_route_ownership_proof(&plan.target_content)?;
+        let listener_token = extract_active_codex_route_string(
+            std::str::from_utf8(&plan.target_content).map_err(|error| {
+                AppError::Config(format!("Codex Profile 路由目标不是 UTF-8: {error}"))
+            })?,
+            CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        )
+        .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
+        let (previous_content, previous_token_state) =
+            if backup.previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+                (
+                    backup.previous_content,
+                    CodexRouteBackupTokenState::ListenerTokenReference,
+                )
+            } else {
+                redact_previous_listener_token(backup.previous_content, &listener_token)?
+            };
+        backup.previous_content = previous_content;
+        backup.previous_token_state = previous_token_state;
+        backup.ownership_proof = Some(proof);
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
@@ -962,6 +1023,7 @@ fn created_provider_tables(previous: &DocumentMut, target: &DocumentMut) -> Vec<
 /// 从接管前正文纯构造 target，并投影三个严格字段。
 fn build_managed_route_projection(
     previous_content: Option<&[u8]>,
+    previous_token_state: CodexRouteBackupTokenState,
     listen_port: u16,
     listener_token: &str,
 ) -> Result<CodexManagedRouteProjection, AppError> {
@@ -996,11 +1058,14 @@ fn build_managed_route_projection(
                 .get(CODEX_MODEL_PROVIDERS_TABLE)
                 .and_then(Item::as_table)
                 .is_some();
-    let previous = CodexManagedRouteState {
+    let mut previous = CodexManagedRouteState {
         base_url: read_route_field_state(&previous_document, &base_url_path),
         wire_api: read_route_field_state(&previous_document, &wire_api_path),
         bearer_token: read_route_field_state(&previous_document, &bearer_token_path),
     };
+    if previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+        previous.bearer_token = CodexRouteFieldState::Present(toml_edit::value(listener_token));
+    }
     let target = CodexManagedRouteState {
         base_url: read_route_field_state(&target_document, &base_url_path),
         wire_api: read_route_field_state(&target_document, &wire_api_path),
@@ -1193,6 +1258,7 @@ fn build_latest_managed_baseline(
     let backup = CodexHomeConfigService::decode_route_backup(backup_json)?;
     let projection = build_managed_route_projection(
         backup.previous_content.as_deref(),
+        backup.previous_token_state,
         listen_port,
         listener_token,
     )?;
@@ -1224,6 +1290,15 @@ fn serialize_route_backup(
     target_fingerprint: &str,
 ) -> Result<String, AppError> {
     let ownership_proof = build_route_ownership_proof(target_content).ok();
+    let listener_token = std::str::from_utf8(target_content)
+        .ok()
+        .and_then(|content| {
+            extract_active_codex_route_string(content, CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        });
+    let (previous_content, previous_token_state) = match listener_token {
+        Some(listener_token) => redact_previous_listener_token(previous_content, &listener_token)?,
+        None => (previous_content, CodexRouteBackupTokenState::Embedded),
+    };
     let version = if ownership_proof.is_some() {
         CODEX_ROUTE_BACKUP_VERSION
     } else {
@@ -1235,8 +1310,46 @@ fn serialize_route_backup(
         previous_fingerprint,
         target_fingerprint: target_fingerprint.to_string(),
         ownership_proof,
+        previous_token_state,
     })
     .map_err(|source| AppError::JsonSerialize { source })
+}
+
+/// 当接管前 token 即 Profile listener token 时，删除可逆字段并保留引用语义。
+fn redact_previous_listener_token(
+    previous_content: Option<Vec<u8>>,
+    listener_token: &str,
+) -> Result<(Option<Vec<u8>>, CodexRouteBackupTokenState), AppError> {
+    let Some(content) = previous_content else {
+        return Ok((None, CodexRouteBackupTokenState::Embedded));
+    };
+    let mut document = parse_codex_document(&content, "接管前")?;
+    let text = document.to_string();
+    if extract_active_codex_route_string(&text, CODEX_ROUTE_FIELD_BEARER_TOKEN).as_deref()
+        != Some(listener_token)
+    {
+        return Ok((Some(content), CodexRouteBackupTokenState::Embedded));
+    }
+    let path = if let Some(provider_id) = active_codex_provider_id(&document) {
+        let provider_path = CodexRouteFieldPath::Provider {
+            provider_id,
+            field: CODEX_ROUTE_FIELD_BEARER_TOKEN,
+        };
+        if route_field_item(&document, &provider_path).and_then(Item::as_str)
+            == Some(listener_token)
+        {
+            provider_path
+        } else {
+            CodexRouteFieldPath::TopLevel(CODEX_ROUTE_FIELD_BEARER_TOKEN)
+        }
+    } else {
+        CodexRouteFieldPath::TopLevel(CODEX_ROUTE_FIELD_BEARER_TOKEN)
+    };
+    apply_route_field_state(&mut document, &path, &CodexRouteFieldState::Missing)?;
+    Ok((
+        Some(document.to_string().into_bytes()),
+        CodexRouteBackupTokenState::ListenerTokenReference,
+    ))
 }
 
 /// 读取活动 provider 中的字符串字段，缺失时回退顶层。
@@ -2114,9 +2227,69 @@ wire_api = "chat"
             CodexHomeReconcileOwnership::Current
         );
         let backup_json: serde_json::Value = serde_json::from_str(&backup).expect("解析备份");
-        assert_eq!(backup_json["version"], 2);
+        assert_eq!(backup_json["version"], CODEX_ROUTE_BACKUP_VERSION);
         assert!(backup_json.get("ownership_proof").is_some());
         assert!(!backup.contains(listener_token));
+        Ok(())
+    }
+
+    /// v2 字段级备份必须保持可读，并在重定位时消除可逆 listener token。
+    #[test]
+    fn rebasing_v2_backup_redacts_listener_token_and_preserves_restore_semantics(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let listener_token = "old-profile-listener-token";
+        let original = format!(
+            "base_url = \"https://user.example/v1\"\nwire_api = \"chat\"\nexperimental_bearer_token = \"{listener_token}\"\n"
+        );
+        fs::write(&config_path, &original).expect("写入 v2 接管前配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+        let mut v2: serde_json::Value =
+            serde_json::from_str(&service.serialize_backup(&plan)?).expect("解析新备份");
+        v2["version"] = serde_json::json!(CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION);
+        v2["previous_content"] = serde_json::to_value(original.as_bytes()).expect("编码 v2 正文");
+        v2.as_object_mut()
+            .expect("备份为对象")
+            .remove("previous_token_state");
+        let v2 = serde_json::to_string(&v2).expect("编码 v2 备份");
+        service.apply_route_plan(&plan)?;
+        let desired =
+            service.build_profile_route_plan(home.path(), 15_722, None, listener_token)?;
+
+        assert_eq!(
+            service.classify_profile_reconcile(&desired, &v2, 15_722)?,
+            CodexHomeReconcileOwnership::Current
+        );
+        let upgraded = service.rebase_route_backup_to_plan(&v2, &desired)?;
+        let upgraded_json: serde_json::Value =
+            serde_json::from_str(&upgraded).expect("解析升级备份");
+        let previous: Vec<u8> = serde_json::from_value(upgraded_json["previous_content"].clone())
+            .expect("解码升级正文");
+        assert_ne!(
+            crate::codex_config::extract_codex_experimental_bearer_token(
+                std::str::from_utf8(&previous).expect("UTF-8 备份")
+            )
+            .as_deref(),
+            Some(listener_token)
+        );
+        assert_eq!(
+            upgraded_json["previous_token_state"],
+            "listener_token_reference"
+        );
+
+        let rebased_again = service.rebase_route_backup_to_plan(&upgraded, &desired)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rebased_again).expect("解析再次重定位备份")
+                ["previous_token_state"],
+            "listener_token_reference"
+        );
+        service.restore_profile_backup(home.path(), &rebased_again, 15_722, listener_token)?;
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取恢复配置"),
+            original
+        );
         Ok(())
     }
 
