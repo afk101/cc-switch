@@ -115,6 +115,15 @@ pub enum CodexHomeRouteReadiness {
     ExternalTakeover,
 }
 
+/// 本地凭证缺失时，启动预检对现有 Home 路由所有权的只读判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexHomeMissingTokenPreflight {
+    /// Home 仍由路由持有，并已在内存中补全可证明的备份元数据。
+    Managed { backup_json: String },
+    /// 当前活动连接路径无法证明属于该 Profile 路由。
+    ExternalTakeover,
+}
+
 /// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
 #[derive(Serialize, Deserialize)]
 struct CodexRouteBackup {
@@ -310,6 +319,53 @@ impl CodexHomeConfigService {
             return Ok(CodexHomeRouteReadiness::ExternalTakeover);
         }
         Ok(CodexHomeRouteReadiness::Readable)
+    }
+
+    /// 在创建缺失凭证前，只用当前 Home 与历史备份证明既有路由所有权。
+    pub fn preflight_missing_listener_token(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+    ) -> Result<CodexHomeMissingTokenPreflight, AppError> {
+        let current = self.inspect(home)?;
+        let Some(current_content) = current.content.as_deref() else {
+            return Ok(CodexHomeMissingTokenPreflight::ExternalTakeover);
+        };
+        let current_proof = match build_route_ownership_proof(current_content) {
+            Ok(proof) => proof,
+            Err(_) => return Ok(CodexHomeMissingTokenPreflight::ExternalTakeover),
+        };
+        let backup = Self::decode_route_backup(backup_json)?;
+        let ownership_proven = if Self::is_legacy_managed_home(Some(current_content), listen_port) {
+            true
+        } else if matches!(
+            backup.version,
+            CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION | CODEX_ROUTE_BACKUP_VERSION
+        ) {
+            backup.ownership_proof.as_ref().is_some_and(|proof| {
+                route_proof_public_target_matches(&current_proof, proof)
+                    && current_proof.token_digest == proof.token_digest
+            })
+        } else {
+            current.fingerprint == backup.target_fingerprint
+        };
+        if !ownership_proven {
+            return Ok(CodexHomeMissingTokenPreflight::ExternalTakeover);
+        }
+        let current_text = std::str::from_utf8(current_content).map_err(|error| {
+            AppError::Config(format!("当前 Codex config.toml 不是 UTF-8: {error}"))
+        })?;
+        let listener_token =
+            extract_active_codex_route_string(current_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
+                .ok_or_else(|| {
+                    AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string())
+                })?;
+        let backup_json = match prepare_proven_missing_token_backup(backup, &listener_token) {
+            Ok(backup) => backup,
+            Err(_) => return Ok(CodexHomeMissingTokenPreflight::ExternalTakeover),
+        };
+        Ok(CodexHomeMissingTokenPreflight::Managed { backup_json })
     }
 
     /// 构造路由接管计划，不在此阶段写入任何文件。
@@ -1071,6 +1127,15 @@ fn resolve_previous_token_origin(
         ));
     }
     Ok(origin)
+}
+
+/// 用已证明的旧 listener token 补全不可逆来源，不改变正文、目标或所有权摘要。
+fn prepare_proven_missing_token_backup(
+    mut backup: CodexRouteBackup,
+    listener_token: &str,
+) -> Result<String, AppError> {
+    backup.previous_token_origin = resolve_previous_token_origin(&backup, listener_token)?;
+    serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
 }
 
 /// 验证显式来源能在接管前结构中成为实际生效路径。

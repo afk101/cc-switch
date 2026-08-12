@@ -12,13 +12,13 @@ use crate::codex_profile::provider_sync::{
 #[cfg(test)]
 use crate::codex_profile::CODEX_CATALOG_SYNC_COMPENSATION_ERROR;
 use crate::codex_profile::{
-    CodexHomeConfigService, CodexHomeOwnership, CodexHomeReconcileOwnership,
-    CodexHomeRouteReadiness, CodexModelCatalogProjectionPlan, CodexProfile, CodexProfileRoute,
-    CodexProfileScope, CodexProfileSecretStore, CodexRouteConfigPlan, CodexRouteProviderSnapshot,
-    CodexRouteRuntime, CodexRouteRuntimeFactory, CodexRouteRuntimeStartError, CodexRuntimeStatus,
-    CODEX_CATALOG_RECONCILE_ERROR_PREFIX, CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX,
-    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
-    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CodexHomeConfigService, CodexHomeMissingTokenPreflight, CodexHomeOwnership,
+    CodexHomeReconcileOwnership, CodexHomeRouteReadiness, CodexModelCatalogProjectionPlan,
+    CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
+    CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
+    CodexRouteRuntimeStartError, CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
+    CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
+    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -171,6 +171,8 @@ struct CodexProviderSaveProjection {
 enum CodexStartupHomePreparation {
     /// Home 仍由路由管理，可以继续派生对账或启动 runtime。
     Managed(Box<CodexManagedStartupHome>),
+    /// Home 所有权已证明，但只读前置阶段不得创建当前缺失的 token。
+    ManagedMissingToken,
     /// Home 已由用户或其他程序接管。
     ExternalTakeover,
 }
@@ -178,6 +180,7 @@ enum CodexStartupHomePreparation {
 /// 已完成只读所有权验证的启动计划。
 struct CodexManagedStartupHome {
     listener_token: String,
+    backup_json: String,
     snapshot: CodexRouteProviderSnapshot,
     plan: CodexRouteConfigPlan,
 }
@@ -1718,8 +1721,11 @@ impl CodexRouteManager {
                 continue;
             }
             if route.enabled {
-                match self.prepare_enabled_home_for_startup(&profile, &route, db) {
-                    Ok(CodexStartupHomePreparation::Managed(_)) => {}
+                match self.prepare_enabled_home_for_startup(&profile, &route, db, false) {
+                    Ok(
+                        CodexStartupHomePreparation::Managed(_)
+                        | CodexStartupHomePreparation::ManagedMissingToken,
+                    ) => {}
                     Ok(CodexStartupHomePreparation::ExternalTakeover) => {
                         if self.persist_external_takeover(&route).is_err() {
                             self.block_profile_for_current_startup(&profile.id)?;
@@ -1913,12 +1919,18 @@ impl CodexRouteManager {
                 {
                     return Ok(());
                 }
-                let (token, snapshot, plan) = match self
-                    .prepare_enabled_home_for_startup(&profile, &route, db)
+                let prepared = match self
+                    .prepare_enabled_home_for_startup(&profile, &route, db, true)
                     .map_err(|failure| *failure)?
                 {
-                    CodexStartupHomePreparation::Managed(prepared) => {
-                        (prepared.listener_token, prepared.snapshot, prepared.plan)
+                    CodexStartupHomePreparation::Managed(prepared) => prepared,
+                    CodexStartupHomePreparation::ManagedMissingToken => {
+                        return Err(CodexStartupRestoreFailure::app(
+                            CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
+                            AppError::Config(
+                                "Codex Profile 启动恢复未创建已证明缺失的本地凭证".to_string(),
+                            ),
+                        ));
                     }
                     CodexStartupHomePreparation::ExternalTakeover => {
                         self.persist_external_takeover(&route).map_err(|error| {
@@ -1931,14 +1943,20 @@ impl CodexRouteManager {
                         return Ok(());
                     }
                 };
-                self.reconcile_enabled_home(&profile, &route, &plan)
-                    .map_err(|error| {
-                        CodexStartupRestoreFailure::app(
-                            CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
-                            error,
-                        )
-                    })?;
-                self.start_restored_runtime(&profile, token, snapshot).await
+                self.reconcile_enabled_home(
+                    &profile,
+                    &route,
+                    &prepared.backup_json,
+                    &prepared.plan,
+                )
+                .map_err(|error| {
+                    CodexStartupRestoreFailure::app(
+                        CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
+                        error,
+                    )
+                })?;
+                self.start_restored_runtime(&profile, prepared.listener_token, prepared.snapshot)
+                    .await
             }
             .await;
             if let Err(failure) = result {
@@ -1954,6 +1972,7 @@ impl CodexRouteManager {
         profile: &CodexProfile,
         route: &CodexProfileRoute,
         db: Option<&Database>,
+        ensure_missing_token: bool,
     ) -> Result<CodexStartupHomePreparation, Box<CodexStartupRestoreFailure>> {
         if route.home_ownership == CodexHomeOwnership::External {
             return Ok(CodexStartupHomePreparation::ExternalTakeover);
@@ -1973,15 +1992,49 @@ impl CodexRouteManager {
                 return Ok(CodexStartupHomePreparation::ExternalTakeover);
             }
         }
-        let listener_token = self
-            .secret_store
-            .ensure_token(&profile.id)
-            .map_err(|error| {
-                Box::new(CodexStartupRestoreFailure::app(
-                    CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
-                    error,
-                ))
-            })?;
+        let backup = route.live_backup_json.as_deref().ok_or_else(|| {
+            Box::new(CodexStartupRestoreFailure::app(
+                CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
+                AppError::InvalidInput("已启用 Codex Profile 缺少 Home 备份".to_string()),
+            ))
+        })?;
+        let existing_token = self.secret_store.read_token(&profile.id).map_err(|error| {
+            Box::new(CodexStartupRestoreFailure::app(
+                CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
+                error,
+            ))
+        })?;
+        let (listener_token, backup_json) = match existing_token {
+            Some(listener_token) => (listener_token, backup.to_string()),
+            None => match self
+                .home_config
+                .preflight_missing_listener_token(home, backup, profile.listen_port)
+                .map_err(|error| {
+                    Box::new(CodexStartupRestoreFailure::app(
+                        CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
+                        error,
+                    ))
+                })? {
+                CodexHomeMissingTokenPreflight::Managed { backup_json, .. } => {
+                    if !ensure_missing_token {
+                        return Ok(CodexStartupHomePreparation::ManagedMissingToken);
+                    }
+                    let listener_token =
+                        self.secret_store
+                            .ensure_token(&profile.id)
+                            .map_err(|error| {
+                                Box::new(CodexStartupRestoreFailure::app(
+                                    CODEX_STARTUP_RESTORE_STAGE_ENSURE_TOKEN,
+                                    error,
+                                ))
+                            })?;
+                    (listener_token, backup_json)
+                }
+                CodexHomeMissingTokenPreflight::ExternalTakeover => {
+                    return Ok(CodexStartupHomePreparation::ExternalTakeover);
+                }
+            },
+        };
         let (snapshot, plan) = self
             .build_restore_plan(profile, route, &listener_token, db)
             .map_err(|error| {
@@ -1990,15 +2043,9 @@ impl CodexRouteManager {
                     error,
                 ))
             })?;
-        let backup = route.live_backup_json.as_deref().ok_or_else(|| {
-            Box::new(CodexStartupRestoreFailure::app(
-                CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
-                AppError::InvalidInput("已启用 Codex Profile 缺少 Home 备份".to_string()),
-            ))
-        })?;
         let ownership = self
             .home_config
-            .classify_profile_reconcile(&plan, backup, profile.listen_port)
+            .classify_profile_reconcile(&plan, &backup_json, profile.listen_port)
             .map_err(|error| {
                 Box::new(CodexStartupRestoreFailure::app(
                     CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
@@ -2011,6 +2058,7 @@ impl CodexRouteManager {
         Ok(CodexStartupHomePreparation::Managed(Box::new(
             CodexManagedStartupHome {
                 listener_token,
+                backup_json,
                 snapshot,
                 plan,
             },
@@ -2112,11 +2160,9 @@ impl CodexRouteManager {
         &self,
         profile: &CodexProfile,
         route: &CodexProfileRoute,
+        backup: &str,
         plan: &CodexRouteConfigPlan,
     ) -> Result<(), AppError> {
-        let backup = route.live_backup_json.as_deref().ok_or_else(|| {
-            AppError::InvalidInput("已启用 Codex Profile 缺少 Home 备份".to_string())
-        })?;
         match self
             .home_config
             .classify_profile_reconcile(plan, backup, profile.listen_port)?
@@ -3625,6 +3671,31 @@ mod codex_route_manager {
         }
 
         fn delete_token(&self, _: &str) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    /// 模拟凭证首次缺失、创建后即可读取的真实私有密钥库。
+    struct CreatingTokenStore {
+        token: Mutex<Option<String>>,
+        ensured: AtomicUsize,
+    }
+
+    impl CodexProfileTokenStore for CreatingTokenStore {
+        fn read_token(&self, _: &str) -> Result<Option<String>, AppError> {
+            Ok(self.token.lock()?.clone())
+        }
+
+        fn ensure_token(&self, _: &str) -> Result<String, AppError> {
+            self.ensured.fetch_add(1, Ordering::SeqCst);
+            let mut token = self.token.lock()?;
+            let created = "replacement-listener-token".to_string();
+            *token = Some(created.clone());
+            Ok(created)
+        }
+
+        fn delete_token(&self, _: &str) -> Result<(), AppError> {
+            *self.token.lock()? = None;
             Ok(())
         }
     }
@@ -7127,6 +7198,247 @@ keep = true
             serde_json::from_str::<serde_json::Value>(&backup).expect("解析新版备份")["version"],
             crate::codex_profile::CODEX_ROUTE_BACKUP_VERSION
         );
+        Ok(())
+    }
+
+    /// 旧 v3 无路径引用必须先用 Home 中已证明的旧 token 解析来源，再创建新凭证。
+    #[tokio::test]
+    async fn startup_preflights_pathless_v3_origin_before_replacing_missing_token(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建旧 v3 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let profile_id = "profile-pathless-v3-preflight";
+        let provider_id = format!("provider-{profile_id}");
+        let old_listener_token = "old-pathless-listener-token";
+        let provider = Provider::with_id(provider_id.clone(), provider_id.clone(), json!({}), None);
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            format!(
+                "model_provider = \"{provider_id}\"\nmodel = \"user-model\"\n\n[model_providers.{provider_id}]\nname = \"Original\"\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+            ),
+        )
+        .expect("写入旧 v3 接管前配置");
+        let old_plan = home_config.build_profile_route_plan(
+            home.path(),
+            16_001,
+            Some(&provider),
+            old_listener_token,
+        )?;
+        let mut pathless_backup: serde_json::Value =
+            serde_json::from_str(&home_config.serialize_backup(&old_plan)?)
+                .expect("解析旧 v3 备份");
+        pathless_backup
+            .as_object_mut()
+            .expect("备份必须是对象")
+            .remove("previous_token_origin");
+        home_config.apply_route_plan(&old_plan)?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(provider_id.clone()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(
+                serde_json::to_string(&pathless_backup).expect("编码旧 v3 无路径备份"),
+            ),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        let repaired = fs::read_to_string(&config_path).expect("读取启动修复后的 Home");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&repaired).as_deref(),
+            Some("replacement-listener-token")
+        );
+        assert!(repaired.contains("model = \"user-model\""));
+        assert!(repaired.contains("followUpQueueMode = \"queue\""));
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.status(profile_id).await?,
+            CodexRuntimeStatus::Running
+        );
+        let route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("修复后的路由存在");
+        let backup = route.live_backup_json.expect("升级后的备份存在");
+        let backup_json: serde_json::Value = serde_json::from_str(&backup).expect("解析升级备份");
+        assert_eq!(
+            backup_json["previous_token_origin"]["provider"],
+            provider_id
+        );
+        assert!(!backup.contains(old_listener_token));
+        assert!(!backup.contains("replacement-listener-token"));
+        Ok(())
+    }
+
+    /// 严格字段已外部接管时必须在创建缺失凭证前静默关闭。
+    #[tokio::test]
+    async fn startup_preflight_external_takeover_does_not_create_missing_token(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建外部接管 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let profile_id = "profile-external-missing-token";
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            profile_id,
+            16_001,
+            "old-listener-token",
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let external = b"model_provider = \"external\"\n\n[model_providers.external]\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"external-token\"\n";
+        fs::write(&config_path, external).expect("写入外部接管配置");
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 0);
+        assert!(token_store.read_token(profile_id)?.is_none());
+        assert_eq!(fs::read(&config_path).expect("重读外部配置"), external);
+        let route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("外部接管路由存在");
+        assert!(!route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+        assert!(route.live_backup_json.is_none());
+        assert!(manager.status(profile_id).await.is_err());
+        Ok(())
+    }
+
+    /// 旧 v3 无路径来源无法由接管前指纹唯一证明时，不得创建凭证或猜测恢复路径。
+    #[tokio::test]
+    async fn startup_preflight_unproved_pathless_v3_fails_closed_without_creating_token(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建模糊旧 v3 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let profile_id = "profile-unproved-pathless-v3";
+        let old_listener_token = "old-unproved-listener-token";
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            profile_id,
+            16_001,
+            old_listener_token,
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        let original_home = fs::read(&config_path).expect("读取旧路由 Home");
+        let mut route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("旧 v3 路由存在");
+        let mut backup: serde_json::Value =
+            serde_json::from_str(route.live_backup_json.as_deref().expect("旧 v3 备份存在"))
+                .expect("解析旧 v3 备份");
+        let backup_object = backup.as_object_mut().expect("旧 v3 备份必须是对象");
+        backup_object.remove("previous_token_origin");
+        let previous_content: Vec<u8> = serde_json::from_value(
+            backup_object
+                .get("previous_content")
+                .expect("旧 v3 接管前正文存在")
+                .clone(),
+        )
+        .expect("解码旧 v3 接管前正文");
+        let redacted_previous = std::str::from_utf8(&previous_content)
+            .expect("旧 v3 接管前正文为 UTF-8")
+            .replace("experimental_bearer_token = \"upstream-token\"\n", "");
+        backup_object.insert(
+            "previous_content".to_string(),
+            serde_json::to_value(redacted_previous.into_bytes()).expect("编码脱敏接管前正文"),
+        );
+        backup_object.insert(
+            "previous_token_state".to_string(),
+            serde_json::json!("listener_token_reference"),
+        );
+        backup_object.insert(
+            "previous_fingerprint".to_string(),
+            serde_json::json!("unproved-previous-fingerprint"),
+        );
+        route.live_backup_json = Some(serde_json::to_string(&backup).expect("编码模糊旧 v3 备份"));
+        db.save_codex_profile_route(&route)?;
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 0);
+        assert!(token_store.read_token(profile_id)?.is_none());
+        assert_eq!(
+            fs::read(&config_path).expect("重读模糊旧路由 Home"),
+            original_home
+        );
+        let route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("fail-closed 路由存在");
+        assert!(!route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+        assert!(route.live_backup_json.is_none());
+        assert!(manager.status(profile_id).await.is_err());
         Ok(())
     }
 
