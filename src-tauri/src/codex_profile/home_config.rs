@@ -837,8 +837,29 @@ impl CodexHomeConfigService {
         listen_port: u16,
         listener_token: &str,
     ) -> Result<(), AppError> {
+        self.restore_profile_backup_with_proven_listener_token(
+            home,
+            backup_json,
+            listen_port,
+            listener_token,
+            None,
+        )
+    }
+
+    /// 使用所有权预检已证明的旧 token 恢复历史接管基线，不把该 token 持久化或记录。
+    pub fn restore_profile_backup_with_proven_listener_token(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+        current_listener_token: &str,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
+    ) -> Result<(), AppError> {
         let backup = Self::decode_route_backup(backup_json)?;
-        self.restore_profile_decoded_backup(home, backup, listen_port, listener_token)
+        let ownership_listener_token = proven_previous_listener_token
+            .map(|token| token.0.as_str())
+            .unwrap_or(current_listener_token);
+        self.restore_profile_decoded_backup(home, backup, listen_port, ownership_listener_token)
     }
 
     /// 对已解码 Profile 备份执行字段级幂等恢复。
