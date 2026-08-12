@@ -1246,7 +1246,9 @@ impl CodexRouteManager {
                 .ok_or_else(|| AppError::InvalidInput("Codex Profile 未配置供应商".to_string()))?,
             &old_failovers,
         )?;
-        let runtime = self.runtime(profile_id)?;
+        let runtime = self
+            .ensure_enabled_runtime_running(&profile, &route)
+            .await?;
         let changed = crate::codex_profile::CodexProfileRoute {
             current_provider_id: Some(provider_id.to_string()),
             home_ownership: CodexHomeOwnership::Managed,
@@ -3667,10 +3669,91 @@ impl CodexRouteManager {
                 .map_err(AppError::Message)?;
         }
         if let Some(failovers) = failovers {
-            self.persistence.replace_failovers(profile_id, failovers)?;
+            if let Err(error) = self.persistence.replace_failovers(profile_id, failovers) {
+                let runtime_error = self
+                    .restore_stopped_enabled_runtime(profile_id, origin_route)
+                    .await
+                    .err();
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    runtime_error.as_ref(),
+                ));
+            }
         }
-        self.persist_external_takeover(origin_route)?;
+        if let Err(error) = self.persist_external_takeover(origin_route) {
+            let runtime_error = self
+                .restore_stopped_enabled_runtime(profile_id, origin_route)
+                .await
+                .err();
+            return Err(Self::compensation_failure_error(
+                &error,
+                runtime_error.as_ref(),
+            ));
+        }
         self.remove_runtime(profile_id)
+    }
+
+    /// External 关闭态未能持久化时，移除已停止实例并恢复数据库仍声明启用的 runtime。
+    async fn restore_stopped_enabled_runtime(
+        &self,
+        profile_id: &str,
+        route: &CodexProfileRoute,
+    ) -> Result<(), AppError> {
+        self.remove_runtime(profile_id)?;
+        let profile = self.persistence.get_profile(profile_id)?;
+        self.ensure_enabled_runtime_running(&profile, route)
+            .await
+            .map(|_| ())
+    }
+
+    /// 返回真实运行且健康的启用态 runtime；缺失或已停止时按持久化路由重建。
+    async fn ensure_enabled_runtime_running(
+        &self,
+        profile: &CodexProfile,
+        route: &CodexProfileRoute,
+    ) -> Result<Arc<dyn CodexRouteRuntime>, AppError> {
+        if let Ok(runtime) = self.runtime(&profile.id) {
+            if runtime.status().await == CodexRuntimeStatus::Running && runtime.health_check().await
+            {
+                return Ok(runtime);
+            }
+            Self::reject_new_requests_and_stop_runtime(runtime)
+                .await
+                .map_err(AppError::Message)?;
+            self.remove_runtime(&profile.id)?;
+        }
+        let provider_id = route.current_provider_id.as_deref().ok_or_else(|| {
+            AppError::InvalidInput("Codex Profile 未配置供应商，无法恢复路由".to_string())
+        })?;
+        let failovers = self.persistence.list_failovers(&profile.id)?;
+        let snapshot = self.provider_snapshot(provider_id, &failovers)?;
+        let token = self.secret_store.read_token(&profile.id)?.ok_or_else(|| {
+            AppError::Config("Codex Profile 本地路由凭证缺失，无法恢复运行时".to_string())
+        })?;
+        let runtime = self.runtime_factory.create(
+            CodexProfileScope {
+                profile_id: profile.id.clone(),
+                home_path: profile.canonical_home_path.clone().into(),
+                port: profile.listen_port,
+            },
+            token,
+            snapshot,
+        );
+        if let Err(error) = runtime.start().await {
+            let _ = Self::reject_new_requests_and_stop_runtime(runtime).await;
+            return Err(AppError::Message(error.to_string()));
+        }
+        if !runtime.health_check().await {
+            let _ = Self::reject_new_requests_and_stop_runtime(runtime).await;
+            return Err(AppError::Message(
+                "Codex Profile 路由恢复后的健康检查失败".to_string(),
+            ));
+        }
+        if let Err(error) = self.track_runtime(profile.id.clone(), runtime.clone()) {
+            let _ = Self::reject_new_requests_and_stop_runtime(runtime).await;
+            return Err(error);
+        }
+        Ok(runtime)
     }
 
     /// 将补偿记录编码到路由字段；编码失败不应开始任何不可逆变更。
@@ -3722,6 +3805,7 @@ mod codex_route_manager {
     /// 记录共享供应商保存前后快照与生命周期调用，用于验证无中断热更新。
     struct SnapshotTrackingRuntime {
         snapshot: AsyncMutex<CodexRouteProviderSnapshot>,
+        running: AtomicBool,
         swaps: AtomicUsize,
         starts: AtomicUsize,
         rejects: AtomicUsize,
@@ -3730,6 +3814,13 @@ mod codex_route_manager {
 
     /// 捕获启动恢复创建的运行时，供测试检查有效供应商集合。
     struct SnapshotTrackingFactory {
+        runtimes: Mutex<HashMap<String, Arc<SnapshotTrackingRuntime>>>,
+    }
+
+    /// 第一次创建返回启动失败实例，后续创建返回可观察运行时。
+    struct FailFirstStartThenTrackingFactory {
+        create_count: AtomicUsize,
+        failed_starts: Arc<AtomicUsize>,
         runtimes: Mutex<HashMap<String, Arc<SnapshotTrackingRuntime>>>,
     }
 
@@ -3931,12 +4022,13 @@ mod codex_route_manager {
         fn start(&self) -> CodexRouteRuntimeFuture<'_, Result<(), CodexRouteRuntimeStartError>> {
             Box::pin(async move {
                 self.starts.fetch_add(1, Ordering::SeqCst);
+                self.running.store(true, Ordering::SeqCst);
                 Ok(())
             })
         }
 
         fn health_check(&self) -> CodexRouteRuntimeFuture<'_, bool> {
-            Box::pin(async { true })
+            Box::pin(async move { self.running.load(Ordering::SeqCst) })
         }
 
         fn swap_provider_snapshot(
@@ -3958,12 +4050,19 @@ mod codex_route_manager {
         fn stop(&self) -> CodexRouteRuntimeFuture<'_, Result<(), String>> {
             Box::pin(async move {
                 self.stops.fetch_add(1, Ordering::SeqCst);
+                self.running.store(false, Ordering::SeqCst);
                 Ok(())
             })
         }
 
         fn status(&self) -> CodexRouteRuntimeFuture<'_, CodexRuntimeStatus> {
-            Box::pin(async { CodexRuntimeStatus::Running })
+            Box::pin(async move {
+                if self.running.load(Ordering::SeqCst) {
+                    CodexRuntimeStatus::Running
+                } else {
+                    CodexRuntimeStatus::Stopped
+                }
+            })
         }
     }
 
@@ -3974,6 +4073,7 @@ mod codex_route_manager {
     ) -> Arc<SnapshotTrackingRuntime> {
         Arc::new(SnapshotTrackingRuntime {
             snapshot: AsyncMutex::new(CodexRouteProviderSnapshot::new(primary, failovers)),
+            running: AtomicBool::new(true),
             swaps: AtomicUsize::new(0),
             starts: AtomicUsize::new(0),
             rejects: AtomicUsize::new(0),
@@ -3991,9 +4091,35 @@ mod codex_route_manager {
             let mut providers = snapshot.providers();
             let primary = providers.remove(0);
             let runtime = snapshot_tracking_runtime(primary, providers);
+            runtime.running.store(false, Ordering::SeqCst);
             self.runtimes
                 .lock()
                 .expect("启动运行时捕获锁")
+                .insert(scope.profile_id, runtime.clone());
+            runtime
+        }
+    }
+
+    impl CodexRouteRuntimeFactory for FailFirstStartThenTrackingFactory {
+        fn create(
+            &self,
+            scope: CodexProfileScope,
+            _: String,
+            snapshot: CodexRouteProviderSnapshot,
+        ) -> Arc<dyn CodexRouteRuntime> {
+            if self.create_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Arc::new(BindFailingRuntime {
+                    starts: self.failed_starts.clone(),
+                    message: "模拟补偿 runtime 首次启动失败".to_string(),
+                });
+            }
+            let mut providers = snapshot.providers();
+            let primary = providers.remove(0);
+            let runtime = snapshot_tracking_runtime(primary, providers);
+            runtime.running.store(false, Ordering::SeqCst);
+            self.runtimes
+                .lock()
+                .expect("重试运行时捕获锁")
                 .insert(scope.profile_id, runtime.clone());
             runtime
         }
@@ -4039,6 +4165,7 @@ mod codex_route_manager {
     struct ExternalTakeoverSaveFailingPersistence {
         db: Arc<Database>,
         failed: AtomicBool,
+        fail_always: bool,
     }
 
     impl SwitchTailFailingPersistence {
@@ -4776,7 +4903,8 @@ mod codex_route_manager {
                 && route.home_ownership == CodexHomeOwnership::External
                 && route.live_backup_json.is_none()
                 && route.recovery_json.is_none();
-            if external_closed && !self.failed.swap(true, Ordering::SeqCst) {
+            if external_closed && (self.fail_always || !self.failed.swap(true, Ordering::SeqCst)) {
+                self.failed.store(true, Ordering::SeqCst);
                 return Err(AppError::Message(
                     "模拟 External 关闭态保存失败".to_string(),
                 ));
@@ -9020,6 +9148,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let persistence = Arc::new(ExternalTakeoverSaveFailingPersistence {
             db: fixture.db.clone(),
             failed: AtomicBool::new(false),
+            fail_always: false,
         });
         let runtime = Arc::new(RecoveryRuntime {
             healthy: true,
@@ -9078,8 +9207,252 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert_eq!(converged.home_ownership, CodexHomeOwnership::External);
         assert!(converged.live_backup_json.is_none());
         assert!(converged.recovery_json.is_none());
-        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 2);
+        // 首次停止的实例已经被替换，重试不得再次复用这个已停止对象。
+        assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 1);
         assert!(manager.runtime(&fixture.profile_id).is_err());
+        Ok(())
+    }
+
+    /// External 关闭态保存失败后，下一次显式切换必须使用真实运行的新 runtime。
+    #[tokio::test]
+    async fn external_switch_close_save_failure_restarts_runtime_before_retrying_switch(
+    ) -> Result<(), AppError> {
+        let mut fixture = prepare_external_switch_tail_fixture("issue24-runtime-retry", 16_130)?;
+        apply_external_switch_prepared_failure_home(&mut fixture);
+        let persistence = Arc::new(ExternalTakeoverSaveFailingPersistence {
+            db: fixture.db.clone(),
+            failed: AtomicBool::new(false),
+            fail_always: false,
+        });
+        let runtime_factory = Arc::new(SnapshotTrackingFactory {
+            runtimes: Mutex::new(HashMap::new()),
+        });
+        let manager = CodexRouteManager::new(
+            persistence.clone(),
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            runtime_factory.clone(),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("External 关闭态保存失败必须返回错误");
+
+        assert!(persistence.failed.load(Ordering::SeqCst));
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.runtime.status().await, CodexRuntimeStatus::Stopped);
+        let restarted_runtime = runtime_factory
+            .runtimes
+            .lock()?
+            .get(&fixture.profile_id)
+            .cloned()
+            .expect("保存失败后必须创建替代 runtime");
+        assert_eq!(restarted_runtime.starts.load(Ordering::SeqCst), 1);
+        assert!(restarted_runtime.health_check().await);
+        assert_eq!(
+            restarted_runtime.status().await,
+            CodexRuntimeStatus::Running
+        );
+
+        fixture.external_home = format!(
+            "model_provider = \"{}\"\nmodel = \"user-model\"\n\n[model_providers.{}]\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n",
+            fixture.old_provider_id,
+            fixture.old_provider_id,
+            fixture.new_listener_token,
+        )
+        .into_bytes();
+        fs::write(&fixture.config_path, &fixture.external_home).expect("移除临时备份构建失败条件");
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await?;
+
+        let switched = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("重试成功后的路由存在");
+        assert!(switched.enabled);
+        assert_eq!(switched.home_ownership, CodexHomeOwnership::Managed);
+        assert_eq!(restarted_runtime.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted_runtime.swaps.load(Ordering::SeqCst), 1);
+        assert!(restarted_runtime.health_check().await);
+        assert_eq!(
+            restarted_runtime.status().await,
+            CodexRuntimeStatus::Running
+        );
+        assert!(Arc::ptr_eq(
+            &restarted_runtime,
+            &runtime_factory
+                .runtimes
+                .lock()?
+                .get(&fixture.profile_id)
+                .cloned()
+                .expect("最终 runtime 仍由 manager 工厂记录")
+        ));
+        Ok(())
+    }
+
+    /// External 关闭态连续保存失败时，每次都必须留下真实运行的可重试实例。
+    #[tokio::test]
+    async fn external_switch_repeated_close_save_failures_replace_each_stopped_runtime(
+    ) -> Result<(), AppError> {
+        let mut fixture = prepare_external_switch_tail_fixture("issue24-repeat-save", 16_131)?;
+        apply_external_switch_prepared_failure_home(&mut fixture);
+        let persistence = Arc::new(ExternalTakeoverSaveFailingPersistence {
+            db: fixture.db.clone(),
+            failed: AtomicBool::new(false),
+            fail_always: true,
+        });
+        let runtime_factory = Arc::new(SnapshotTrackingFactory {
+            runtimes: Mutex::new(HashMap::new()),
+        });
+        let manager = CodexRouteManager::new(
+            persistence,
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            runtime_factory.clone(),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("第一次关闭态保存必须失败");
+        let first_replacement = runtime_factory
+            .runtimes
+            .lock()?
+            .get(&fixture.profile_id)
+            .cloned()
+            .expect("第一次失败后替代 runtime 存在");
+        assert_eq!(first_replacement.starts.load(Ordering::SeqCst), 1);
+        assert!(first_replacement.health_check().await);
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("第二次关闭态保存也必须失败");
+        let second_replacement = runtime_factory
+            .runtimes
+            .lock()?
+            .get(&fixture.profile_id)
+            .cloned()
+            .expect("第二次失败后替代 runtime 存在");
+
+        assert!(!Arc::ptr_eq(&first_replacement, &second_replacement));
+        assert_eq!(first_replacement.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_replacement.status().await,
+            CodexRuntimeStatus::Stopped
+        );
+        assert_eq!(second_replacement.starts.load(Ordering::SeqCst), 1);
+        assert!(second_replacement.health_check().await);
+        assert_eq!(
+            second_replacement.status().await,
+            CodexRuntimeStatus::Running
+        );
+        let retryable = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("连续失败后的原路由存在");
+        assert!(retryable.enabled);
+        assert_eq!(retryable.home_ownership, CodexHomeOwnership::Managed);
+        Ok(())
+    }
+
+    /// 失败补偿无法重建 runtime 时，下一次显式切换必须从缺失状态恢复并成功。
+    #[tokio::test]
+    async fn external_switch_retries_from_enabled_route_without_runtime_after_restart_failure(
+    ) -> Result<(), AppError> {
+        let mut fixture = prepare_external_switch_tail_fixture("issue24-restart-fail", 16_132)?;
+        apply_external_switch_prepared_failure_home(&mut fixture);
+        let persistence = Arc::new(ExternalTakeoverSaveFailingPersistence {
+            db: fixture.db.clone(),
+            failed: AtomicBool::new(false),
+            fail_always: false,
+        });
+        let failed_starts = Arc::new(AtomicUsize::new(0));
+        let runtime_factory = Arc::new(FailFirstStartThenTrackingFactory {
+            create_count: AtomicUsize::new(0),
+            failed_starts: failed_starts.clone(),
+            runtimes: Mutex::new(HashMap::new()),
+        });
+        let manager = CodexRouteManager::new(
+            persistence,
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            runtime_factory.clone(),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("关闭保存与首次 runtime 重建失败必须返回错误");
+        assert_eq!(failed_starts.load(Ordering::SeqCst), 1);
+        assert!(manager.runtime(&fixture.profile_id).is_err());
+        let retryable = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("runtime 重建失败后的路由存在");
+        assert!(retryable.enabled);
+        assert_eq!(retryable.home_ownership, CodexHomeOwnership::Managed);
+
+        fixture.external_home = format!(
+            "model_provider = \"{}\"\nmodel = \"user-model\"\n\n[model_providers.{}]\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{}\"\n",
+            fixture.old_provider_id,
+            fixture.old_provider_id,
+            fixture.new_listener_token,
+        )
+        .into_bytes();
+        fs::write(&fixture.config_path, &fixture.external_home)
+            .expect("移除第二次切换的临时准备失败条件");
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await?;
+
+        let runtime = runtime_factory
+            .runtimes
+            .lock()?
+            .get(&fixture.profile_id)
+            .cloned()
+            .expect("重试必须创建并登记 runtime");
+        assert_eq!(runtime.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.swaps.load(Ordering::SeqCst), 1);
+        assert!(runtime.health_check().await);
+        assert_eq!(runtime.status().await, CodexRuntimeStatus::Running);
+        let switched = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("重试后的路由存在");
+        assert!(switched.enabled);
+        assert_eq!(switched.home_ownership, CodexHomeOwnership::Managed);
         Ok(())
     }
 
@@ -13024,8 +13397,9 @@ keep = true
             .switch_provider("profile-a", "provider-new", vec![])
             .await
             .is_err());
-        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 2);
-        assert_eq!(runtime.stops.load(Ordering::SeqCst), 2);
+        // 第一次失败后已停止实例不得在下一次恢复中被伪装成运行态继续复用。
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
