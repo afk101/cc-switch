@@ -15,10 +15,11 @@ use crate::codex_profile::{
     CodexHomeConfigService, CodexHomeMissingTokenPreflight, CodexHomeOwnership,
     CodexHomeReconcileOwnership, CodexHomeRouteReadiness, CodexModelCatalogProjectionPlan,
     CodexProfile, CodexProfileRoute, CodexProfileScope, CodexProfileSecretStore,
-    CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
-    CodexRouteRuntimeStartError, CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
-    CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
-    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CodexProvenPreviousListenerToken, CodexRouteConfigPlan, CodexRouteProviderSnapshot,
+    CodexRouteRuntime, CodexRouteRuntimeFactory, CodexRouteRuntimeStartError, CodexRuntimeStatus,
+    CODEX_CATALOG_RECONCILE_ERROR_PREFIX, CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX,
+    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
+    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -180,6 +181,7 @@ enum CodexStartupHomePreparation {
 /// 已完成只读所有权验证的启动计划。
 struct CodexManagedStartupHome {
     listener_token: String,
+    proven_previous_listener_token: Option<CodexProvenPreviousListenerToken>,
     backup_json: String,
     snapshot: CodexRouteProviderSnapshot,
     plan: CodexRouteConfigPlan,
@@ -1948,6 +1950,7 @@ impl CodexRouteManager {
                     &route,
                     &prepared.backup_json,
                     &prepared.plan,
+                    prepared.proven_previous_listener_token.as_ref(),
                 )
                 .map_err(|error| {
                     CodexStartupRestoreFailure::app(
@@ -2004,8 +2007,8 @@ impl CodexRouteManager {
                 error,
             ))
         })?;
-        let (listener_token, backup_json) = match existing_token {
-            Some(listener_token) => (listener_token, backup.to_string()),
+        let (listener_token, backup_json, proven_previous_listener_token) = match existing_token {
+            Some(listener_token) => (listener_token, backup.to_string(), None),
             None => match self
                 .home_config
                 .preflight_missing_listener_token(home, backup, profile.listen_port)
@@ -2015,7 +2018,10 @@ impl CodexRouteManager {
                         error,
                     ))
                 })? {
-                CodexHomeMissingTokenPreflight::Managed { backup_json, .. } => {
+                CodexHomeMissingTokenPreflight::Managed {
+                    backup_json,
+                    proven_previous_listener_token,
+                } => {
                     if !ensure_missing_token {
                         return Ok(CodexStartupHomePreparation::ManagedMissingToken);
                     }
@@ -2028,7 +2034,11 @@ impl CodexRouteManager {
                                     error,
                                 ))
                             })?;
-                    (listener_token, backup_json)
+                    (
+                        listener_token,
+                        backup_json,
+                        Some(proven_previous_listener_token),
+                    )
                 }
                 CodexHomeMissingTokenPreflight::ExternalTakeover => {
                     return Ok(CodexStartupHomePreparation::ExternalTakeover);
@@ -2058,6 +2068,7 @@ impl CodexRouteManager {
         Ok(CodexStartupHomePreparation::Managed(Box::new(
             CodexManagedStartupHome {
                 listener_token,
+                proven_previous_listener_token,
                 backup_json,
                 snapshot,
                 plan,
@@ -2162,6 +2173,7 @@ impl CodexRouteManager {
         route: &CodexProfileRoute,
         backup: &str,
         plan: &CodexRouteConfigPlan,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
     ) -> Result<(), AppError> {
         match self
             .home_config
@@ -2169,14 +2181,24 @@ impl CodexRouteManager {
         {
             CodexHomeReconcileOwnership::Current => {
                 if plan.previous_fingerprint() == plan.target_fingerprint() {
-                    self.finalize_current_home_backup(route, backup, plan)
+                    self.finalize_current_home_backup(
+                        route,
+                        backup,
+                        plan,
+                        proven_previous_listener_token,
+                    )
                 } else {
-                    self.apply_profile_reconcile(route, backup, plan)
+                    self.apply_profile_reconcile(
+                        route,
+                        backup,
+                        plan,
+                        proven_previous_listener_token,
+                    )
                 }
             }
             CodexHomeReconcileOwnership::RouteOwned
             | CodexHomeReconcileOwnership::LegacyManaged => {
-                self.apply_profile_reconcile(route, backup, plan)
+                self.apply_profile_reconcile(route, backup, plan, proven_previous_listener_token)
             }
             CodexHomeReconcileOwnership::ExternalTakeover => Err(AppError::Config(
                 "Codex Profile Home 已由外部连接配置接管".to_string(),
@@ -2190,8 +2212,15 @@ impl CodexRouteManager {
         route: &CodexProfileRoute,
         backup: &str,
         plan: &CodexRouteConfigPlan,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
     ) -> Result<(), AppError> {
-        let rebased = self.home_config.rebase_route_backup_to_plan(backup, plan)?;
+        let rebased = self
+            .home_config
+            .rebase_route_backup_to_plan_with_proven_token(
+                backup,
+                plan,
+                proven_previous_listener_token,
+            )?;
         if rebased == backup {
             return Ok(());
         }
@@ -2209,6 +2238,7 @@ impl CodexRouteManager {
         route: &CodexProfileRoute,
         backup: &str,
         plan: &CodexRouteConfigPlan,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
     ) -> Result<(), AppError> {
         self.persist_reconcile_operation(route, plan)?;
         self.home_config.apply_route_plan(plan)?;
@@ -2219,7 +2249,13 @@ impl CodexRouteManager {
         ) {
             return Err(self.compensate_reconcile_failure(plan, &error));
         }
-        let rebased = match self.home_config.rebase_route_backup_to_plan(backup, plan) {
+        let rebased = match self
+            .home_config
+            .rebase_route_backup_to_plan_with_proven_token(
+                backup,
+                plan,
+                proven_previous_listener_token,
+            ) {
             Ok(rebased) => rebased,
             Err(error) => return Err(self.compensate_reconcile_failure(plan, &error)),
         };
@@ -7131,6 +7167,357 @@ keep = true
                 manager.status(profile_id).await?,
                 CodexRuntimeStatus::Running
             );
+        }
+        Ok(())
+    }
+
+    /// 真实 v1 备份的旧 listener token 必须在升级时从历史正文不可逆移除。
+    #[tokio::test]
+    async fn startup_redacts_proven_old_token_when_upgrading_manual_v1_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建手工 v1 Profile Home");
+        let profile_id = "issue12-v1";
+        let provider_id = "provider-issue12-v1";
+        let old_listener_token = "issue12-v1-old-listener-token";
+        let current_home = format!(
+            "model_provider = \"{provider_id}\"\nmodel = \"user-v1-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"http://127.0.0.1:16001/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.issue12]\nenabled = true\n"
+        );
+        let previous_content = format!(
+            "model_provider = \"{provider_id}\"\nmodel = \"baseline-v1-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+        );
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                provider_id.to_string(),
+                provider_id.to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, &current_home).expect("写入旧 v1 路由 Home");
+        let manual_v1_backup = json!({
+            "previous_content": previous_content.as_bytes(),
+            "previous_fingerprint": "9fc0413aaf1adb27e09fee32fba98a62c086f8c1f5919fe6709013b8a6c59144",
+            "target_fingerprint": "00d88fb2640d83c62bae212d3a7654c027b5c35805740ba1ab8b53d9a6157242"
+        });
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(provider_id.to_string()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(
+                serde_json::to_string(&manual_v1_backup).expect("编码手工 v1 备份"),
+            ),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        let repaired = fs::read_to_string(&config_path).expect("读取 v1 升级后 Home");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&repaired).as_deref(),
+            Some("replacement-listener-token")
+        );
+        assert!(repaired.contains("model = \"user-v1-model\""));
+        assert!(repaired.contains("followUpQueueMode = \"queue\""));
+        assert!(repaired.contains("[plugins.issue12]"));
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.status(profile_id).await?,
+            CodexRuntimeStatus::Running
+        );
+        let route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("升级后 v1 路由存在");
+        let backup = route.live_backup_json.expect("升级后 v3 备份存在");
+        let backup_json: serde_json::Value =
+            serde_json::from_str(&backup).expect("解析升级后 v3 备份");
+        let decoded_previous: Vec<u8> =
+            serde_json::from_value(backup_json["previous_content"].clone())
+                .expect("解码升级后接管前正文");
+        assert_eq!(
+            backup_json["version"],
+            crate::codex_profile::CODEX_ROUTE_BACKUP_VERSION
+        );
+        assert_eq!(
+            backup_json["previous_token_state"],
+            "listener_token_reference"
+        );
+        assert!(!decoded_previous
+            .windows(old_listener_token.len())
+            .any(|window| window == old_listener_token.as_bytes()));
+        assert!(!decoded_previous
+            .windows("replacement-listener-token".len())
+            .any(|window| window == b"replacement-listener-token"));
+        assert!(!backup.contains(old_listener_token));
+        assert!(!backup.contains("replacement-listener-token"));
+        Ok(())
+    }
+
+    /// 真实 v2 备份必须使用已证明的旧 token 脱敏正文，再生成当前 v3 proof。
+    #[tokio::test]
+    async fn startup_redacts_proven_old_token_when_upgrading_manual_v2_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, extract_codex_experimental_bearer_token,
+        };
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建手工 v2 Profile Home");
+        let profile_id = "issue12-v2";
+        let provider_id = "provider-issue12-v2";
+        let old_listener_token = "issue12-v2-old-listener-token";
+        let current_home = format!(
+            "model_provider = \"{provider_id}\"\nmodel = \"user-v2-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"http://127.0.0.1:16002/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n\n[plugins.issue12v2]\nenabled = true\n"
+        );
+        let previous_content = format!(
+            "model_provider = \"{provider_id}\"\nmodel = \"baseline-v2-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v2\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+        );
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                provider_id.to_string(),
+                provider_id.to_string(),
+                json!({}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_002,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, &current_home).expect("写入旧 v2 路由 Home");
+        let manual_v2_backup = json!({
+            "version": 2,
+            "previous_content": previous_content.as_bytes(),
+            "previous_fingerprint": "manual-v2-previous-fingerprint",
+            "target_fingerprint": "manual-v2-target-fingerprint",
+            "ownership_proof": {
+                "active_provider_id": provider_id,
+                "base_url": "http://127.0.0.1:16002/v1",
+                "wire_api": "responses",
+                "token_digest": "6b2e7306330754cc6a13b414702e3570ebc11cf6b8b3e707ced346b174c7947f"
+            }
+        });
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(provider_id.to_string()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(
+                serde_json::to_string(&manual_v2_backup).expect("编码手工 v2 备份"),
+            ),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        let repaired = fs::read_to_string(&config_path).expect("读取 v2 升级后 Home");
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&repaired).as_deref(),
+            Some("replacement-listener-token")
+        );
+        assert!(repaired.contains("model = \"user-v2-model\""));
+        assert!(repaired.contains("followUpQueueMode = \"queue\""));
+        assert!(repaired.contains("[plugins.issue12v2]"));
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager.status(profile_id).await?,
+            CodexRuntimeStatus::Running
+        );
+        let route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("升级后 v2 路由存在");
+        let backup = route.live_backup_json.expect("升级后 v3 备份存在");
+        let backup_json: serde_json::Value =
+            serde_json::from_str(&backup).expect("解析升级后 v3 备份");
+        let decoded_previous: Vec<u8> =
+            serde_json::from_value(backup_json["previous_content"].clone())
+                .expect("解码升级后接管前正文");
+        assert_eq!(
+            backup_json["version"],
+            crate::codex_profile::CODEX_ROUTE_BACKUP_VERSION
+        );
+        assert_eq!(
+            backup_json["previous_token_state"],
+            "listener_token_reference"
+        );
+        assert!(!decoded_previous
+            .windows(old_listener_token.len())
+            .any(|window| window == old_listener_token.as_bytes()));
+        assert!(!decoded_previous
+            .windows("replacement-listener-token".len())
+            .any(|window| window == b"replacement-listener-token"));
+        assert!(!backup.contains(old_listener_token));
+        assert!(!backup.contains("replacement-listener-token"));
+        Ok(())
+    }
+
+    /// 无法证明旧 token 的真实 v1/v2 备份必须在创建凭证前 fail closed。
+    #[tokio::test]
+    async fn startup_does_not_create_token_for_unproved_manual_v1_or_v2_backup(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let token_store = Arc::new(CreatingTokenStore {
+            token: Mutex::new(None),
+            ensured: AtomicUsize::new(0),
+        });
+        let mut homes = Vec::new();
+        for (version, profile_id, provider_id, listen_port, old_listener_token) in [
+            (
+                1_u8,
+                "issue12-unproved-v1",
+                "provider-issue12-unproved-v1",
+                16_011_u16,
+                "issue12-unproved-v1-old-token",
+            ),
+            (
+                2_u8,
+                "issue12-unproved-v2",
+                "provider-issue12-unproved-v2",
+                16_012_u16,
+                "issue12-unproved-v2-old-token",
+            ),
+        ] {
+            let home = tempfile::tempdir().expect("创建无法证明的旧 Profile Home");
+            let current_home = format!(
+                "model_provider = \"{provider_id}\"\nmodel = \"user-model\"\n\n[model_providers.{provider_id}]\nbase_url = \"http://127.0.0.1:{listen_port}/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n"
+            );
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    provider_id.to_string(),
+                    provider_id.to_string(),
+                    json!({}),
+                    None,
+                ),
+            )?;
+            db.insert_codex_profile(&CodexProfile {
+                id: profile_id.to_string(),
+                name: profile_id.to_string(),
+                canonical_home_path: home.path().display().to_string(),
+                listen_port,
+                created_at: 1,
+                updated_at: 1,
+            })?;
+            let config_path = codex_config_path_for_home(home.path());
+            fs::write(&config_path, &current_home).expect("写入无法证明的旧路由 Home");
+            let backup = if version == 1 {
+                json!({
+                    "previous_content": current_home.as_bytes(),
+                    "previous_fingerprint": "unproved-v1-previous-fingerprint",
+                    "target_fingerprint": "unproved-v1-target-fingerprint"
+                })
+            } else {
+                json!({
+                    "version": 2,
+                    "previous_content": current_home.as_bytes(),
+                    "previous_fingerprint": "unproved-v2-previous-fingerprint",
+                    "target_fingerprint": "unproved-v2-target-fingerprint",
+                    "ownership_proof": {
+                        "active_provider_id": provider_id,
+                        "base_url": format!("http://127.0.0.1:{listen_port}/v1"),
+                        "wire_api": "responses",
+                        "token_digest": "digest-does-not-prove-current-home-token"
+                    }
+                })
+            };
+            db.save_codex_profile_route(&CodexProfileRoute {
+                profile_id: profile_id.to_string(),
+                current_provider_id: Some(provider_id.to_string()),
+                enabled: true,
+                home_ownership: CodexHomeOwnership::Managed,
+                live_backup_json: Some(
+                    serde_json::to_string(&backup).expect("编码无法证明的旧备份"),
+                ),
+                last_error: None,
+                recovery_json: None,
+                updated_at: 1,
+            })?;
+            homes.push((profile_id, config_path, current_home.into_bytes(), home));
+        }
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+        manager
+            .restore_enabled_profiles_with_effective_settings(db.as_ref())
+            .await?;
+
+        assert_eq!(token_store.ensured.load(Ordering::SeqCst), 0);
+        for (profile_id, config_path, original_home, _home) in homes {
+            assert_eq!(
+                fs::read(config_path).expect("读取 fail-closed 后 Home"),
+                original_home
+            );
+            let route = db
+                .get_codex_profile_route(profile_id)?
+                .expect("fail-closed 后路由存在");
+            assert!(!route.enabled);
+            assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+            assert!(route.live_backup_json.is_none());
+            assert!(manager.status(profile_id).await.is_err());
         }
         Ok(())
     }

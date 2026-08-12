@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::provider::Provider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -119,9 +120,22 @@ pub enum CodexHomeRouteReadiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexHomeMissingTokenPreflight {
     /// Home 仍由路由持有，并已在内存中补全可证明的备份元数据。
-    Managed { backup_json: String },
+    Managed {
+        backup_json: String,
+        proven_previous_listener_token: CodexProvenPreviousListenerToken,
+    },
     /// 当前活动连接路径无法证明属于该 Profile 路由。
     ExternalTakeover,
+}
+
+/// 只能由 Home 所有权预检产生的旧 listener token，生命周期仅限本次启动对账。
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexProvenPreviousListenerToken(String);
+
+impl fmt::Debug for CodexProvenPreviousListenerToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CodexProvenPreviousListenerToken([REDACTED])")
+    }
 }
 
 /// 持久化在 Profile 路由关系中的最小 Home 恢复信息。
@@ -365,7 +379,10 @@ impl CodexHomeConfigService {
             Ok(backup) => backup,
             Err(_) => return Ok(CodexHomeMissingTokenPreflight::ExternalTakeover),
         };
-        Ok(CodexHomeMissingTokenPreflight::Managed { backup_json })
+        Ok(CodexHomeMissingTokenPreflight::Managed {
+            backup_json,
+            proven_previous_listener_token: CodexProvenPreviousListenerToken(listener_token),
+        })
     }
 
     /// 构造路由接管计划，不在此阶段写入任何文件。
@@ -925,6 +942,16 @@ impl CodexHomeConfigService {
         backup_json: &str,
         plan: &CodexRouteConfigPlan,
     ) -> Result<String, AppError> {
+        self.rebase_route_backup_to_plan_with_proven_token(backup_json, plan, None)
+    }
+
+    /// 用已证明的旧 token 脱敏历史正文，同时仍用当前目标 token 生成新所有权证明。
+    pub fn rebase_route_backup_to_plan_with_proven_token(
+        &self,
+        backup_json: &str,
+        plan: &CodexRouteConfigPlan,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
+    ) -> Result<String, AppError> {
         let mut backup = Self::decode_route_backup(backup_json)?;
         backup.version = CODEX_ROUTE_BACKUP_VERSION;
         backup.target_fingerprint = plan.target_fingerprint.clone();
@@ -946,7 +973,10 @@ impl CodexHomeConfigService {
                     origin: resolved_previous_token_origin,
                 }
             } else {
-                redact_previous_listener_token(backup.previous_content, &listener_token)?
+                let redaction_token = proven_previous_listener_token
+                    .map(|token| token.0.as_str())
+                    .unwrap_or(&listener_token);
+                redact_previous_listener_token(backup.previous_content, redaction_token)?
             };
         backup.previous_content = redacted.content;
         backup.previous_token_state = redacted.state;
