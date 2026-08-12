@@ -12,11 +12,11 @@ use crate::codex_profile::provider_sync::{
 #[cfg(test)]
 use crate::codex_profile::CODEX_CATALOG_SYNC_COMPENSATION_ERROR;
 use crate::codex_profile::{
-    CodexHomeConfigService, CodexHomeExistingTokenPreflight, CodexHomeMissingTokenPreflight,
-    CodexHomeOwnership, CodexHomeReconcileOwnership, CodexHomeRouteReadiness,
-    CodexModelCatalogProjectionPlan, CodexProfile, CodexProfileRoute, CodexProfileScope,
-    CodexProfileSecretStore, CodexProvenPreviousListenerToken, CodexRouteConfigPlan,
-    CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
+    CodexDisableHomeState, CodexHomeConfigService, CodexHomeExistingTokenPreflight,
+    CodexHomeMissingTokenPreflight, CodexHomeOwnership, CodexHomeReconcileOwnership,
+    CodexHomeRouteReadiness, CodexModelCatalogProjectionPlan, CodexProfile, CodexProfileRoute,
+    CodexProfileScope, CodexProfileSecretStore, CodexProvenPreviousListenerToken,
+    CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
     CodexRouteRuntimeStartError, CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
     CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
     CODEX_ROUTE_RECOVERY_OPERATION_DELETE, CODEX_ROUTE_RECOVERY_OPERATION_DISABLE,
@@ -189,6 +189,16 @@ enum CodexDisableHomePreparation {
         proven_previous_listener_token: Option<CodexProvenPreviousListenerToken>,
     },
     /// 当前 Home 已由用户或其他程序接管。
+    ExternalTakeover,
+}
+
+/// 中断关闭恢复时，Home 相对本次服务状态的唯一分类。
+enum CodexPendingDisableHomePreparation {
+    /// Home 仍是当前路由，需要执行字段恢复。
+    CurrentRoute(CodexDisableHomePreparation),
+    /// Home 已由上次尝试恢复，只需继续停止与落库。
+    PreviousBaseline,
+    /// Home 已被外部严格编辑。
     ExternalTakeover,
 }
 
@@ -1256,7 +1266,7 @@ impl CodexRouteManager {
             AppError::Config("Codex Profile 本地路由凭证缺失，无法显式切换供应商".to_string())
         })?;
         let home = std::path::Path::new(&profile.canonical_home_path);
-        let (switch_backup_json, proven_previous_listener_token) =
+        let (mut switch_origin_route, mut switch_backup_json, mut proven_previous_listener_token) =
             if let Some(backup) = route.live_backup_json.as_deref() {
                 match self.home_config.preflight_existing_listener_token(
                     home,
@@ -1267,14 +1277,43 @@ impl CodexRouteManager {
                     CodexHomeExistingTokenPreflight::Managed {
                         backup_json,
                         proven_previous_listener_token,
-                    } => (Some(backup_json), proven_previous_listener_token),
-                    CodexHomeExistingTokenPreflight::ExternalTakeover => {
-                        (route.live_backup_json.clone(), None)
-                    }
+                    } => (
+                        route.clone(),
+                        Some(backup_json),
+                        proven_previous_listener_token,
+                    ),
+                    CodexHomeExistingTokenPreflight::ExternalTakeover => (
+                        CodexProfileRoute {
+                            home_ownership: CodexHomeOwnership::External,
+                            live_backup_json: None,
+                            ..route.clone()
+                        },
+                        None,
+                        None,
+                    ),
                 }
             } else {
-                (None, None)
+                (route.clone(), None, None)
             };
+        if let Some(backup_json) = switch_backup_json.as_deref() {
+            let current_route_plan = self.home_config.build_profile_route_plan(
+                home,
+                profile.listen_port,
+                None,
+                &listener_token,
+            )?;
+            if self.home_config.classify_profile_reconcile(
+                &current_route_plan,
+                backup_json,
+                profile.listen_port,
+            )? == CodexHomeReconcileOwnership::ExternalTakeover
+            {
+                switch_origin_route.home_ownership = CodexHomeOwnership::External;
+                switch_origin_route.live_backup_json = None;
+                switch_backup_json = None;
+                proven_previous_listener_token = None;
+            }
+        }
         let route_model_provider = (route.current_provider_id.as_deref() != Some(provider_id))
             .then_some(&selected_provider);
         let (catalog_plan, route_plan) = self.home_config.build_profile_switch_plans(
@@ -1298,8 +1337,7 @@ impl CodexRouteManager {
             Ok(backup) => backup,
             Err(error) => return Err(error),
         };
-        let mut prepared = self.route_with_recovery(route.clone(), &recovery)?;
-        prepared.home_ownership = CodexHomeOwnership::Managed;
+        let mut prepared = self.route_with_recovery(switch_origin_route.clone(), &recovery)?;
         prepared.live_backup_json = Some(latest_backup.clone());
         self.persistence.save_route(&prepared)?;
         if let Err(error) = self
@@ -1320,7 +1358,7 @@ impl CodexRouteManager {
                 .err()
                 .into_iter()
                 .collect::<Vec<_>>();
-            if let Err(persist_error) = self.persistence.save_route(&route) {
+            if let Err(persist_error) = self.persistence.save_route(&switch_origin_route) {
                 compensation_errors.push(persist_error);
             }
             let compensation_error = Self::combine_compensation_errors(compensation_errors);
@@ -1338,7 +1376,7 @@ impl CodexRouteManager {
             let compensation_error = self
                 .restore_switch_and_catalog_locked(
                     profile_id,
-                    &route,
+                    &switch_origin_route,
                     &old_failovers,
                     old_snapshot,
                     &route_plan,
@@ -1359,7 +1397,7 @@ impl CodexRouteManager {
             let compensation_error = self
                 .restore_switch_and_catalog_locked(
                     profile_id,
-                    &route,
+                    &switch_origin_route,
                     &old_failovers,
                     old_snapshot,
                     &route_plan,
@@ -1379,7 +1417,7 @@ impl CodexRouteManager {
             let compensation_error = self
                 .restore_switch_and_catalog_locked(
                     profile_id,
-                    &route,
+                    &switch_origin_route,
                     &old_failovers,
                     old_snapshot,
                     &route_plan,
@@ -1398,7 +1436,7 @@ impl CodexRouteManager {
             let compensation_error = self
                 .restore_switch_and_catalog_locked(
                     profile_id,
-                    &route,
+                    &switch_origin_route,
                     &old_failovers,
                     old_snapshot,
                     &route_plan,
@@ -1773,6 +1811,38 @@ impl CodexRouteManager {
             backup_json,
             proven_previous_listener_token,
         })
+    }
+
+    /// 先识别可证明的接管前基线，再对仍指向当前路由的 Home 执行常规所有权预检。
+    fn prepare_pending_disable_home(
+        &self,
+        profile: &CodexProfile,
+        route: &CodexProfileRoute,
+    ) -> Result<CodexPendingDisableHomePreparation, AppError> {
+        let backup_json = route.live_backup_json.as_deref().ok_or_else(|| {
+            AppError::InvalidInput("中断关闭缺少 Codex Profile Home 备份".to_string())
+        })?;
+        let listener_token = self.secret_store.read_token(&profile.id)?.ok_or_else(|| {
+            AppError::Config("Codex Profile 本地路由凭证缺失，拒绝恢复关闭".to_string())
+        })?;
+        let state = self.home_config.classify_disable_home_state(
+            std::path::Path::new(&profile.canonical_home_path),
+            backup_json,
+            profile.listen_port,
+            &listener_token,
+            None,
+        )?;
+        if state == CodexDisableHomeState::PreviousBaseline {
+            return Ok(CodexPendingDisableHomePreparation::PreviousBaseline);
+        }
+        match self.prepare_managed_home_for_disable(profile, route)? {
+            managed @ CodexDisableHomePreparation::Managed { .. } => {
+                Ok(CodexPendingDisableHomePreparation::CurrentRoute(managed))
+            }
+            CodexDisableHomePreparation::ExternalTakeover => {
+                Ok(CodexPendingDisableHomePreparation::ExternalTakeover)
+            }
+        }
     }
 
     /// restore 冲突后只读重验当前 Home，确认外部接管时放弃陈旧恢复记录。
@@ -2289,7 +2359,8 @@ impl CodexRouteManager {
     /// 记录显式关闭前识别到的外部接管事件，不包含 Home 路径、配置正文或凭证。
     fn log_lifecycle_external_takeover(&self, profile: &CodexProfile) {
         self.startup_restore_diagnostic_logger.warn(&format!(
-            "Codex Profile 路由操作检测到外部接管，已静默关闭: operation=disable profile_id={} stage={} category={}",
+            "Codex Profile 路由操作检测到外部接管，已静默关闭: operation={} profile_id={} stage={} category={}",
+            CODEX_ROUTE_RECOVERY_OPERATION_DISABLE,
             profile.id,
             CODEX_STARTUP_RESTORE_STAGE_RECONCILE_HOME,
             CODEX_STARTUP_RESTORE_CATEGORY_DERIVED_STATE
@@ -3055,13 +3126,7 @@ impl CodexRouteManager {
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             let profile = self.persistence.get_profile(profile_id)?;
-            let preparation = match self.prepare_managed_home_for_disable(&profile, &route) {
-                Ok(CodexDisableHomePreparation::ExternalTakeover) => {
-                    self.disable_external_takeover_locked(profile_id, &profile, &route)
-                        .await
-                        .map_err(Self::recovery_unconverged_error)?;
-                    return Ok(());
-                }
+            let pending = match self.prepare_pending_disable_home(&profile, &route) {
                 Ok(preparation) => preparation,
                 Err(error) => {
                     self.persist_operation_error(
@@ -3072,30 +3137,45 @@ impl CodexRouteManager {
                     return Err(Self::recovery_unconverged_error(error));
                 }
             };
-            if let Err(error) =
-                self.restore_preflighted_profile_home_for_disable(&profile, preparation)
-            {
-                match self
-                    .converge_external_after_disable_restore_failure(profile_id, &profile, &route)
-                    .await
-                {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => {}
-                    Err(reclassification_error) => {
+            match pending {
+                CodexPendingDisableHomePreparation::ExternalTakeover => {
+                    self.disable_external_takeover_locked(profile_id, &profile, &route)
+                        .await
+                        .map_err(Self::recovery_unconverged_error)?;
+                    return Ok(());
+                }
+                CodexPendingDisableHomePreparation::PreviousBaseline => {}
+                CodexPendingDisableHomePreparation::CurrentRoute(preparation) => {
+                    if let Err(error) =
+                        self.restore_preflighted_profile_home_for_disable(&profile, preparation)
+                    {
+                        match self
+                            .converge_external_after_disable_restore_failure(
+                                profile_id, &profile, &route,
+                            )
+                            .await
+                        {
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {}
+                            Err(reclassification_error) => {
+                                self.persist_operation_error(
+                                    profile_id,
+                                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                                    &reclassification_error.to_string(),
+                                )?;
+                                return Err(Self::recovery_unconverged_error(
+                                    reclassification_error,
+                                ));
+                            }
+                        }
                         self.persist_operation_error(
                             profile_id,
                             CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
-                            &reclassification_error.to_string(),
+                            &error.to_string(),
                         )?;
-                        return Err(Self::recovery_unconverged_error(reclassification_error));
+                        return Err(Self::recovery_unconverged_error(error));
                     }
                 }
-                self.persist_operation_error(
-                    profile_id,
-                    CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
-                    &error.to_string(),
-                )?;
-                return Err(Self::recovery_unconverged_error(error));
             }
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
@@ -3108,6 +3188,26 @@ impl CodexRouteManager {
                     )?;
                     return Err(AppError::Message(format!(
                         "继续关闭 Codex Profile 路由失败: {error}"
+                    )));
+                }
+            }
+            let profile = self.persistence.get_profile(profile_id)?;
+            let preparation = self
+                .prepare_pending_disable_home(&profile, &route)
+                .map_err(Self::recovery_unconverged_error)?;
+            match preparation {
+                CodexPendingDisableHomePreparation::ExternalTakeover => {
+                    self.persist_external_takeover(&route)
+                        .map_err(Self::recovery_unconverged_error)?;
+                    self.remove_runtime(profile_id)
+                        .map_err(Self::recovery_unconverged_error)?;
+                    self.log_lifecycle_external_takeover(&profile);
+                    return Ok(());
+                }
+                CodexPendingDisableHomePreparation::PreviousBaseline => {}
+                CodexPendingDisableHomePreparation::CurrentRoute(_) => {
+                    return Err(Self::recovery_unconverged_error(AppError::Config(
+                        "Codex Profile 关闭恢复尚未完成".to_string(),
                     )));
                 }
             }
@@ -7775,6 +7875,160 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
+    /// 显式切换发现 Home 严格字段已外部接管时，不得把无法证明的旧备份带入新操作。
+    #[tokio::test]
+    async fn switching_external_home_discards_unproven_legacy_backup_and_recovers_external(
+    ) -> Result<(), AppError> {
+        use sha2::{Digest, Sha256};
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建 External 切换测试 Home");
+        let profile_id = "issue20-external-switch";
+        let old_provider_id = "provider-issue20-old";
+        let new_provider_id = "provider-issue20-new";
+        let old_listener_token = "issue20-rotated-old-listener-token";
+        let new_listener_token = "issue20-current-new-listener-token";
+        for provider_id in [old_provider_id, new_provider_id] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    provider_id.to_string(),
+                    provider_id.to_string(),
+                    json!({"auth": {}, "config": ""}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_020,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let external_home = format!(
+            "model_provider = \"{old_provider_id}\"\nmodel = \"user-model\"\n\n[model_providers.{old_provider_id}]\nbase_url = \"https://external.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{new_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+        );
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, &external_home).expect("写入外部接管 Home");
+        let mut hasher = Sha256::new();
+        hasher.update(crate::codex_profile::CODEX_ROUTE_TOKEN_PROOF_DOMAIN);
+        hasher.update([0]);
+        hasher.update(old_listener_token.as_bytes());
+        let manual_v2 = json!({
+            "version": 2,
+            "previous_content": format!(
+                "model_provider = \"{old_provider_id}\"\n[model_providers.{old_provider_id}]\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n"
+            ).as_bytes(),
+            "previous_fingerprint": "issue20-v2-previous",
+            "target_fingerprint": "issue20-v2-target",
+            "ownership_proof": {
+                "active_provider_id": old_provider_id,
+                "base_url": "http://127.0.0.1:16020/v1",
+                "wire_api": "responses",
+                "token_digest": format!("{:x}", hasher.finalize())
+            }
+        });
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(old_provider_id.to_string()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(serde_json::to_string(&manual_v2).expect("编码手工 v2 备份")),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(ProfileTokenMapStore {
+            tokens: HashMap::from([(profile_id.to_string(), new_listener_token.to_string())]),
+            reads: Mutex::new(HashMap::new()),
+        });
+        let runtime = snapshot_tracking_runtime(
+            db.get_provider_by_id(old_provider_id, AppType::Codex.as_str())?
+                .expect("旧供应商存在"),
+            vec![],
+        );
+        let crashing = Arc::new(CodexRouteManager::new(
+            Arc::new(PanicAfterSwitchPreparedPersistence {
+                db: db.clone(),
+                panicked: AtomicBool::new(false),
+            }),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        ));
+        crashing.track_runtime(profile_id.to_string(), runtime.clone())?;
+
+        let switching = {
+            let manager = crashing.clone();
+            tokio::spawn(async move {
+                manager
+                    .switch_provider(profile_id, new_provider_id, vec![])
+                    .await
+            })
+        };
+        assert!(switching
+            .await
+            .expect_err("PREPARED 后必须模拟崩溃")
+            .is_panic());
+        let pending = db
+            .get_codex_profile_route(profile_id)?
+            .expect("切换 PREPARED 路由存在");
+        assert_eq!(pending.home_ownership, CodexHomeOwnership::External);
+        let pending_backup = pending.live_backup_json.expect("切换安全备份存在");
+        let pending_value: serde_json::Value =
+            serde_json::from_str(&pending_backup).expect("解析切换安全备份");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(!json_contains_reversible_secret(
+                &pending_value,
+                token.as_bytes()
+            ));
+        }
+
+        let restarted = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            token_store,
+            Arc::new(FakeFactory),
+        );
+        restarted.track_runtime(profile_id.to_string(), runtime)?;
+        restarted.recover_pending_locked(profile_id).await?;
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("读取恢复后的 External Home"),
+            external_home
+        );
+        let recovered = db
+            .get_codex_profile_route(profile_id)?
+            .expect("恢复后的路由存在");
+        assert!(recovered.enabled);
+        assert_eq!(recovered.home_ownership, CodexHomeOwnership::External);
+        assert!(recovered.live_backup_json.is_none());
+        assert!(recovered.recovery_json.is_none());
+
+        restarted
+            .switch_provider(profile_id, new_provider_id, vec![])
+            .await?;
+        let switched = db
+            .get_codex_profile_route(profile_id)?
+            .expect("显式接管后的路由存在");
+        assert_eq!(switched.home_ownership, CodexHomeOwnership::Managed);
+        let fresh_backup = switched.live_backup_json.expect("显式接管的新基线存在");
+        let fresh_value: serde_json::Value =
+            serde_json::from_str(&fresh_backup).expect("解析显式接管新基线");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(!json_contains_reversible_secret(
+                &fresh_value,
+                token.as_bytes()
+            ));
+        }
+        restarted.disable(profile_id).await?;
+        let restored_baseline = fs::read_to_string(&config_path).expect("读取显式接管基线");
+        assert!(restored_baseline.contains("https://external.example/v1"));
+        assert!(restored_baseline.contains(new_listener_token));
+        Ok(())
+    }
+
     /// 递归检查 JSON 字符串与数字字节数组是否包含可逆敏感值。
     fn json_contains_reversible_secret(value: &serde_json::Value, secret: &[u8]) -> bool {
         match value {
@@ -8227,7 +8481,9 @@ experimental_bearer_token = "PROXY_MANAGED"
         );
         let messages = logger.messages();
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("operation=disable"));
+        assert!(messages[0].contains(&format!(
+            "operation={CODEX_ROUTE_RECOVERY_OPERATION_DISABLE}"
+        )));
         assert!(!messages[0].contains("https://external.example/v1"));
         assert!(!messages[0].contains("upstream-token"));
         assert!(!messages[0].contains(&home.path().display().to_string()));
@@ -13853,8 +14109,85 @@ keep = true
             .get_codex_profile_route("profile-stop-retry")?
             .expect("路由存在");
         assert!(!route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::Managed);
+        assert!(route.live_backup_json.is_none());
         assert!(route.recovery_json.is_none());
         assert_eq!(runtime.reject_new_requests_calls.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
+    /// 中断关闭在本轮恢复 Home 后，stop 尾窗发生的外部编辑必须重新分类为 External。
+    #[tokio::test]
+    async fn pending_disable_rechecks_external_edit_after_async_stop() -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建中断关闭 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let profile_id = "issue20-pending-disable-tail";
+        prepare_enabled_profile_home(
+            &db,
+            &home_config,
+            home.path(),
+            profile_id,
+            16_020,
+            "test-local-token",
+        )?;
+        let mut route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("受管路由存在");
+        let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+        let mut target = before.clone();
+        target.enabled = false;
+        route.recovery_json = Some(
+            serde_json::to_string(&RouteRecoveryRecord {
+                operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
+                before,
+                target,
+                phase: CODEX_ROUTE_RECOVERY_PHASE_PREPARED.to_string(),
+                last_error: None,
+                reconcile: None,
+            })
+            .expect("编码中断关闭 recovery"),
+        );
+        db.save_codex_profile_route(&route)?;
+        let config_path = codex_config_path_for_home(home.path());
+        let external = b"model_provider = \"external\"\n\n[model_providers.external]\nbase_url = \"https://external-during-stop.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"external-token\"\n".to_vec();
+        let stop_entered = Arc::new(tokio::sync::Notify::new());
+        let resume_stop = Arc::new(tokio::sync::Notify::new());
+        let manager = Arc::new(CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        ));
+        manager.track_runtime(
+            profile_id.to_string(),
+            Arc::new(BlockingStopRuntime {
+                stop_entered: stop_entered.clone(),
+                resume_stop: resume_stop.clone(),
+                first_stop: AtomicBool::new(true),
+            }),
+        )?;
+
+        let restoring = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.restore_enabled_profiles().await })
+        };
+        stop_entered.notified().await;
+        fs::write(&config_path, &external).expect("stop 尾窗写入外部 Home");
+        resume_stop.notify_one();
+        restoring.await.expect("恢复任务未崩溃")?;
+
+        assert_eq!(fs::read(&config_path).expect("重读外部 Home"), external);
+        let recovered = db
+            .get_codex_profile_route(profile_id)?
+            .expect("恢复后的路由存在");
+        assert!(!recovered.enabled);
+        assert_eq!(recovered.home_ownership, CodexHomeOwnership::External);
+        assert!(recovered.live_backup_json.is_none());
+        assert!(recovered.recovery_json.is_none());
         Ok(())
     }
 

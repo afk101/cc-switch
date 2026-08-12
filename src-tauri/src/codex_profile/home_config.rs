@@ -140,6 +140,17 @@ pub enum CodexHomeExistingTokenPreflight {
     ExternalTakeover,
 }
 
+/// 关闭流程中当前 Home 相对路由与接管前基线的可观察状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexDisableHomeState {
+    /// Home 仍指向当前本地路由。
+    CurrentRoute,
+    /// Home 已恢复为本次接管前基线。
+    PreviousBaseline,
+    /// Home 既不属于当前路由，也不是可证明的接管前基线。
+    External,
+}
+
 /// 只能由 Home 所有权预检产生的旧 listener token，生命周期仅限本次启动对账。
 #[derive(Clone, PartialEq, Eq)]
 pub struct CodexProvenPreviousListenerToken(String);
@@ -1220,6 +1231,36 @@ impl CodexHomeConfigService {
             &state,
             &projection,
         ))
+    }
+
+    /// 区分关闭恢复前后的两种受管 Home 与真实外部接管。
+    pub fn classify_disable_home_state(
+        &self,
+        home: &Path,
+        backup_json: &str,
+        listen_port: u16,
+        current_listener_token: &str,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
+    ) -> Result<CodexDisableHomeState, AppError> {
+        if self.profile_backup_restore_is_current(
+            home,
+            backup_json,
+            listen_port,
+            current_listener_token,
+            proven_previous_listener_token,
+        )? {
+            return Ok(CodexDisableHomeState::PreviousBaseline);
+        }
+        let plan =
+            self.build_profile_route_plan(home, listen_port, None, current_listener_token)?;
+        let ownership = self.classify_profile_reconcile(&plan, backup_json, listen_port)?;
+        Ok(
+            if ownership == CodexHomeReconcileOwnership::ExternalTakeover {
+                CodexDisableHomeState::External
+            } else {
+                CodexDisableHomeState::CurrentRoute
+            },
+        )
     }
 
     /// 关闭 Profile 时只验证并恢复三个严格路由字段，保留其他当前配置。
