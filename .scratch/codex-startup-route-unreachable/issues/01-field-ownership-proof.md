@@ -1,6 +1,6 @@
 # 01 — 建立字段级路由所有权与版本化证明
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 让 Home 配置服务能够只依据当前活动 provider 与严格路由字段识别 CC Switch 所有权，并生成不含明文 token 的可演进 backup，使非路由字段变化不再影响判断。
 
@@ -13,11 +13,11 @@ Status: ready-for-agent
 
 ## Acceptance Criteria
 
-- [ ] `model`、Desktop、plugins、MCP、注释和未知非路由字段不参与所有权比较。
-- [ ] 当前活动 provider 的 selector 与三个严格字段能被独立分类为当前持有、可证明旧持有、legacy或外部接管。
-- [ ] backup具有显式版本和域分离 token摘要，任何序列化内容均不含 listener token明文。
-- [ ] 整文件指纹仅用于单次写入CAS；外部并发修改不会被覆盖。
-- [ ] legacy占位符必须完整匹配端口、协议和token才被接受，且可升级为新版证明。
+- [x] `model`、Desktop、plugins、MCP、注释和未知非路由字段不参与所有权比较。
+- [x] 当前活动 provider 的 selector 与三个严格字段能被独立分类为当前持有、可证明旧持有、legacy或外部接管。
+- [x] backup具有显式版本和域分离 token摘要，任何序列化内容均不含 listener token明文。
+- [x] 整文件指纹仅用于单次写入CAS；外部并发修改不会被覆盖。
+- [x] legacy占位符必须完整匹配端口、协议和token才被接受，且可升级为新版证明。
 
 ## 验证方式
 
@@ -36,3 +36,9 @@ Status: ready-for-agent
 
 - 不改变启动顺序、route持久化状态或UI。
 - 不实现显式启用/切换的新基线。
+
+## Comments
+
+- 实现提交：`4fa1a9869bf86ee8f7f4fa257bb8722cf815a6a2`。
+- 验证：Home 27/27、route manager 71/71、Codex Profile 151/151；格式与 diff check 通过。
+- `cargo clippy --lib -- -D warnings` 被未修改文件中的 8 个既有 lint 阻断，本 issue 修改文件无报告。
