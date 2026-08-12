@@ -1256,6 +1256,25 @@ impl CodexRouteManager {
             AppError::Config("Codex Profile 本地路由凭证缺失，无法显式切换供应商".to_string())
         })?;
         let home = std::path::Path::new(&profile.canonical_home_path);
+        let (switch_backup_json, proven_previous_listener_token) =
+            if let Some(backup) = route.live_backup_json.as_deref() {
+                match self.home_config.preflight_existing_listener_token(
+                    home,
+                    backup,
+                    profile.listen_port,
+                    &listener_token,
+                )? {
+                    CodexHomeExistingTokenPreflight::Managed {
+                        backup_json,
+                        proven_previous_listener_token,
+                    } => (Some(backup_json), proven_previous_listener_token),
+                    CodexHomeExistingTokenPreflight::ExternalTakeover => {
+                        (route.live_backup_json.clone(), None)
+                    }
+                }
+            } else {
+                (None, None)
+            };
         let route_model_provider = (route.current_provider_id.as_deref() != Some(provider_id))
             .then_some(&selected_provider);
         let (catalog_plan, route_plan) = self.home_config.build_profile_switch_plans(
@@ -1270,9 +1289,10 @@ impl CodexRouteManager {
             .serialize_explicit_switch_backup_with_catalog(
                 &route_plan,
                 &catalog_plan,
-                route.live_backup_json.as_deref(),
+                switch_backup_json.as_deref(),
                 profile.listen_port,
                 &listener_token,
+                proven_previous_listener_token.as_ref(),
             );
         let latest_backup = match latest_backup_result {
             Ok(backup) => backup,
@@ -1522,24 +1542,30 @@ impl CodexRouteManager {
         self.disable_locked(profile_id, &profile, route).await
     }
 
-    /// 使用既有 listener token 收敛关闭中的 Profile Home，不创建新凭证。
-    fn restore_profile_home_for_disable(
+    /// 使用只读预检结果收敛关闭中的 Profile Home，不创建或持久化新凭证。
+    fn restore_preflighted_profile_home_for_disable(
         &self,
         profile: &CodexProfile,
-        route: &CodexProfileRoute,
+        preparation: CodexDisableHomePreparation,
     ) -> Result<(), AppError> {
-        let Some(backup) = route.live_backup_json.as_deref() else {
-            return Ok(());
+        let CodexDisableHomePreparation::Managed {
+            listener_token,
+            backup_json,
+            proven_previous_listener_token,
+        } = preparation
+        else {
+            return Err(AppError::InvalidInput(
+                "Codex Profile 关闭恢复预检状态无效".to_string(),
+            ));
         };
-        let listener_token = self.secret_store.read_token(&profile.id)?.ok_or_else(|| {
-            AppError::Config("Codex Profile 本地路由凭证缺失，无法证明 Home 路由所有权".to_string())
-        })?;
-        self.home_config.restore_profile_backup(
-            std::path::Path::new(&profile.canonical_home_path),
-            backup,
-            profile.listen_port,
-            &listener_token,
-        )
+        self.home_config
+            .restore_profile_backup_with_proven_listener_token(
+                std::path::Path::new(&profile.canonical_home_path),
+                &backup_json,
+                profile.listen_port,
+                &listener_token,
+                proven_previous_listener_token.as_ref(),
+            )
     }
 
     /// 在已持有 Profile 锁时执行可重试的关闭流程。
@@ -3029,7 +3055,26 @@ impl CodexRouteManager {
         }
         if Self::is_disable_recovery(&recovery.operation, &recovery.phase) {
             let profile = self.persistence.get_profile(profile_id)?;
-            if let Err(error) = self.restore_profile_home_for_disable(&profile, &route) {
+            let preparation = match self.prepare_managed_home_for_disable(&profile, &route) {
+                Ok(CodexDisableHomePreparation::ExternalTakeover) => {
+                    self.disable_external_takeover_locked(profile_id, &profile, &route)
+                        .await
+                        .map_err(Self::recovery_unconverged_error)?;
+                    return Ok(());
+                }
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    self.persist_operation_error(
+                        profile_id,
+                        CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+                        &error.to_string(),
+                    )?;
+                    return Err(Self::recovery_unconverged_error(error));
+                }
+            };
+            if let Err(error) =
+                self.restore_preflighted_profile_home_for_disable(&profile, preparation)
+            {
                 match self
                     .converge_external_after_disable_restore_failure(profile_id, &profile, &route)
                     .await
@@ -3068,6 +3113,7 @@ impl CodexRouteManager {
             }
             let mut disabled = route;
             disabled.enabled = false;
+            disabled.live_backup_json = None;
             disabled.recovery_json = None;
             disabled.last_error = None;
             disabled.updated_at = Utc::now().timestamp_millis();
@@ -4064,6 +4110,68 @@ mod codex_route_manager {
         db: Arc<Database>,
         old_backup: String,
         split_saves: AtomicUsize,
+    }
+
+    /// 在切换 PREPARED 与组合备份原子落库后模拟进程崩溃。
+    struct PanicAfterSwitchPreparedPersistence {
+        db: Arc<Database>,
+        panicked: AtomicBool,
+    }
+
+    impl CodexProfileRoutePersistence for PanicAfterSwitchPreparedPersistence {
+        fn list_profiles(&self) -> Result<Vec<CodexProfile>, AppError> {
+            self.db.list_codex_profiles()
+        }
+
+        fn get_profile(&self, profile_id: &str) -> Result<CodexProfile, AppError> {
+            self.db.get_codex_profile(profile_id)
+        }
+
+        fn get_route(&self, profile_id: &str) -> Result<Option<CodexProfileRoute>, AppError> {
+            self.db.get_codex_profile_route(profile_id)
+        }
+
+        fn save_route(&self, route: &CodexProfileRoute) -> Result<(), AppError> {
+            self.db.save_codex_profile_route(route)?;
+            let switch_prepared = route
+                .recovery_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<RouteRecoveryRecord>(json).ok())
+                .is_some_and(|recovery| {
+                    recovery.operation == CODEX_ROUTE_RECOVERY_OPERATION_SWITCH
+                        && recovery.phase == CODEX_ROUTE_RECOVERY_PHASE_PREPARED
+                });
+            if switch_prepared && !self.panicked.swap(true, Ordering::SeqCst) {
+                panic!("模拟切换 PREPARED 落库后进程崩溃");
+            }
+            Ok(())
+        }
+
+        fn list_failovers(&self, profile_id: &str) -> Result<Vec<String>, AppError> {
+            self.db.list_codex_profile_failovers(profile_id)
+        }
+
+        fn replace_failovers(
+            &self,
+            profile_id: &str,
+            provider_ids: &[String],
+        ) -> Result<(), AppError> {
+            self.db
+                .replace_codex_profile_failovers(profile_id, provider_ids)
+        }
+
+        fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
+            self.db
+                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        }
+
+        fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
+            self.db.save_provider(AppType::Codex.as_str(), provider)
+        }
+
+        fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
+            self.db.delete_codex_profile(profile_id)
+        }
     }
 
     impl CodexProfileRoutePersistence for AtomicEnableSavePersistence {
@@ -7457,6 +7565,246 @@ experimental_bearer_token = "PROXY_MANAGED"
         assert!(restored.contains("js_repl = true"));
         assert!(!restored.contains("test-local-token"));
         Ok(())
+    }
+
+    /// 手工旧备份进入切换 PREPARED 前必须先脱敏升级，崩溃恢复也不能重新引入旧凭证。
+    #[tokio::test]
+    async fn switching_manual_legacy_backup_redacts_nested_tokens_before_prepared_recovery(
+    ) -> Result<(), AppError> {
+        use sha2::{Digest, Sha256};
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建旧备份 Profile Home");
+        let profile_id = "issue19-nested-v2";
+        let old_provider_id = "provider-issue19-old";
+        let new_provider_id = "provider-issue19-new";
+        let old_listener_token = "issue19-proven-old-listener-token";
+        let new_listener_token = "issue19-current-new-listener-token";
+        for provider_id in [old_provider_id, new_provider_id] {
+            db.save_provider(
+                AppType::Codex.as_str(),
+                &Provider::with_id(
+                    provider_id.to_string(),
+                    provider_id.to_string(),
+                    json!({"auth": {}, "config": ""}),
+                    None,
+                ),
+            )?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: profile_id.to_string(),
+            name: profile_id.to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_019,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let current_home = format!(
+            "model_provider = \"{old_provider_id}\"\nmodel = \"user-model\"\n\n[model_providers.{old_provider_id}]\nbase_url = \"http://127.0.0.1:16019/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+        );
+        let previous_content = format!(
+            "model_provider = \"{old_provider_id}\"\nmodel = \"baseline-model\"\n\n[model_providers.{old_provider_id}]\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n"
+        );
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(&config_path, &current_home).expect("写入可证明旧路由 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let mut hasher = Sha256::new();
+        hasher.update(crate::codex_profile::CODEX_ROUTE_TOKEN_PROOF_DOMAIN);
+        hasher.update([0]);
+        hasher.update(old_listener_token.as_bytes());
+        let token_digest = format!("{:x}", hasher.finalize());
+        let manual_v2 = json!({
+            "version": 2,
+            "previous_content": previous_content.as_bytes(),
+            "previous_fingerprint": "issue19-v2-previous",
+            "target_fingerprint": home_config.current_fingerprint(home.path())?,
+            "ownership_proof": {
+                "active_provider_id": old_provider_id,
+                "base_url": "http://127.0.0.1:16019/v1",
+                "wire_api": "responses",
+                "token_digest": token_digest
+            }
+        });
+        let original_backup = serde_json::to_string(&manual_v2).expect("编码手工 v2 备份");
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: profile_id.to_string(),
+            current_provider_id: Some(old_provider_id.to_string()),
+            enabled: true,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: Some(original_backup),
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let token_store = Arc::new(ProfileTokenMapStore {
+            tokens: HashMap::from([(profile_id.to_string(), new_listener_token.to_string())]),
+            reads: Mutex::new(HashMap::new()),
+        });
+        let runtime = snapshot_tracking_runtime(
+            db.get_provider_by_id(old_provider_id, AppType::Codex.as_str())?
+                .expect("旧供应商存在"),
+            vec![],
+        );
+        let manager = Arc::new(CodexRouteManager::new(
+            Arc::new(PanicAfterSwitchPreparedPersistence {
+                db: db.clone(),
+                panicked: AtomicBool::new(false),
+            }),
+            home_config.clone(),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        ));
+        manager.track_runtime(profile_id.to_string(), runtime.clone())?;
+
+        let switching = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .switch_provider(profile_id, new_provider_id, vec![])
+                    .await
+            })
+        };
+        assert!(switching
+            .await
+            .expect_err("PREPARED 落库后必须模拟崩溃")
+            .is_panic());
+        let pending = db
+            .get_codex_profile_route(profile_id)?
+            .expect("PREPARED 路由存在");
+        let pending_backup = pending.live_backup_json.expect("组合备份存在");
+        let pending_value: serde_json::Value =
+            serde_json::from_str(&pending_backup).expect("解析组合备份");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(
+                !json_contains_reversible_secret(&pending_value, token.as_bytes()),
+                "组合备份不得递归还原 listener token"
+            );
+        }
+
+        let restarted = CodexRouteManager::new(
+            db.clone(),
+            home_config.clone(),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+        restarted.track_runtime(profile_id.to_string(), runtime.clone())?;
+        restarted.recover_pending_locked(profile_id).await?;
+        let recovered = db
+            .get_codex_profile_route(profile_id)?
+            .expect("恢复后的路由存在");
+        assert!(recovered.recovery_json.is_none());
+        assert_eq!(
+            recovered.current_provider_id.as_deref(),
+            Some(old_provider_id)
+        );
+        let recovered_backup = recovered.live_backup_json.expect("恢复后的旧备份存在");
+        let recovered_value: serde_json::Value =
+            serde_json::from_str(&recovered_backup).expect("解析恢复后的备份");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(!json_contains_reversible_secret(
+                &recovered_value,
+                token.as_bytes()
+            ));
+        }
+
+        let route_write_manager = Arc::new(CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(Arc::new(
+                WriteRouteThenPanicOps {
+                    config_path: config_path.clone(),
+                    panicked: AtomicBool::new(false),
+                },
+            ))),
+            token_store.clone(),
+            Arc::new(FakeFactory),
+        ));
+        route_write_manager.track_runtime(profile_id.to_string(), runtime.clone())?;
+        let switching = {
+            let manager = route_write_manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .switch_provider(profile_id, new_provider_id, vec![])
+                    .await
+            })
+        };
+        assert!(switching
+            .await
+            .expect_err("路由 Home 落盘后必须模拟崩溃")
+            .is_panic());
+        let route_write_pending = db
+            .get_codex_profile_route(profile_id)?
+            .expect("route-write 崩溃后的路由存在");
+        let route_write_backup = route_write_pending
+            .live_backup_json
+            .expect("route-write 崩溃后的组合备份存在");
+        let route_write_value: serde_json::Value =
+            serde_json::from_str(&route_write_backup).expect("解析 route-write 组合备份");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(!json_contains_reversible_secret(
+                &route_write_value,
+                token.as_bytes()
+            ));
+        }
+        let route_write_restarted =
+            CodexRouteManager::new(db.clone(), home_config, token_store, Arc::new(FakeFactory));
+        route_write_restarted.track_runtime(profile_id.to_string(), runtime)?;
+        route_write_restarted
+            .recover_pending_locked(profile_id)
+            .await?;
+        let final_route = db
+            .get_codex_profile_route(profile_id)?
+            .expect("route-write 恢复后的路由存在");
+        assert!(final_route.recovery_json.is_none());
+        assert_eq!(
+            final_route.current_provider_id.as_deref(),
+            Some(old_provider_id)
+        );
+        let final_backup: serde_json::Value = serde_json::from_str(
+            final_route
+                .live_backup_json
+                .as_deref()
+                .expect("最终安全备份存在"),
+        )
+        .expect("解析最终安全备份");
+        for token in [old_listener_token, new_listener_token] {
+            assert!(!json_contains_reversible_secret(
+                &final_backup,
+                token.as_bytes()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 递归检查 JSON 字符串与数字字节数组是否包含可逆敏感值。
+    fn json_contains_reversible_secret(value: &serde_json::Value, secret: &[u8]) -> bool {
+        match value {
+            serde_json::Value::String(text) => text
+                .as_bytes()
+                .windows(secret.len())
+                .any(|bytes| bytes == secret),
+            serde_json::Value::Array(values) => {
+                let bytes = values
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()
+                    .and_then(|values| {
+                        values
+                            .into_iter()
+                            .map(|value| u8::try_from(value).ok())
+                            .collect::<Option<Vec<_>>>()
+                    });
+                bytes
+                    .as_deref()
+                    .is_some_and(|bytes| bytes.windows(secret.len()).any(|window| window == secret))
+                    || values
+                        .iter()
+                        .any(|value| json_contains_reversible_secret(value, secret))
+            }
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(|value| json_contains_reversible_secret(value, secret)),
+            _ => false,
+        }
     }
 
     /// 外部接管后重新启用同一供应商只能重建基线，不得修改用户模型。
@@ -13726,6 +14074,86 @@ keep = true
         assert!(!recovered_route.enabled);
         assert!(recovered_route.recovery_json.is_none());
         assert!(restarted_manager.status("profile-a").await.is_err());
+        Ok(())
+    }
+
+    /// 关闭崩溃恢复必须重新预检 Home，并用可证明旧 token 完成字段恢复。
+    #[tokio::test]
+    async fn restarting_disable_with_proven_old_token_repreflights_and_clears_route_state(
+    ) -> Result<(), AppError> {
+        for phase in [
+            CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
+            CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
+        ] {
+            let db = Arc::new(Database::memory()?);
+            let home = tempfile::tempdir().expect("创建关闭恢复 Home");
+            let profile_id = format!("issue19-disable-{phase}");
+            let old_listener_token = "issue19-disable-proven-old-token";
+            let new_listener_token = "issue19-disable-current-new-token";
+            let home_config = Arc::new(CodexHomeConfigService::system());
+            prepare_enabled_profile_home(
+                db.as_ref(),
+                home_config.as_ref(),
+                home.path(),
+                &profile_id,
+                16_019,
+                old_listener_token,
+            )?;
+            let mut route = db
+                .get_codex_profile_route(&profile_id)?
+                .expect("已启用路由存在");
+            let before = RouteRecoverySnapshot::from_route(&route, vec![]);
+            let mut target = before.clone();
+            target.enabled = false;
+            route.recovery_json = Some(
+                serde_json::to_string(&RouteRecoveryRecord {
+                    operation: CODEX_ROUTE_RECOVERY_OPERATION_DISABLE.to_string(),
+                    before,
+                    target,
+                    phase: phase.to_string(),
+                    last_error: None,
+                    reconcile: None,
+                })
+                .expect("编码关闭恢复记录"),
+            );
+            db.save_codex_profile_route(&route)?;
+            let runtime = Arc::new(RecoveryRuntime {
+                healthy: true,
+                stop_fails: AtomicBool::new(false),
+                reject_new_requests_calls: AtomicUsize::new(0),
+            });
+            let manager = CodexRouteManager::new(
+                db.clone(),
+                home_config,
+                Arc::new(ProfileTokenMapStore {
+                    tokens: HashMap::from([(profile_id.clone(), new_listener_token.to_string())]),
+                    reads: Mutex::new(HashMap::new()),
+                }),
+                Arc::new(FakeFactory),
+            );
+            manager.track_runtime(profile_id.clone(), runtime.clone())?;
+
+            manager.recover_pending_locked(&profile_id).await?;
+
+            let restored = fs::read_to_string(codex_config_path_for_home(home.path()))
+                .expect("读取关闭恢复后的 Home");
+            assert!(restored.contains("base_url = \"https://example.com/v1\""));
+            assert!(restored.contains("experimental_bearer_token = \"upstream-token\""));
+            assert!(!restored.contains(old_listener_token));
+            assert!(!restored.contains(new_listener_token));
+            let recovered = db
+                .get_codex_profile_route(&profile_id)?
+                .expect("关闭恢复后的路由存在");
+            assert!(!recovered.enabled, "phase={phase}");
+            assert!(recovered.live_backup_json.is_none(), "phase={phase}");
+            assert!(recovered.recovery_json.is_none(), "phase={phase}");
+            assert!(manager.status(&profile_id).await.is_err(), "phase={phase}");
+            assert_eq!(
+                runtime.reject_new_requests_calls.load(Ordering::SeqCst),
+                1,
+                "phase={phase}"
+            );
+        }
         Ok(())
     }
 

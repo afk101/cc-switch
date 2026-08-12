@@ -170,6 +170,8 @@ struct CodexRouteBackup {
     previous_live_backup: Option<Box<CodexRouteBackup>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_backup: Option<Box<CodexRouteBackup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_restore_fingerprint: Option<String>,
 }
 
 /// 路由生命周期写入模型目录前持久化的精确文件前态。
@@ -874,6 +876,7 @@ impl CodexHomeConfigService {
         backup_json: Option<&str>,
         listen_port: u16,
         listener_token: &str,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
     ) -> Result<String, AppError> {
         let Some(backup_json) = backup_json else {
             let current_proof = plan
@@ -901,15 +904,59 @@ impl CodexHomeConfigService {
             plan.previous.content.as_deref(),
             backup_json,
             listen_port,
-            listener_token,
+            proven_previous_listener_token
+                .map(|token| token.0.as_str())
+                .unwrap_or(listener_token),
         )?;
         let previous_fingerprint = fingerprint_content(previous_content.as_deref());
-        serialize_route_backup(
+        serialize_route_backup_with_redaction_token(
             previous_content,
             previous_fingerprint,
             &plan.target_content,
             &plan.target_fingerprint,
+            proven_previous_listener_token
+                .map(|token| token.0.as_str())
+                .unwrap_or(listener_token),
         )
+    }
+
+    /// 将即将嵌入组合备份的历史 live backup 升级为无可逆 listener token 的当前格式。
+    pub fn sanitize_route_backup_for_switch_embedding(
+        &self,
+        backup_json: &str,
+        current_plan: &CodexRouteConfigPlan,
+        listener_token: &str,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
+    ) -> Result<String, AppError> {
+        let ownership_token = proven_previous_listener_token
+            .map(|token| token.0.as_str())
+            .unwrap_or(listener_token);
+        let mut backup = Self::decode_route_backup(backup_json)?;
+        let resolved_origin = resolve_previous_token_origin(&backup, ownership_token)?;
+        let redacted =
+            if backup.previous_token_state == CodexRouteBackupTokenState::ListenerTokenReference {
+                CodexRedactedPreviousToken {
+                    content: backup.previous_content,
+                    state: CodexRouteBackupTokenState::ListenerTokenReference,
+                    origin: resolved_origin,
+                }
+            } else {
+                redact_previous_listener_token(backup.previous_content, ownership_token)?
+            };
+        let current_content = current_plan.previous.content.as_deref().ok_or_else(|| {
+            AppError::Config("Codex Profile 切换缺少当前 Home，无法升级历史备份".to_string())
+        })?;
+        backup.version = CODEX_ROUTE_BACKUP_VERSION;
+        backup.previous_content = redacted.content;
+        backup.previous_token_state = redacted.state;
+        backup.previous_token_origin = redacted.origin;
+        backup.target_fingerprint = current_plan.previous.fingerprint.clone();
+        backup.ownership_proof = Some(build_route_ownership_proof(current_content)?);
+        // 已完成的 live backup 不应携带上一轮生命周期的瞬态嵌套状态。
+        backup.model_catalog = None;
+        backup.previous_live_backup = None;
+        backup.operation_backup = None;
+        serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
     /// 构造显式切换基线并持久化同一 snapshot 的模型目录前态。
@@ -920,18 +967,41 @@ impl CodexHomeConfigService {
         backup_json: Option<&str>,
         listen_port: u16,
         listener_token: &str,
+        proven_previous_listener_token: Option<&CodexProvenPreviousListenerToken>,
     ) -> Result<String, AppError> {
-        let backup =
-            self.serialize_explicit_switch_backup(plan, backup_json, listen_port, listener_token)?;
+        let backup = self.serialize_explicit_switch_backup(
+            plan,
+            backup_json,
+            listen_port,
+            listener_token,
+            proven_previous_listener_token,
+        )?;
         let backup = self.attach_catalog_backup(&backup, catalog_plan)?;
         let mut backup = Self::decode_route_backup(&backup)?;
         backup.previous_live_backup = backup_json
+            .map(|backup_json| {
+                self.sanitize_route_backup_for_switch_embedding(
+                    backup_json,
+                    plan,
+                    listener_token,
+                    proven_previous_listener_token,
+                )
+            })
+            .transpose()?
+            .as_deref()
             .map(Self::decode_route_backup)
             .transpose()?
             .map(Box::new);
-        backup.operation_backup = Some(Box::new(Self::decode_route_backup(
-            &self.serialize_backup(plan)?,
-        )?));
+        let operation_backup = serialize_route_backup_with_redaction_token(
+            plan.previous.content.clone(),
+            plan.previous.fingerprint.clone(),
+            &plan.target_content,
+            &plan.target_fingerprint,
+            proven_previous_listener_token
+                .map(|token| token.0.as_str())
+                .unwrap_or(listener_token),
+        )?;
+        backup.operation_backup = Some(Box::new(Self::decode_route_backup(&operation_backup)?));
         serde_json::to_string(&backup).map_err(|source| AppError::JsonSerialize { source })
     }
 
@@ -1078,7 +1148,10 @@ impl CodexHomeConfigService {
                 )?;
                 let restored = document.to_string().into_bytes();
                 ensure_fingerprint(
-                    &backup.previous_fingerprint,
+                    backup
+                        .reference_restore_fingerprint
+                        .as_deref()
+                        .unwrap_or(&backup.previous_fingerprint),
                     &fingerprint_content(Some(&restored)),
                 )?;
                 Some(restored)
@@ -1990,13 +2063,53 @@ fn serialize_route_backup(
     target_content: &[u8],
     target_fingerprint: &str,
 ) -> Result<String, AppError> {
-    let ownership_proof = build_route_ownership_proof(target_content)?;
     let target_text = std::str::from_utf8(target_content)
         .map_err(|error| AppError::Config(format!("Codex Profile 路由目标不是 UTF-8: {error}")))?;
     let listener_token =
         extract_active_codex_route_string(target_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
             .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
-    let redacted = redact_previous_listener_token(previous_content, &listener_token)?;
+    serialize_route_backup_with_redaction_token(
+        previous_content,
+        previous_fingerprint,
+        target_content,
+        target_fingerprint,
+        &listener_token,
+    )
+}
+
+/// 使用单独的已证明旧 token 脱敏恢复正文，同时仍以目标正文生成当前 ownership proof。
+fn serialize_route_backup_with_redaction_token(
+    previous_content: Option<Vec<u8>>,
+    previous_fingerprint: String,
+    target_content: &[u8],
+    target_fingerprint: &str,
+    redaction_token: &str,
+) -> Result<String, AppError> {
+    let ownership_proof = build_route_ownership_proof(target_content)?;
+    let target_text = std::str::from_utf8(target_content)
+        .map_err(|error| AppError::Config(format!("Codex Profile 路由目标不是 UTF-8: {error}")))?;
+    let target_listener_token =
+        extract_active_codex_route_string(target_text, CODEX_ROUTE_FIELD_BEARER_TOKEN)
+            .ok_or_else(|| AppError::Config("Codex Profile 路由目标缺少本地凭证".to_string()))?;
+    let redacted = redact_previous_listener_token(previous_content, redaction_token)?;
+    let reference_restore_fingerprint =
+        if redacted.state == CodexRouteBackupTokenState::ListenerTokenReference {
+            let content = redacted.content.as_deref().ok_or_else(|| {
+                AppError::Config("Codex Profile 路由 token 引用缺少恢复正文".to_string())
+            })?;
+            let origin = redacted.origin.as_ref().ok_or_else(|| {
+                AppError::Config("Codex Profile 路由 token 引用缺少来源路径".to_string())
+            })?;
+            let mut document = parse_codex_document(content, "接管前")?;
+            apply_route_field_state(
+                &mut document,
+                &token_origin_path(origin),
+                &CodexRouteFieldState::Present(toml_edit::value(&target_listener_token)),
+            )?;
+            Some(fingerprint_content(Some(document.to_string().as_bytes())))
+        } else {
+            None
+        };
     serde_json::to_string(&CodexRouteBackup {
         version: CODEX_ROUTE_BACKUP_VERSION,
         previous_content: redacted.content,
@@ -2008,6 +2121,7 @@ fn serialize_route_backup(
         model_catalog: None,
         previous_live_backup: None,
         operation_backup: None,
+        reference_restore_fingerprint,
     })
     .map_err(|source| AppError::JsonSerialize { source })
 }
@@ -3358,6 +3472,7 @@ experimental_bearer_token = "{listener_token}"
                         Some(&future),
                         15_722,
                         listener_token,
+                        None,
                     )
                     .map(|_| ()),
                 "startup" => service
@@ -3694,6 +3809,70 @@ experimental_bearer_token = "external-token"
             "model = \"before\"\n"
         );
         assert_eq!(plan.previous.fingerprint, previous_fingerprint);
+        Ok(())
+    }
+
+    /// 手工 v1/v2 live backup 被嵌入组合备份前必须使用已证明旧 token 脱敏升级。
+    #[test]
+    fn switch_embedding_sanitizes_manual_v1_and_v2_backups() -> Result<(), AppError> {
+        let temp_dir = tempfile::tempdir().expect("创建旧备份测试目录");
+        let home = temp_dir.path().join("home");
+        fs::create_dir_all(&home).expect("创建 Home");
+        let old_token = "issue19-home-old-listener-token";
+        let new_token = "issue19-home-new-listener-token";
+        let current = format!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:16019/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_token}\"\n"
+        );
+        let previous = format!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_token}\"\n"
+        );
+        fs::write(codex_config_path_for_home(&home), &current).expect("写入旧路由 Home");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_profile_route_plan(&home, 16_019, None, new_token)?;
+        let proven = CodexProvenPreviousListenerToken(old_token.to_string());
+
+        for version in [
+            CODEX_ROUTE_LEGACY_BACKUP_VERSION,
+            CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION,
+        ] {
+            let mut backup = serde_json::json!({
+                "version": version,
+                "previous_content": previous.as_bytes(),
+                "previous_fingerprint": "manual-previous",
+                "target_fingerprint": plan.previous_fingerprint(),
+            });
+            if version == CODEX_ROUTE_OWNERSHIP_PROOF_BACKUP_VERSION {
+                backup["ownership_proof"] = serde_json::json!({
+                    "active_provider_id": "custom",
+                    "base_url": "http://127.0.0.1:16019/v1",
+                    "wire_api": "responses",
+                    "token_digest": route_token_digest(old_token),
+                });
+            }
+            let sanitized = service.sanitize_route_backup_for_switch_embedding(
+                &serde_json::to_string(&backup).expect("编码手工旧备份"),
+                &plan,
+                new_token,
+                Some(&proven),
+            )?;
+            let sanitized: serde_json::Value =
+                serde_json::from_str(&sanitized).expect("解析升级备份");
+            let decoded: Vec<u8> = serde_json::from_value(sanitized["previous_content"].clone())
+                .expect("解码升级正文");
+            assert_eq!(sanitized["version"], CODEX_ROUTE_BACKUP_VERSION);
+            assert_eq!(
+                sanitized["previous_token_state"],
+                "listener_token_reference"
+            );
+            assert!(!decoded
+                .windows(old_token.len())
+                .any(|bytes| bytes == old_token.as_bytes()));
+            assert!(!decoded
+                .windows(new_token.len())
+                .any(|bytes| bytes == new_token.as_bytes()));
+            assert!(!sanitized.to_string().contains(old_token));
+            assert!(!sanitized.to_string().contains(new_token));
+        }
         Ok(())
     }
 
