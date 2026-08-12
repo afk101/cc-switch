@@ -1344,6 +1344,22 @@ impl CodexRouteManager {
             .home_config
             .apply_profile_enable_catalog_plan(&catalog_plan)
         {
+            if switch_origin_route.home_ownership == CodexHomeOwnership::External {
+                let compensation_error = self
+                    .restore_switch_and_catalog_locked(
+                        profile_id,
+                        &switch_origin_route,
+                        &old_failovers,
+                        old_snapshot,
+                        &route_plan,
+                        &catalog_plan,
+                    )
+                    .await;
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
+            }
             self.persist_operation_error(
                 profile_id,
                 CODEX_ROUTE_RECOVERY_PHASE_PREPARED,
@@ -1352,16 +1368,32 @@ impl CodexRouteManager {
             return Err(error);
         }
         if let Err(error) = self.home_config.apply_route_plan(&route_plan) {
-            let mut compensation_errors = self
-                .home_config
-                .restore_profile_enable_catalog_plan(&catalog_plan)
-                .err()
-                .into_iter()
-                .collect::<Vec<_>>();
-            if let Err(persist_error) = self.persistence.save_route(&switch_origin_route) {
-                compensation_errors.push(persist_error);
+            if switch_origin_route.home_ownership == CodexHomeOwnership::Managed {
+                let mut compensation_errors = self
+                    .home_config
+                    .restore_profile_enable_catalog_plan(&catalog_plan)
+                    .err()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if let Err(persist_error) = self.persistence.save_route(&switch_origin_route) {
+                    compensation_errors.push(persist_error);
+                }
+                let compensation_error = Self::combine_compensation_errors(compensation_errors);
+                return Err(Self::compensation_failure_error(
+                    &error,
+                    compensation_error.as_ref(),
+                ));
             }
-            let compensation_error = Self::combine_compensation_errors(compensation_errors);
+            let compensation_error = self
+                .restore_switch_and_catalog_locked(
+                    profile_id,
+                    &switch_origin_route,
+                    &old_failovers,
+                    old_snapshot,
+                    &route_plan,
+                    &catalog_plan,
+                )
+                .await;
             return Err(Self::compensation_failure_error(
                 &error,
                 compensation_error.as_ref(),
@@ -2877,17 +2909,27 @@ impl CodexRouteManager {
         if let Err(error) = self.home_config.restore(route_plan) {
             errors.push(error);
         }
-        if let Err(error) = self
-            .restore_switch_locked(profile_id, route, failovers, old_snapshot)
-            .await
-        {
-            errors.push(error);
+        if route.home_ownership == CodexHomeOwnership::Managed {
+            if let Err(error) = self
+                .restore_switch_locked(profile_id, route, failovers, old_snapshot.clone())
+                .await
+            {
+                errors.push(error);
+            }
         }
         if let Err(error) = self
             .home_config
             .restore_model_catalog_projection_plan(catalog_plan)
         {
             errors.push(error);
+        }
+        if route.home_ownership == CodexHomeOwnership::External && errors.is_empty() {
+            if let Err(error) = self
+                .restore_switch_locked(profile_id, route, failovers, old_snapshot)
+                .await
+            {
+                errors.push(error);
+            }
         }
         Self::combine_compensation_errors(errors)
     }
@@ -3241,6 +3283,25 @@ impl CodexRouteManager {
                 .map_err(Self::recovery_unconverged_error)?;
         }
         let original = recovery.before;
+        if recovery.operation == CODEX_ROUTE_RECOVERY_OPERATION_SWITCH
+            && route.home_ownership == CodexHomeOwnership::External
+        {
+            let external_origin = CodexProfileRoute {
+                current_provider_id: original.current_provider_id,
+                enabled: original.enabled,
+                home_ownership: CodexHomeOwnership::External,
+                live_backup_json: None,
+                ..route
+            };
+            return self
+                .converge_failed_external_switch_locked(
+                    profile_id,
+                    &external_origin,
+                    &original.failover_ids,
+                )
+                .await
+                .map_err(Self::recovery_unconverged_error);
+        }
         let provider_id = original.current_provider_id.as_deref().ok_or_else(|| {
             Self::recovery_unconverged_error(AppError::InvalidInput(
                 "补偿记录缺少原始供应商".to_string(),
@@ -3487,6 +3548,11 @@ impl CodexRouteManager {
         failovers: &[String],
         old_snapshot: CodexRouteProviderSnapshot,
     ) -> Result<(), AppError> {
+        if route.home_ownership == CodexHomeOwnership::External {
+            return self
+                .converge_failed_external_switch_locked(profile_id, route, failovers)
+                .await;
+        }
         let current = self.persistence.get_route(profile_id)?.ok_or_else(|| {
             AppError::InvalidInput("Codex Profile 路由不存在，无法补偿切换".to_string())
         })?;
@@ -3512,6 +3578,57 @@ impl CodexRouteManager {
         restoring.last_error = None;
         restoring.updated_at = Utc::now().timestamp_millis();
         self.persistence.save_route(&restoring)
+    }
+
+    /// 将 External 起点的失败切换静默收敛为关闭态，并彻底停止旧运行时。
+    async fn converge_failed_external_switch_locked(
+        &self,
+        profile_id: &str,
+        origin_route: &CodexProfileRoute,
+        failovers: &[String],
+    ) -> Result<(), AppError> {
+        let current = self.persistence.get_route(profile_id)?.ok_or_else(|| {
+            AppError::InvalidInput("Codex Profile 路由不存在，无法收敛 External 切换".to_string())
+        })?;
+        let persisted_recovery = current.recovery_json.as_deref().ok_or_else(|| {
+            AppError::InvalidInput(
+                "Codex Profile 缺少切换补偿记录，无法安全关闭 External 路由".to_string(),
+            )
+        })?;
+        let recovery: RouteRecoveryRecord =
+            serde_json::from_str(persisted_recovery).map_err(|_| {
+                AppError::InvalidInput(
+                    "Codex Profile 切换补偿记录无效，无法安全关闭 External 路由".to_string(),
+                )
+            })?;
+        if recovery.operation != CODEX_ROUTE_RECOVERY_OPERATION_SWITCH {
+            return Err(AppError::InvalidInput(
+                "Codex Profile 当前补偿记录不是供应商切换".to_string(),
+            ));
+        }
+        let runtime = self
+            .runtimes
+            .lock()
+            .map_err(|error| AppError::Lock(error.to_string()))?
+            .get(profile_id)
+            .cloned();
+        if let Some(runtime) = runtime {
+            Self::reject_new_requests_and_stop_runtime(runtime)
+                .await
+                .map_err(AppError::Message)?;
+        }
+        self.persistence.replace_failovers(profile_id, failovers)?;
+        let disabled = CodexProfileRoute {
+            enabled: false,
+            home_ownership: CodexHomeOwnership::External,
+            live_backup_json: None,
+            recovery_json: None,
+            last_error: None,
+            updated_at: Utc::now().timestamp_millis(),
+            ..origin_route.clone()
+        };
+        self.persistence.save_route(&disabled)?;
+        self.remove_runtime(profile_id)
     }
 
     /// 将补偿记录编码到路由字段；编码失败不应开始任何不可逆变更。
@@ -8206,7 +8323,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             token_store,
             Arc::new(FakeFactory),
         );
-        restarted.track_runtime(profile_id.to_string(), runtime)?;
+        restarted.track_runtime(profile_id.to_string(), runtime.clone())?;
         restarted.recover_pending_locked(profile_id).await?;
         assert_eq!(
             fs::read_to_string(&config_path).expect("读取恢复后的 External Home"),
@@ -8215,17 +8332,22 @@ experimental_bearer_token = "PROXY_MANAGED"
         let recovered = db
             .get_codex_profile_route(profile_id)?
             .expect("恢复后的路由存在");
-        assert!(recovered.enabled);
+        assert!(!recovered.enabled);
         assert_eq!(recovered.home_ownership, CodexHomeOwnership::External);
         assert!(recovered.live_backup_json.is_none());
         assert!(recovered.recovery_json.is_none());
+        assert!(recovered.last_error.is_none());
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 1);
+        assert!(restarted.runtime(profile_id).is_err());
 
         restarted
-            .switch_provider(profile_id, new_provider_id, vec![])
+            .enable(profile_id, new_provider_id, vec![])
             .await?;
         let switched = db
             .get_codex_profile_route(profile_id)?
             .expect("显式接管后的路由存在");
+        assert!(switched.enabled);
         assert_eq!(switched.home_ownership, CodexHomeOwnership::Managed);
         let fresh_backup = switched.live_backup_json.expect("显式接管的新基线存在");
         let fresh_value: serde_json::Value =
@@ -8279,10 +8401,11 @@ experimental_bearer_token = "PROXY_MANAGED"
             .db
             .get_codex_profile_route(&fixture.profile_id)?
             .expect("补偿后的路由存在");
-        assert!(recovered.enabled);
+        assert!(!recovered.enabled);
         assert_eq!(recovered.home_ownership, CodexHomeOwnership::External);
         assert!(recovered.live_backup_json.is_none());
         assert!(recovered.recovery_json.is_none());
+        assert!(recovered.last_error.is_none());
         assert_eq!(
             recovered.current_provider_id.as_deref(),
             Some(fixture.old_provider_id.as_str())
@@ -8293,9 +8416,9 @@ experimental_bearer_token = "PROXY_MANAGED"
                 .list_codex_profile_failovers(&fixture.profile_id)?,
             vec![fixture.old_failover_id.clone()]
         );
-        let providers = fixture.runtime.snapshot.lock().await.providers();
-        assert_eq!(providers[0].id, fixture.old_provider_id);
-        assert_eq!(providers[1].id, fixture.old_failover_id);
+        assert_eq!(fixture.runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 1);
+        assert!(manager.runtime(&fixture.profile_id).is_err());
         let persisted = serde_json::to_value(&recovered).expect("编码补偿后的路由");
         for token in [
             fixture.old_listener_token.as_bytes(),
@@ -8370,7 +8493,6 @@ experimental_bearer_token = "PROXY_MANAGED"
             fixture.token_store.clone(),
             Arc::new(FakeFactory),
         );
-        restarted.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
         restarted
             .with_profile_metadata_lock(&fixture.profile_id, |_| Ok(()))
             .await?;
@@ -8383,10 +8505,11 @@ experimental_bearer_token = "PROXY_MANAGED"
             .db
             .get_codex_profile_route(&fixture.profile_id)?
             .expect("重启恢复后的路由存在");
-        assert!(recovered.enabled);
+        assert!(!recovered.enabled);
         assert_eq!(recovered.home_ownership, CodexHomeOwnership::External);
         assert!(recovered.live_backup_json.is_none());
         assert!(recovered.recovery_json.is_none());
+        assert!(recovered.last_error.is_none());
         assert!(
             !(recovered.enabled
                 && recovered.home_ownership == CodexHomeOwnership::Managed
@@ -8402,9 +8525,193 @@ experimental_bearer_token = "PROXY_MANAGED"
                 .list_codex_profile_failovers(&fixture.profile_id)?,
             vec![fixture.old_failover_id.clone()]
         );
+        assert_eq!(fixture.runtime.rejects.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 0);
+        assert!(restarted.runtime(&fixture.profile_id).is_err());
+        Ok(())
+    }
+
+    /// External 起点切换失败后必须静默停接并收敛为关闭态。
+    #[tokio::test]
+    async fn external_switch_failure_converges_to_disabled_external_without_runtime(
+    ) -> Result<(), AppError> {
+        let fixture = prepare_external_switch_tail_fixture("issue22-failure", 16_123)?;
+        let persistence = Arc::new(SwitchTailFailingPersistence {
+            db: fixture.db.clone(),
+            failure_point: SwitchTailSaveFailurePoint::FailoversPhaseAdvance,
+            failed: AtomicBool::new(false),
+        });
+        let manager = CodexRouteManager::new(
+            persistence.clone(),
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("External 起点切换失败必须返回错误");
+
+        assert!(persistence.failed.load(Ordering::SeqCst));
+        assert_eq!(
+            fs::read(&fixture.config_path).expect("读取失败补偿后的 External Home"),
+            fixture.external_home
+        );
+        let converged = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("失败补偿后的路由存在");
+        assert!(!converged.enabled);
+        assert_eq!(converged.home_ownership, CodexHomeOwnership::External);
+        assert!(converged.live_backup_json.is_none());
+        assert!(converged.recovery_json.is_none());
+        assert!(converged.last_error.is_none());
+        assert_eq!(
+            converged.current_provider_id.as_deref(),
+            Some(fixture.old_provider_id.as_str())
+        );
+        assert_eq!(
+            fixture
+                .db
+                .list_codex_profile_failovers(&fixture.profile_id)?,
+            vec![fixture.old_failover_id.clone()]
+        );
+        assert_eq!(fixture.runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 1);
+        assert!(manager.runtime(&fixture.profile_id).is_err());
+        let persisted = serde_json::to_value(&converged).expect("编码关闭后的 External 路由");
+        for token in [
+            fixture.old_listener_token.as_bytes(),
+            fixture.new_listener_token.as_bytes(),
+        ] {
+            assert!(!json_contains_reversible_secret(&persisted, token));
+        }
+        Ok(())
+    }
+
+    /// External 切换崩溃后，新 manager 必须恢复到同一关闭稳定态。
+    #[tokio::test]
+    async fn external_switch_crash_recovery_converges_to_disabled_external_without_runtime(
+    ) -> Result<(), AppError> {
+        let fixture = prepare_external_switch_tail_fixture("issue22-recovery", 16_124)?;
+        let persistence = Arc::new(SwitchTailFailingPersistence {
+            db: fixture.db.clone(),
+            failure_point: SwitchTailSaveFailurePoint::FinalClear,
+            failed: AtomicBool::new(false),
+        });
+        let manager = CodexRouteManager::new(
+            persistence.clone(),
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await
+            .expect_err("最终 clear 失败必须留下可恢复记录");
+
+        let restarted = CodexRouteManager::new(
+            fixture.db.clone(),
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+        restarted
+            .with_profile_metadata_lock(&fixture.profile_id, |_| Ok(()))
+            .await?;
+
+        assert_eq!(
+            fs::read(&fixture.config_path).expect("读取崩溃恢复后的 External Home"),
+            fixture.external_home
+        );
+        let converged = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("崩溃恢复后的路由存在");
+        assert!(!converged.enabled);
+        assert_eq!(converged.home_ownership, CodexHomeOwnership::External);
+        assert!(converged.live_backup_json.is_none());
+        assert!(converged.recovery_json.is_none());
+        assert!(converged.last_error.is_none());
+        assert_eq!(
+            converged.current_provider_id.as_deref(),
+            Some(fixture.old_provider_id.as_str())
+        );
+        assert_eq!(
+            fixture
+                .db
+                .list_codex_profile_failovers(&fixture.profile_id)?,
+            vec![fixture.old_failover_id.clone()]
+        );
+        assert_eq!(fixture.runtime.rejects.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 0);
+        assert!(restarted.runtime(&fixture.profile_id).is_err());
+        Ok(())
+    }
+
+    /// External 起点的显式切换成功时仍必须提交新的 Managed 接管。
+    #[tokio::test]
+    async fn successful_external_switch_commits_enabled_managed_route_and_runtime(
+    ) -> Result<(), AppError> {
+        let fixture = prepare_external_switch_tail_fixture("issue22-success", 16_125)?;
+        let manager = CodexRouteManager::new(
+            fixture.db.clone(),
+            fixture.home_config.clone(),
+            fixture.token_store.clone(),
+            Arc::new(FakeFactory),
+        );
+        manager.track_runtime(fixture.profile_id.clone(), fixture.runtime.clone())?;
+
+        manager
+            .switch_provider(
+                &fixture.profile_id,
+                &fixture.new_provider_id,
+                vec![fixture.new_failover_id.clone()],
+            )
+            .await?;
+
+        let switched = fixture
+            .db
+            .get_codex_profile_route(&fixture.profile_id)?
+            .expect("成功切换后的路由存在");
+        assert!(switched.enabled);
+        assert_eq!(switched.home_ownership, CodexHomeOwnership::Managed);
+        assert!(switched.live_backup_json.is_some());
+        assert!(switched.recovery_json.is_none());
+        assert!(switched.last_error.is_none());
+        assert_eq!(
+            switched.current_provider_id.as_deref(),
+            Some(fixture.new_provider_id.as_str())
+        );
+        assert_eq!(
+            fixture
+                .db
+                .list_codex_profile_failovers(&fixture.profile_id)?,
+            vec![fixture.new_failover_id.clone()]
+        );
+        assert_eq!(fixture.runtime.rejects.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.runtime.stops.load(Ordering::SeqCst), 0);
         let providers = fixture.runtime.snapshot.lock().await.providers();
-        assert_eq!(providers[0].id, fixture.old_provider_id);
-        assert_eq!(providers[1].id, fixture.old_failover_id);
+        assert_eq!(providers[0].id, fixture.new_provider_id);
+        assert_eq!(providers[1].id, fixture.new_failover_id);
+        let persisted = serde_json::to_value(&switched).expect("编码成功切换后的路由");
+        for token in [
+            fixture.old_listener_token.as_bytes(),
+            fixture.new_listener_token.as_bytes(),
+        ] {
+            assert!(!json_contains_reversible_secret(&persisted, token));
+        }
         Ok(())
     }
 
@@ -12215,7 +12522,7 @@ keep = true
         Ok(())
     }
 
-    /// 故障转移列表保存失败时，运行时回滚且数据库保留可拒绝的切换操作记录。
+    /// External 切换的故障转移恢复持续失败时，停接并保留可重试操作记录。
     #[tokio::test]
     async fn switching_failover_save_failure_keeps_recovery_and_rejects_next_mutation(
     ) -> Result<(), AppError> {
@@ -12255,10 +12562,11 @@ keep = true
             }),
             Arc::new(FakeFactory),
         );
-        let runtime = Arc::new(FakeRuntime {
-            provider: AsyncMutex::new("provider-profile-a".to_string()),
-            port: 16001,
-        });
+        let runtime = snapshot_tracking_runtime(
+            db.get_provider_by_id("provider-profile-a", AppType::Codex.as_str())?
+                .expect("切换前供应商存在"),
+            vec![],
+        );
         manager
             .runtimes
             .lock()
@@ -12269,7 +12577,8 @@ keep = true
             .switch_provider("profile-a", "provider-new", vec![])
             .await
             .is_err());
-        assert_eq!(*runtime.provider.lock().await, "provider-profile-a");
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 1);
         assert_eq!(
             fs::read_to_string(config_path).expect("读取补偿后的 Home"),
             latest_before_switch
@@ -12284,11 +12593,16 @@ keep = true
             recovery["phase"],
             CODEX_ROUTE_RECOVERY_PHASE_SWITCH_ROUTE_SAVED
         );
-        assert!(recovery["last_error"].is_string());
+        assert!(recovery["last_error"].is_null());
+        assert!(route.enabled);
+        assert_eq!(route.home_ownership, CodexHomeOwnership::External);
+        assert!(route.last_error.is_none());
         assert!(manager
             .switch_provider("profile-a", "provider-new", vec![])
             .await
             .is_err());
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 2);
         Ok(())
     }
 
