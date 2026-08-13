@@ -30,6 +30,7 @@ pub enum LogExportError {
 #[derive(Debug)]
 struct LogSnapshot {
     source_path: PathBuf,
+    relative_path: PathBuf,
     entry_name: String,
     length: u64,
 }
@@ -37,21 +38,252 @@ struct LogSnapshot {
 /// 为日志归档提供可替换的源文件读取边界。
 pub trait LogFileReader {
     /// 打开一个已快照的日志文件。
-    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Read>>;
+    fn open(&self, relative_path: &Path) -> std::io::Result<Box<dyn Read>>;
 }
 
 /// 生产环境使用的本地文件读取器。
-struct FileSystemLogReader;
+struct FileSystemLogReader {
+    root: fs::File,
+    root_path: PathBuf,
+}
+
+impl FileSystemLogReader {
+    /// 打开并固定日志根目录，后续读取只允许从该根目录解析。
+    fn new(logs_dir: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            root: open_log_root(logs_dir)?,
+            root_path: logs_dir.to_path_buf(),
+        })
+    }
+}
 
 impl LogFileReader for FileSystemLogReader {
-    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Read>> {
-        fs::File::open(path).map(|file| Box::new(file) as Box<dyn Read>)
+    fn open(&self, relative_path: &Path) -> std::io::Result<Box<dyn Read>> {
+        open_log_file_without_links(&self.root, &self.root_path, relative_path)
+            .map(|file| Box::new(file) as Box<dyn Read>)
     }
+}
+
+/// 在 Unix 上以不跟随最终符号链接的方式固定日志根目录。
+#[cfg(unix)]
+fn open_log_root(logs_dir: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(logs_dir)
+        .map_err(normalize_no_follow_error)
+}
+
+/// 在 Unix 上从已固定的根目录逐级打开，杜绝祖先目录与文件链接竞态。
+#[cfg(unix)]
+fn open_log_file_without_links(
+    root: &fs::File,
+    _root_path: &Path,
+    relative_path: &Path,
+) -> std::io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "日志相对路径包含非法组件",
+        ));
+    }
+
+    let mut current_dir = root.try_clone()?;
+    for component in &components[..components.len() - 1] {
+        let Component::Normal(name) = component else {
+            unreachable!("路径组件已经完成校验")
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "日志路径包含 NUL")
+        })?;
+        // SAFETY：目录 fd 在调用期间有效，C 字符串以 NUL 结尾；返回 fd 立即交给 OwnedFd。
+        let fd = unsafe {
+            libc::openat(
+                current_dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(normalize_no_follow_error(std::io::Error::last_os_error()));
+        }
+        // SAFETY：openat 成功返回当前进程独占的新 fd。
+        current_dir = unsafe { fs::File::from(OwnedFd::from_raw_fd(fd)) };
+    }
+
+    let Component::Normal(file_name) = components[components.len() - 1] else {
+        unreachable!("路径组件已经完成校验")
+    };
+    let file_name = CString::new(file_name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "日志路径包含 NUL"))?;
+    // SAFETY：目录 fd 与 C 字符串均有效；O_NOFOLLOW 保证最终组件不是符号链接目标。
+    let fd = unsafe {
+        libc::openat(
+            current_dir.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(normalize_no_follow_error(std::io::Error::last_os_error()));
+    }
+    // SAFETY：openat 成功返回当前进程独占的新 fd。
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    Ok(file)
+}
+
+/// 把链接替换产生的平台错误归一为可静默跳过的快照变化。
+#[cfg(unix)]
+fn normalize_no_follow_error(error: std::io::Error) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        }
+        _ => error,
+    }
+}
+
+/// Windows 上固定日志根目录；候选文件打开后会用同一 handle 验证最终边界。
+#[cfg(windows)]
+fn open_log_root(logs_dir: &Path) -> std::io::Result<fs::File> {
+    open_windows_path(logs_dir, true)
+}
+
+/// Windows 上拒绝最终 reparse point，并基于已打开 handle 验证仍位于固定根目录。
+#[cfg(windows)]
+fn open_log_file_without_links(
+    root: &fs::File,
+    root_path: &Path,
+    relative_path: &Path,
+) -> std::io::Result<fs::File> {
+    let candidate = root_path.join(relative_path);
+    let file = open_windows_path(&candidate, false)?;
+    let root_final = windows_final_path(root)?;
+    let file_final = windows_final_path(&file)?;
+    let root_prefix = format!("{}\\", root_final.trim_end_matches('\\'));
+    if !file_final
+        .to_lowercase()
+        .starts_with(&root_prefix.to_lowercase())
+    {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    Ok(file)
+}
+
+/// Windows 上以 OPEN_REPARSE_POINT 打开路径，并拒绝 reparse point 本身。
+#[cfg(windows)]
+fn open_windows_path(path: &Path, directory: bool) -> std::io::Result<fs::File> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let directory_flag = if directory {
+        FILE_FLAG_BACKUP_SEMANTICS
+    } else {
+        0
+    };
+    // SAFETY：wide 是 NUL 结尾的稳定缓冲区，其余参数均为 Win32 文档允许值。
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | directory_flag,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY：CreateFileW 成功返回当前进程持有的 handle，立即转交给 File 管理。
+    let file = unsafe { fs::File::from_raw_handle(handle as _) };
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY：file handle 有效，info 缓冲区尺寸与请求的信息类匹配。
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    Ok(file)
+}
+
+/// 取得 Windows 已打开 handle 的最终规范路径，用于无竞态边界校验。
+#[cfg(windows)]
+fn windows_final_path(file: &fs::File) -> std::io::Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED,
+    };
+
+    let handle = file.as_raw_handle() as _;
+    // SAFETY：handle 有效；空缓冲区调用用于取得所需 UTF-16 长度。
+    let required =
+        unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, FILE_NAME_NORMALIZED) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut buffer = vec![0_u16; required as usize + 1];
+    // SAFETY：buffer 容量使用上一调用返回值分配，handle 在调用期间有效。
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED,
+        )
+    };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(String::from_utf16_lossy(&buffer[..written as usize]))
 }
 
 /// 将日志目录中的普通文件流式写入目标目录中的 ZIP。
 pub fn export_logs_archive(logs_dir: &Path, target_dir: &Path) -> Result<PathBuf, LogExportError> {
-    export_logs_archive_with_reader(logs_dir, target_dir, &FileSystemLogReader)
+    let reader = match FileSystemLogReader::new(logs_dir) {
+        Ok(reader) => reader,
+        Err(error) if is_transient_source_error(&error) => return Err(LogExportError::NoLogs),
+        Err(error) => return Err(anyhow::Error::from(error).into()),
+    };
+    export_logs_archive_with_reader(logs_dir, target_dir, &reader)
 }
 
 /// 使用指定源文件读取器流式导出日志 ZIP。
@@ -116,10 +348,12 @@ fn collect_directory_snapshots(
             let metadata = entry.metadata().context("无法读取日志文件元数据")?;
             let relative_path = path
                 .strip_prefix(logs_root)
-                .context("日志文件不在日志根目录中")?;
-            let entry_name = archive_entry_name(relative_path);
+                .context("日志文件不在日志根目录中")?
+                .to_path_buf();
+            let entry_name = archive_entry_name(&relative_path);
             snapshots.push(LogSnapshot {
                 source_path: path,
+                relative_path,
                 entry_name,
                 length: metadata.len(),
             });
@@ -164,7 +398,7 @@ fn append_snapshot<R: LogFileReader>(
     archive: &mut zip::ZipWriter<&mut fs::File>,
     reader: &R,
 ) -> AnyhowResult<()> {
-    let mut source = match reader.open(&snapshot.source_path) {
+    let mut source = match reader.open(&snapshot.relative_path) {
         Ok(source) => source,
         Err(error) if is_transient_source_error(&error) => return Ok(()),
         Err(error) => {
@@ -225,9 +459,11 @@ fn archive_entry_name(relative_path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::cell::Cell;
     use std::fs;
     use std::io::{self, Read};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::Duration;
 
@@ -235,7 +471,8 @@ mod tests {
     use zip::ZipArchive;
 
     use super::{
-        export_logs_archive, export_logs_archive_with_reader, LogExportError, LogFileReader,
+        export_logs_archive, export_logs_archive_with_reader, FileSystemLogReader, LogExportError,
+        LogFileReader,
     };
 
     struct PermissionDeniedReader;
@@ -259,6 +496,52 @@ mod tests {
     impl LogFileReader for PermissionDeniedReadOpener {
         fn open(&self, _path: &Path) -> io::Result<Box<dyn Read>> {
             Ok(Box::new(PermissionDeniedOnRead))
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReplaceWithSymlinkReader {
+        delegate: FileSystemLogReader,
+        source_path: PathBuf,
+        source_relative_path: PathBuf,
+        link_target: PathBuf,
+        replaced: Cell<bool>,
+    }
+
+    #[cfg(unix)]
+    impl LogFileReader for ReplaceWithSymlinkReader {
+        fn open(&self, relative_path: &Path) -> io::Result<Box<dyn Read>> {
+            use std::os::unix::fs::symlink;
+
+            if relative_path == self.source_relative_path && !self.replaced.replace(true) {
+                fs::remove_file(&self.source_path)?;
+                symlink(&self.link_target, &self.source_path)?;
+            }
+            self.delegate.open(relative_path)
+        }
+    }
+
+    #[cfg(unix)]
+    struct ReplaceAncestorWithSymlinkReader {
+        delegate: FileSystemLogReader,
+        source_path: PathBuf,
+        source_relative_path: PathBuf,
+        ancestor_path: PathBuf,
+        link_target: PathBuf,
+        replaced: Cell<bool>,
+    }
+
+    #[cfg(unix)]
+    impl LogFileReader for ReplaceAncestorWithSymlinkReader {
+        fn open(&self, relative_path: &Path) -> io::Result<Box<dyn Read>> {
+            use std::os::unix::fs::symlink;
+
+            if relative_path == self.source_relative_path && !self.replaced.replace(true) {
+                debug_assert!(self.source_path.starts_with(&self.ancestor_path));
+                fs::remove_dir_all(&self.ancestor_path)?;
+                symlink(&self.link_target, &self.ancestor_path)?;
+            }
+            self.delegate.open(relative_path)
         }
     }
 
@@ -379,6 +662,68 @@ mod tests {
         assert!(archive.by_name("logs/cc-switch.log").is_ok());
         assert!(archive.by_name("logs/linked-secret.log").is_err());
         assert!(archive.by_name("logs/linked-directory/secret.log").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_a_regular_file_replaced_by_an_external_symbolic_link_after_snapshot() {
+        let app_config_dir = tempdir().expect("创建临时应用配置目录");
+        let download_dir = tempdir().expect("创建临时下载目录");
+        let outside_dir = tempdir().expect("创建目录外临时目录");
+        let logs_dir = app_config_dir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("创建日志目录");
+        let source_path = logs_dir.join("changing.log");
+        fs::write(&source_path, b"original log").expect("写入待替换日志");
+        fs::write(logs_dir.join("stable.log"), b"stable log").expect("写入稳定日志");
+        let outside_secret = outside_dir.path().join("secret.log");
+        fs::write(&outside_secret, b"outside secret").expect("写入目录外秘密");
+        let reader = ReplaceWithSymlinkReader {
+            delegate: FileSystemLogReader::new(&logs_dir).expect("固定日志根目录"),
+            source_path,
+            source_relative_path: PathBuf::from("changing.log"),
+            link_target: outside_secret,
+            replaced: Cell::new(false),
+        };
+
+        let archive_path = export_logs_archive_with_reader(&logs_dir, download_dir.path(), &reader)
+            .expect("链接替换属于瞬时变化，应继续导出");
+        let archive_file = fs::File::open(archive_path).expect("打开导出的 ZIP");
+        let mut archive = ZipArchive::new(archive_file).expect("读取导出的 ZIP");
+
+        assert!(archive.by_name("logs/changing.log").is_err());
+        assert!(archive.by_name("logs/stable.log").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_a_file_whose_ancestor_is_replaced_by_an_external_symbolic_link_after_snapshot() {
+        let app_config_dir = tempdir().expect("创建临时应用配置目录");
+        let download_dir = tempdir().expect("创建临时下载目录");
+        let outside_dir = tempdir().expect("创建目录外临时目录");
+        let logs_dir = app_config_dir.path().join("logs");
+        let ancestor_path = logs_dir.join("nested");
+        fs::create_dir_all(&ancestor_path).expect("创建嵌套日志目录");
+        let source_path = ancestor_path.join("changing.log");
+        fs::write(&source_path, b"original log").expect("写入待替换日志");
+        fs::write(logs_dir.join("stable.log"), b"stable log").expect("写入稳定日志");
+        fs::write(outside_dir.path().join("changing.log"), b"outside secret")
+            .expect("写入目录外秘密");
+        let reader = ReplaceAncestorWithSymlinkReader {
+            delegate: FileSystemLogReader::new(&logs_dir).expect("固定日志根目录"),
+            source_path,
+            source_relative_path: PathBuf::from("nested/changing.log"),
+            ancestor_path,
+            link_target: outside_dir.path().to_path_buf(),
+            replaced: Cell::new(false),
+        };
+
+        let archive_path = export_logs_archive_with_reader(&logs_dir, download_dir.path(), &reader)
+            .expect("祖先链接替换属于瞬时变化，应继续导出");
+        let archive_file = fs::File::open(archive_path).expect("打开导出的 ZIP");
+        let mut archive = ZipArchive::new(archive_file).expect("读取导出的 ZIP");
+
+        assert!(archive.by_name("logs/nested/changing.log").is_err());
+        assert!(archive.by_name("logs/stable.log").is_ok());
     }
 
     #[cfg(unix)]

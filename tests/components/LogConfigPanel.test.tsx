@@ -37,7 +37,8 @@ vi.mock(
   }),
 );
 
-describe("LogConfigPanel" /** 验证日志设置面板的公开交互。 */, () => {
+/** 验证日志设置面板的公开交互。 */
+function verifyLogConfigPanelInteractions() {
   beforeEach(
     /** 重置测试边界并提供默认日志配置。 */
     () => {
@@ -50,14 +51,17 @@ describe("LogConfigPanel" /** 验证日志设置面板的公开交互。 */, () 
     },
   );
 
-  it("导出期间禁止重复触发并在成功后展示完整路径" /** 驱动一次受控完成的日志导出。 */, async () => {
+  /** 驱动一次受控完成的日志导出。 */
+  async function verifySuccessfulExport() {
     const user = userEvent.setup();
     let finishExport: ((path: string) => void) | undefined;
+    /** 保存 Promise 完成函数，供测试显式结束导出。 */
+    function retainExportResolver(resolve: (path: string) => void) {
+      finishExport = resolve;
+    }
     const exportLogs = vi.spyOn(settingsApi, "exportLogs").mockReturnValue(
       /** 保持导出未完成，直到测试显式释放。 */
-      new Promise((resolve) => {
-        finishExport = resolve;
-      }),
+      new Promise(retainExportResolver),
     );
     render(<LogConfigPanel />);
     const exportButton = await screen.findByRole("button", {
@@ -86,7 +90,9 @@ describe("LogConfigPanel" /** 验证日志设置面板的公开交互。 */, () 
         ),
     );
     expect(exportButton).toBeEnabled();
-  });
+  }
+
+  it("导出期间禁止重复触发并在成功后展示完整路径", verifySuccessfulExport);
 
   it.each([
     ["NO_LOGS", "settings.advanced.logConfig.exportNoLogs"],
@@ -114,4 +120,6 @@ describe("LogConfigPanel" /** 验证日志设置面板的公开交互。 */, () 
       expect(exportButton).toBeEnabled();
     },
   );
-});
+}
+
+describe("LogConfigPanel", verifyLogConfigPanelInteractions);

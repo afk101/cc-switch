@@ -189,3 +189,17 @@
 - 聚焦与完整受影响验证：Rust `log_export` 15/15、`LogConfigPanel` 3/3、TypeScript typecheck、`cargo check`、rustfmt、相关 Prettier 均通过。
 - 前端完整套件首次并行运行 751/753：范围外 `scripts/upgrade.test.js` 被 Vitest 收集后出现既有 `ERR_INVALID_URL_SCHEME`，另有 App 集成测试并行污染/超时；未重复同一运行方式，改为单 worker 独立重跑 `tests/integration/App.test.tsx`，7/7 通过。此次修复的组件完整测试已独立通过。
 - 依赖使用当前 worktree 的 `pnpm install --frozen-lockfile` 正常安装，没有创建或复用主 worktree `node_modules` 软链接。
+
+## 第二轮双轴审查修复记录
+
+- 已核对第二轮修复基线为 `455133ae`，并完整复读 AGENTS、CONTRIBUTING、TDD、spec、两条 issues、findings、领域上下文与相关 ADR；本轮继续使用已确认的归档服务公开 seam，不新增面向私有 helper 的测试接口。
+- Standards finding 指向 `LogConfigPanel.test.tsx` 中未紧邻函数表达式的 JSDoc；修复将提取具名 factory/callback，并对本轮涉及的全部 TypeScript/JavaScript 函数表达式做邻接自审。
+- Spec finding 属于 REQ-04/SCN-09：当前枚举阶段的 `file_type` 只能拒绝当时的符号链接，快照后到 `reader.open(path)` 前若普通文件或目录被替换成链接，生产 reader 仍会再次解析路径并可能读取 `logs` 外内容；修复必须让“实际打开”本身拒绝链接，而不能再叠加一次路径元数据检查。
+- 符号链接竞态 RED：新增的文件替换与祖先目录替换测试均证明旧生产读取方式会把 `logs` 外的秘密内容写入 ZIP；测试通过公开 reader seam 在完成快照后、实际打开前精确执行替换。
+- 符号链接竞态 GREEN：Unix 在扫描前固定日志根目录 fd，并以 `openat`、`O_NOFOLLOW` 逐级打开相对路径；Windows 以 `OPEN_REPARSE_POINT` 打开同一 handle，拒绝 reparse point，并用 handle 的最终规范路径验证仍在固定根目录内。两种平台都不依赖“先检查再打开”的可竞态元数据判断。
+- 生产 reader 现在只接收已校验的相对路径；归档清单仍保留完整源路径用于错误上下文，不扩大测试 seam 职责。快照后变成链接统一视作 `NotFound` 并静默跳过，符合既定 best-effort 语义。
+- 本轮 Rust 聚焦验证共 17/17 通过，其中两条竞态测试同时证明变化条目不入包、稳定条目仍保留；日志根链接继续返回稳定 `NO_LOGS`。
+- Windows 全仓交叉检查受既有 `aws-lc`/`ring` 原生依赖阻塞：macOS 环境缺少 MSVC SDK 的 `stdio.h`/`stdlib.h`，失败发生在本次模块编译前。改用已为 Windows target 构建的 `windows-sys` 元数据隔离编译本次 Win32 handle 代码，API、常量与类型检查通过。
+- Standards finding 已通过把说明注释放到 `describe`、`it` 与 `Promise` 回调函数表达式正前方修复；相关组件测试 3/3 通过。
+- Prettier 会把参数位置的注释重新排到字符串参数后，无法稳定满足 JSDoc 邻接要求；最终改为具名 `verifyLogConfigPanelInteractions`、`verifySuccessfulExport` 与 `retainExportResolver` 函数，每个声明正上方均有中文 JSDoc，Prettier 检查与组件测试均通过。
+- 完整 Rust 首次与 `cargo check` 并行运行时出现范围外测试失败且输出被截断；未重复该并行方式，改为安静、串行执行完整库测试，结果 2635 passed / 5 ignored。前端指定 `tests` 与 `src` 的完整 Vitest 套件 753/753、TypeScript typecheck、macOS `cargo check`、rustfmt、Prettier 与 diff check 均通过。
