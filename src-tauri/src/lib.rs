@@ -10,6 +10,7 @@ pub mod codex_profile;
 mod codex_state_db;
 mod commands;
 mod config;
+mod constants;
 mod database;
 mod deeplink;
 mod error;
@@ -1575,6 +1576,7 @@ pub fn run() {
             // app_config_dir override via Store
             commands::get_app_config_dir_override,
             commands::set_app_config_dir_override,
+            commands::export_logs,
             // provider sort order management
             commands::update_providers_sort_order,
             // theirs: config import/export and dialogs

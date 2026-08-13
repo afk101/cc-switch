@@ -411,6 +411,10 @@
         "enabledDescription": "cc-switch.log を制御します。リクエスト使用量記録と crash.log には影響しません",
         "level": "ログレベル",
         "levelDescription": "出力する最小ログレベルを設定",
+        "export": "ログをエクスポート",
+        "exportDescription": "すべてのアプリ診断ログを ZIP ファイルとしてシステムのダウンロードフォルダーに保存します",
+        "exporting": "エクスポート中...",
+        "exportSuccess": "ログをエクスポートしました",
         "levels": {
           "error": "エラー",
           "warn": "警告",

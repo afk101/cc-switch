@@ -6,6 +6,7 @@ import type {
   RemoteSnapshotInfo,
 } from "@/types";
 import type { AppId } from "./types";
+import { LOG_EXPORT_COMMAND } from "@/config/constants";
 
 export interface ConfigTransferResult {
   success: boolean;
@@ -91,6 +92,11 @@ export const settingsApi = {
 
   async openAppConfigFolder(): Promise<void> {
     await invoke("open_app_config_folder");
+  },
+
+  /** 导出当前生效应用配置目录中的日志并返回完整 ZIP 路径。 */
+  async exportLogs(): Promise<string> {
+    return await invoke(LOG_EXPORT_COMMAND);
   },
 
   async getAppConfigDirOverride(): Promise<string | null> {

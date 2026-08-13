@@ -411,6 +411,10 @@
         "enabledDescription": "控制 cc-switch.log；不影響請求用量記錄和 crash.log",
         "level": "日誌層級",
         "levelDescription": "設定輸出的最低日誌層級",
+        "export": "匯出日誌",
+        "exportDescription": "將全部應用程式診斷日誌匯出為 ZIP 檔案並儲存到系統下載目錄",
+        "exporting": "正在匯出...",
+        "exportSuccess": "日誌匯出成功",
         "levels": {
           "error": "錯誤",
           "warn": "警告",

@@ -411,6 +411,10 @@
         "enabledDescription": "控制 cc-switch.log；不影响请求用量记录和 crash.log",
         "level": "日志级别",
         "levelDescription": "设置输出的最低日志级别",
+        "export": "导出日志",
+        "exportDescription": "将全部应用诊断日志导出为 ZIP 文件并保存到系统下载目录",
+        "exporting": "正在导出...",
+        "exportSuccess": "日志导出成功",
         "levels": {
           "error": "错误",
           "warn": "警告",

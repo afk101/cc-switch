@@ -145,3 +145,16 @@
 ## Execution Context
 
 - Review Base Commit: `210ecac8`
+
+## Issue 01 实施记录
+
+- 已确认 Issue 01 仅覆盖正常导出主路径：归档服务、下载目录命令和设置面板三条既定 public seam；桌面回退、空日志、同名冲突、符号链接与失败清理由 Issue 02 处理。
+- TDD 执行将按单条行为 vertical slice 记录 RED 与 GREEN 命令，不针对私有 helper 或内部遍历顺序编写测试。
+- 项目领域文档中的现有 ADR 只约束 Codex Profile 派生状态，与日志导出无冲突；Issue 01 继续使用项目单一 context 的既有术语。
+- 测试规范要求只 mock 系统边界；Rust seam 将使用真实临时文件系统与实际 ZIP，前端 seam 只 mock Tauri invoke 和 toast/i18n 边界。
+- Issue 01 首次 Rust RED 命令被环境中的 Node 可执行文件 `~/.nvm/.../bin/cc` 抢占编译器名称而中止（不支持 clang 的 `-MD`）；后续 Rust 验证显式使用 `/usr/bin/clang` 与 `/usr/bin/ar`，不重复原失败操作。
+- 归档主路径 seam 的首个测试通过真实 `tempfile` 日志树与 `ZipArchive` 观察标准文件名、`logs/` 顶层、嵌套路径和文件内容。
+- 归档服务 RED 为缺少 `export_logs_archive`，GREEN 使用 `io::copy` 流式写入真实 ZIP；命令 seam RED 为缺少 `export_logs_from_directories`，GREEN 证明自定义生效配置目录与下载目录的完整路径结果。
+- 前端 worktree 起初缺少 `node_modules`，已按仓库约束临时链接主 worktree 依赖；首次聚焦命令因 `pnpm test:unit -- <file>` 实际运行全套仍取得目标测试 RED（缺少 `settingsApi.exportLogs`），后续改用 `pnpm exec vitest run <file>` 做真正聚焦验证，完成后必须删除软链接。
+- 设置面板 GREEN 已从公开交互验证：按钮点击后显示导出中并禁用，重复点击不会再次调用后端，成功 toast 展示完整 ZIP 路径，最终恢复可用。
+- Issue 01 最终验证通过：Rust 两条 `log_export::tests`、前端 `LogConfigPanel` 聚焦测试、`cargo check`、`cargo fmt --check`、TypeScript typecheck、Prettier 全前端检查；临时 `node_modules` 软链接已删除。

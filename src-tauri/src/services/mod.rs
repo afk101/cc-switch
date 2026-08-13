@@ -4,6 +4,7 @@ pub mod coding_plan;
 pub mod config;
 pub mod env_checker;
 pub mod env_manager;
+pub mod log_export;
 pub mod mcp;
 pub mod model_fetch;
 pub mod model_pricing;
@@ -34,6 +35,7 @@ pub mod webdav_auto_sync;
 pub mod webdav_sync;
 
 pub use config::ConfigService;
+pub use log_export::export_logs_archive;
 pub use mcp::McpService;
 pub use omo::OmoService;
 pub use prompt::PromptService;

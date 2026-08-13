@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
 import {
   Select,
   SelectContent,
@@ -21,6 +22,7 @@ export function LogConfigPanel() {
     level: "info",
   });
   const [isLoading, setIsLoading] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
 
   useEffect(() => {
     settingsApi
@@ -39,6 +41,22 @@ export function LogConfigPanel() {
       console.error("Failed to save log config:", e);
       toast.error(String(e));
       setConfig(config);
+    }
+  };
+
+  /** 在后台导出日志，并通过消息展示完整保存路径。 */
+  const handleExport = async () => {
+    if (isExporting) return;
+    setIsExporting(true);
+    try {
+      const path = await settingsApi.exportLogs();
+      toast.success(t("settings.advanced.logConfig.exportSuccess"), {
+        description: path,
+      });
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setIsExporting(false);
     }
   };
 
@@ -84,6 +102,27 @@ export function LogConfigPanel() {
             ))}
           </SelectContent>
         </Select>
+      </div>
+
+      <div className="flex items-center justify-between">
+        <div className="space-y-0.5">
+          <Label>{t("settings.advanced.logConfig.export")}</Label>
+          <p className="text-xs text-muted-foreground">
+            {t("settings.advanced.logConfig.exportDescription")}
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          disabled={isExporting}
+          onClick={handleExport}
+        >
+          {t(
+            isExporting
+              ? "settings.advanced.logConfig.exporting"
+              : "settings.advanced.logConfig.export",
+          )}
+        </Button>
       </div>
 
       {/* 日志级别说明 */}

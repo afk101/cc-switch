@@ -49,3 +49,6 @@ export const CODEX_PROVIDER_ROUTE_REQUIREMENTS = {
 
 export type CodexProviderRouteRequirement =
   (typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS)[keyof typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS];
+
+// Tauri 日志导出命令名称
+export const LOG_EXPORT_COMMAND = "export_logs";

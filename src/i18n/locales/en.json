@@ -411,6 +411,10 @@
         "enabledDescription": "Controls cc-switch.log; request usage records and crash.log are unaffected",
         "level": "Log Level",
         "levelDescription": "Set the minimum log level to output",
+        "export": "Export Logs",
+        "exportDescription": "Export all application diagnostic logs to a ZIP file in the system Downloads folder",
+        "exporting": "Exporting...",
+        "exportSuccess": "Logs exported successfully",
         "levels": {
           "error": "Error",
           "warn": "Warning",
