@@ -271,6 +271,7 @@ fn open_windows_relative_path(
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         NtOpenFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT,
     };
     use windows_sys::Win32::Foundation::{
         RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
@@ -314,7 +315,7 @@ fn open_windows_relative_path(
             &attributes,
             &mut io_status,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_OPEN_REPARSE_POINT | type_option,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | type_option,
         )
     };
     if status < 0 {

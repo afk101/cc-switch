@@ -206,3 +206,4 @@
 - 第三轮双轴复审共同指出 Windows `OPEN_REPARSE_POINT` 只约束最终组件，祖先 junction 若仍指向 `logs` 内部会通过最终路径前缀判断，仍违背“不跟随任何链接”；同时字符串小写前缀也不是大小写敏感目录下可靠的安全边界。
 - Windows 最终修复不再重开完整候选路径或比较路径字符串：使用 `NtOpenFile` 的 `RootDirectory` 从已固定根 handle 开始逐组件相对打开，每一级都带 `FILE_OPEN_REPARSE_POINT` 并从同一 handle 查询 reparse 属性；父级 handle 持续持有，因此替换无法改变后续解析锚点。
 - 本机仍缺少 Windows MSVC C 工具链，完整 target check 在范围外 `rquickjs-sys`/`bzip2-sys` 的 `lib.exe` 缺失处失败；未重复该失败方式，改用 Cargo 为 Windows target 生成且启用相同 feature 集合的 `windows-sys 0.61.2` 元数据，隔离编译逐级相对打开代码，类型与 Win32/NT API 签名检查通过。
+- 第四轮 Spec 复审指出 `NtOpenFile` 若缺少同步 I/O create option，返回的异步 handle 不能可靠交给 `std::fs::File` 的同步 `Read`；已在每级相对打开加入 `FILE_SYNCHRONOUS_IO_NONALERT`，与既有 `SYNCHRONIZE` 权限配套，不改变逐级拒绝 reparse point 的安全语义。
