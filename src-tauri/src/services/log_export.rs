@@ -19,6 +19,9 @@ pub enum LogExportError {
     /// 日志目录不存在或不含可归档普通文件。
     #[error("{LOG_EXPORT_NO_LOGS_ERROR}")]
     NoLogs,
+    /// 目标目录无法创建临时输出，可尝试下一个系统目录。
+    #[error(transparent)]
+    TargetUnavailable(anyhow::Error),
     /// 目标目录或 ZIP 写入等整体失败。
     #[error(transparent)]
     Failed(#[from] anyhow::Error),
@@ -31,21 +34,45 @@ struct LogSnapshot {
     length: u64,
 }
 
+/// 为日志归档提供可替换的源文件读取边界。
+pub trait LogFileReader {
+    /// 打开一个已快照的日志文件。
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Read>>;
+}
+
+/// 生产环境使用的本地文件读取器。
+struct FileSystemLogReader;
+
+impl LogFileReader for FileSystemLogReader {
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn Read>> {
+        fs::File::open(path).map(|file| Box::new(file) as Box<dyn Read>)
+    }
+}
+
 /// 将日志目录中的普通文件流式写入目标目录中的 ZIP。
 pub fn export_logs_archive(logs_dir: &Path, target_dir: &Path) -> Result<PathBuf, LogExportError> {
+    export_logs_archive_with_reader(logs_dir, target_dir, &FileSystemLogReader)
+}
+
+/// 使用指定源文件读取器流式导出日志 ZIP。
+pub fn export_logs_archive_with_reader<R: LogFileReader>(
+    logs_dir: &Path,
+    target_dir: &Path,
+    reader: &R,
+) -> Result<PathBuf, LogExportError> {
     let snapshots = collect_log_snapshots(logs_dir)?;
     if snapshots.is_empty() {
         return Err(LogExportError::NoLogs);
     }
 
     let archive_path = available_archive_path(target_dir);
-    let mut temporary_archive = NamedTempFile::new_in(target_dir).with_context(|| {
-        format!(
+    let mut temporary_archive = NamedTempFile::new_in(target_dir).map_err(|error| {
+        LogExportError::TargetUnavailable(anyhow::Error::from(error).context(format!(
             "无法在目标目录创建临时日志导出文件：{}",
             target_dir.display()
-        )
+        )))
     })?;
-    write_archive(temporary_archive.as_file_mut(), &snapshots)?;
+    write_archive(temporary_archive.as_file_mut(), &snapshots, reader)?;
     temporary_archive
         .persist_noclobber(&archive_path)
         .map_err(|error| error.error)
@@ -118,23 +145,33 @@ fn available_archive_path(target_dir: &Path) -> PathBuf {
 }
 
 /// 把固定快照逐个写入 ZIP，并显式完成中央目录。
-fn write_archive(file: &mut fs::File, snapshots: &[LogSnapshot]) -> AnyhowResult<()> {
+fn write_archive<R: LogFileReader>(
+    file: &mut fs::File,
+    snapshots: &[LogSnapshot],
+    reader: &R,
+) -> AnyhowResult<()> {
     let mut archive = zip::ZipWriter::new(file);
     for snapshot in snapshots {
-        append_snapshot(snapshot, &mut archive)?;
+        append_snapshot(snapshot, &mut archive, reader)?;
     }
     archive.finish().context("无法完成日志 ZIP 写入")?;
     Ok(())
 }
 
 /// 以固定缓冲区写入快照长度；源文件瞬时变化时放弃当前条目。
-fn append_snapshot(
+fn append_snapshot<R: LogFileReader>(
     snapshot: &LogSnapshot,
     archive: &mut zip::ZipWriter<&mut fs::File>,
+    reader: &R,
 ) -> AnyhowResult<()> {
-    let mut source = match fs::File::open(&snapshot.source_path) {
+    let mut source = match reader.open(&snapshot.source_path) {
         Ok(source) => source,
-        Err(_) => return Ok(()),
+        Err(error) if is_transient_source_error(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("无法打开日志源文件：{}", snapshot.source_path.display())
+            });
+        }
     };
     archive
         .start_file(&snapshot.entry_name, SimpleFileOptions::default())
@@ -145,9 +182,18 @@ fn append_snapshot(
     while remaining > 0 {
         let read_limit = remaining.min(buffer.len() as u64) as usize;
         let count = match source.read(&mut buffer[..read_limit]) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
                 archive.abort_file().context("无法放弃变化的日志条目")?;
                 return Ok(());
+            }
+            Err(error) if is_transient_source_error(&error) => {
+                archive.abort_file().context("无法放弃变化的日志条目")?;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("无法读取日志源文件：{}", snapshot.source_path.display())
+                });
             }
             Ok(count) => count,
         };
@@ -157,6 +203,14 @@ fn append_snapshot(
         remaining -= count as u64;
     }
     Ok(())
+}
+
+/// 判断源文件错误是否来自快照后的瞬时变化。
+fn is_transient_source_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// 构造使用正斜杠且包含 `logs/` 顶层目录的 ZIP 条目路径。
@@ -172,14 +226,41 @@ fn archive_entry_name(relative_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Read;
+    use std::io::{self, Read};
+    use std::path::Path;
     use std::thread;
     use std::time::Duration;
 
     use tempfile::tempdir;
     use zip::ZipArchive;
 
-    use super::export_logs_archive;
+    use super::{
+        export_logs_archive, export_logs_archive_with_reader, LogExportError, LogFileReader,
+    };
+
+    struct PermissionDeniedReader;
+
+    impl LogFileReader for PermissionDeniedReader {
+        fn open(&self, _path: &Path) -> io::Result<Box<dyn Read>> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    struct PermissionDeniedOnRead;
+
+    impl Read for PermissionDeniedOnRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    struct PermissionDeniedReadOpener;
+
+    impl LogFileReader for PermissionDeniedReadOpener {
+        fn open(&self, _path: &Path) -> io::Result<Box<dyn Read>> {
+            Ok(Box::new(PermissionDeniedOnRead))
+        }
+    }
 
     #[test]
     fn exports_top_level_and_nested_logs_with_portable_paths() {
@@ -405,6 +486,56 @@ mod tests {
                 .count(),
             1,
             "不得留下临时或最终半成品"
+        );
+    }
+
+    #[test]
+    fn fails_when_a_snapshotted_source_file_cannot_be_opened_persistently() {
+        let app_config_dir = tempdir().expect("创建临时应用配置目录");
+        let download_dir = tempdir().expect("创建临时下载目录");
+        let logs_dir = app_config_dir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("创建日志目录");
+        fs::write(logs_dir.join("cc-switch.log"), b"runtime log").expect("写入日志文件");
+
+        let error = export_logs_archive_with_reader(
+            &logs_dir,
+            download_dir.path(),
+            &PermissionDeniedReader,
+        )
+        .expect_err("持续权限错误必须使导出整体失败");
+
+        assert!(matches!(error, LogExportError::Failed(_)));
+        assert_eq!(
+            fs::read_dir(download_dir.path())
+                .expect("读取下载目录")
+                .count(),
+            0,
+            "失败后不得保留半成品"
+        );
+    }
+
+    #[test]
+    fn fails_when_a_snapshotted_source_file_cannot_be_read_persistently() {
+        let app_config_dir = tempdir().expect("创建临时应用配置目录");
+        let download_dir = tempdir().expect("创建临时下载目录");
+        let logs_dir = app_config_dir.path().join("logs");
+        fs::create_dir_all(&logs_dir).expect("创建日志目录");
+        fs::write(logs_dir.join("cc-switch.log"), b"runtime log").expect("写入日志文件");
+
+        let error = export_logs_archive_with_reader(
+            &logs_dir,
+            download_dir.path(),
+            &PermissionDeniedReadOpener,
+        )
+        .expect_err("持续读取错误必须使导出整体失败");
+
+        assert!(matches!(error, LogExportError::Failed(_)));
+        assert_eq!(
+            fs::read_dir(download_dir.path())
+                .expect("读取下载目录")
+                .count(),
+            0,
+            "失败后不得保留半成品"
         );
     }
 }

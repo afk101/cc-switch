@@ -170,3 +170,22 @@
 - 设置面板 RED 证明原实现直接展示后端错误串；GREEN 将 `NO_LOGS` 与通用失败映射到四语本地化消息，并在两种失败后恢复按钮可重试。
 - 前端依赖首次尝试复用旧主工作树 `node_modules` 软链接失败（目标不存在），已立即移除；离线安装因缓存缺包失败后改用正常锁文件安装成功，未重复失败操作。
 - Issue 02 最终验证通过：日志导出 Rust 聚焦测试 11 项、`LogConfigPanel` 聚焦测试 3 项、前端完整单测、Rust 完整测试（2629 passed / 5 ignored）、TypeScript typecheck、`cargo check`、Rustfmt 与相关前端 Prettier 检查。
+
+## 双轴审查修复记录
+
+- 修复继续沿用已确认的三个 public seams：归档服务公开接口、Tauri 导出命令/协调接口、设置面板公开交互；不为测试私有 helper 建立耦合 seam。
+- 源码核查确认：当前目录选择循环会把所有 `LogExportError::Failed` 都视为可回退；命令层没有跨窗口单飞；源文件打开与读取会吞掉所有错误；前端命令名仍为 snake_case。
+- Tauri `command(rename_all = "camelCase")` 只控制参数名，不会改变命令名；当前依赖版本是否支持显式 `rename` 需以锁定宏版本确认，否则应通过 camelCase Rust command 标识符暴露命令。
+- 审查还确认 Rust 通用失败码未进入 `constants.rs`，前端 `FAILED` 常量无生产消费者，组件测试本次新增 Promise executor 与 hoisted/mock 回调缺少 JSDoc。
+- 回退语义 RED：`cargo test commands::log_export::tests::does_not_fall_back_after_archiving_has_started --lib` 因缺少可控公开归档器 seam 编译失败；GREEN 新增公开 `export_logs_from_directories_with` seam，并把临时输出创建失败分类为 `TargetUnavailable`，证明 ZIP 写入/finish/persist 类 `Failed` 只尝试下载目录后整体失败，不再回退桌面。
+- `LOG_EXPORT_FAILED` 与后续单飞所需 `LOG_EXPORT_BUSY` 已集中进入 Rust `constants.rs`；目录选择层用稳定失败码包装归档开始后的错误。
+- 命令单飞 RED：并发命令测试因缺少 `LogExportCoordinator` 与公开协调 seam 编译失败；GREEN 使用原子 compare-exchange 获取执行权，生产命令共享全局协调器，第二次并发调用稳定返回 `LOG_EXPORT_BUSY` 且归档器调用计数保持为 1。
+- 锁定的 `tauri-macros 2.5.5` 不支持命令级 `rename = "..."`，且 `rename_all` 仅转换参数名；因此按仓库既有 camelCase command 风格把 Rust command 实际标识符及 handler 注册改为 `exportLogs`，前端 invoke 常量仍待同步。
+- 单飞 lease 在正常完成、失败或 async future 被取消时均通过 Drop 释放状态，前端既有组件防重继续保留。
+- 源文件错误分类 OPEN RED：公开 reader seam 尚不存在导致测试编译失败；GREEN 以跨平台注入的 `PermissionDenied` 证明持续打开错误返回整体 `Failed` 并清理临时包。
+- 源文件错误分类 READ RED：注入持续读取 `PermissionDenied` 时旧逻辑仍成功生成 ZIP；GREEN 只对 `NotFound`、`UnexpectedEof` 与代表快照后缩短的 `Ok(0)` 静默放弃条目，其他读取错误整体失败。
+- reader seam 仅承担“打开已快照文件”的单一职责，生产适配器仍直接使用 `fs::File`；它不从 services facade 重导出，避免扩散测试能力，同时消除 chmod 在 root/Windows 上不可控的问题。
+- Standards 收口完成：Tauri handler 与前端 invoke 均使用 `exportLogs`；Rust `LOG_EXPORT_FAILED`/`LOG_EXPORT_BUSY` 集中在 `constants.rs`；前端无生产消费者的 `FAILED` 常量已删除；本次新增组件测试中的回调与工厂函数均补充中文 JSDoc。
+- 聚焦与完整受影响验证：Rust `log_export` 15/15、`LogConfigPanel` 3/3、TypeScript typecheck、`cargo check`、rustfmt、相关 Prettier 均通过。
+- 前端完整套件首次并行运行 751/753：范围外 `scripts/upgrade.test.js` 被 Vitest 收集后出现既有 `ERR_INVALID_URL_SCHEME`，另有 App 集成测试并行污染/超时；未重复同一运行方式，改为单 worker 独立重跑 `tests/integration/App.test.tsx`，7/7 通过。此次修复的组件完整测试已独立通过。
+- 依赖使用当前 worktree 的 `pnpm install --frozen-lockfile` 正常安装，没有创建或复用主 worktree `node_modules` 软链接。

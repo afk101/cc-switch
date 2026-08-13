@@ -15,3 +15,9 @@ pub const LOG_EXPORT_BUFFER_SIZE: usize = 64 * 1024;
 
 /// 没有可归档日志时返回的稳定错误码。
 pub const LOG_EXPORT_NO_LOGS_ERROR: &str = "NO_LOGS";
+
+/// 日志导出整体失败时返回的稳定错误码。
+pub const LOG_EXPORT_FAILED_ERROR: &str = "LOG_EXPORT_FAILED";
+
+/// 已有日志导出正在运行时返回的稳定错误码。
+pub const LOG_EXPORT_BUSY_ERROR: &str = "LOG_EXPORT_BUSY";

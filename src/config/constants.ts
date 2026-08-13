@@ -51,10 +51,9 @@ export type CodexProviderRouteRequirement =
   (typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS)[keyof typeof CODEX_PROVIDER_ROUTE_REQUIREMENTS];
 
 // Tauri 日志导出命令名称
-export const LOG_EXPORT_COMMAND = "export_logs";
+export const LOG_EXPORT_COMMAND = "exportLogs";
 
 // 日志导出的稳定错误码
 export const LOG_EXPORT_ERROR_CODES = {
   NO_LOGS: "NO_LOGS",
-  FAILED: "LOG_EXPORT_FAILED",
 } as const;
