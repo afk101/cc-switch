@@ -203,3 +203,6 @@
 - Standards finding 已通过把说明注释放到 `describe`、`it` 与 `Promise` 回调函数表达式正前方修复；相关组件测试 3/3 通过。
 - Prettier 会把参数位置的注释重新排到字符串参数后，无法稳定满足 JSDoc 邻接要求；最终改为具名 `verifyLogConfigPanelInteractions`、`verifySuccessfulExport` 与 `retainExportResolver` 函数，每个声明正上方均有中文 JSDoc，Prettier 检查与组件测试均通过。
 - 完整 Rust 首次与 `cargo check` 并行运行时出现范围外测试失败且输出被截断；未重复该并行方式，改为安静、串行执行完整库测试，结果 2635 passed / 5 ignored。前端指定 `tests` 与 `src` 的完整 Vitest 套件 753/753、TypeScript typecheck、macOS `cargo check`、rustfmt、Prettier 与 diff check 均通过。
+- 第三轮双轴复审共同指出 Windows `OPEN_REPARSE_POINT` 只约束最终组件，祖先 junction 若仍指向 `logs` 内部会通过最终路径前缀判断，仍违背“不跟随任何链接”；同时字符串小写前缀也不是大小写敏感目录下可靠的安全边界。
+- Windows 最终修复不再重开完整候选路径或比较路径字符串：使用 `NtOpenFile` 的 `RootDirectory` 从已固定根 handle 开始逐组件相对打开，每一级都带 `FILE_OPEN_REPARSE_POINT` 并从同一 handle 查询 reparse 属性；父级 handle 持续持有，因此替换无法改变后续解析锚点。
+- 本机仍缺少 Windows MSVC C 工具链，完整 target check 在范围外 `rquickjs-sys`/`bzip2-sys` 的 `lib.exe` 缺失处失败；未重复该失败方式，改用 Cargo 为 Windows target 生成且启用相同 feature 集合的 `windows-sys 0.61.2` 元数据，隔离编译逐级相对打开代码，类型与 Win32/NT API 签名检查通过。

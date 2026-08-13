@@ -168,21 +168,34 @@ fn open_log_root(logs_dir: &Path) -> std::io::Result<fs::File> {
 #[cfg(windows)]
 fn open_log_file_without_links(
     root: &fs::File,
-    root_path: &Path,
+    _root_path: &Path,
     relative_path: &Path,
 ) -> std::io::Result<fs::File> {
-    let candidate = root_path.join(relative_path);
-    let file = open_windows_path(&candidate, false)?;
-    let root_final = windows_final_path(root)?;
-    let file_final = windows_final_path(&file)?;
-    let root_prefix = format!("{}\\", root_final.trim_end_matches('\\'));
-    if !file_final
-        .to_lowercase()
-        .starts_with(&root_prefix.to_lowercase())
+    use std::path::Component;
+
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "日志相对路径包含非法组件",
+        ));
+    }
+
+    let mut current = root.try_clone()?;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            unreachable!("路径组件已经完成校验")
+        };
+        current = open_windows_relative_path(&current, name, index + 1 < components.len())?;
+    }
+    if !current.metadata()?.is_file() {
         return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
     }
-    Ok(file)
+    Ok(current)
 }
 
 /// Windows 上以 OPEN_REPARSE_POINT 打开路径，并拒绝 reparse point 本身。
@@ -245,35 +258,102 @@ fn open_windows_path(path: &Path, directory: bool) -> std::io::Result<fs::File> 
     Ok(file)
 }
 
-/// 取得 Windows 已打开 handle 的最终规范路径，用于无竞态边界校验。
+/// Windows 上以父目录 handle 为锚打开单个组件，并拒绝该组件是 reparse point。
 #[cfg(windows)]
-fn windows_final_path(file: &fs::File) -> std::io::Result<String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED,
+fn open_windows_relative_path(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    directory: bool,
+) -> std::io::Result<fs::File> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtOpenFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
     };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    let handle = file.as_raw_handle() as _;
-    // SAFETY：handle 有效；空缓冲区调用用于取得所需 UTF-16 长度。
-    let required =
-        unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, FILE_NAME_NORMALIZED) };
-    if required == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut buffer = vec![0_u16; required as usize + 1];
-    // SAFETY：buffer 容量使用上一调用返回值分配，handle 在调用期间有效。
-    let written = unsafe {
-        GetFinalPathNameByHandleW(
-            handle,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
-            FILE_NAME_NORMALIZED,
+    let mut wide = name.encode_wide().collect::<Vec<_>>();
+    let byte_length = wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u16::try_from(length).ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "日志路径组件过长"))?;
+    let unicode_name = UNICODE_STRING {
+        Length: byte_length,
+        MaximumLength: byte_length,
+        Buffer: wide.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle() as _,
+        ObjectName: &unicode_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let type_option = if directory {
+        FILE_DIRECTORY_FILE
+    } else {
+        FILE_NON_DIRECTORY_FILE
+    };
+    // SAFETY：父 handle 在调用期间有效；结构体及 UTF-16 缓冲区生命周期覆盖本次同步调用。
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            FILE_GENERIC_READ | SYNCHRONIZE,
+            &attributes,
+            &mut io_status,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN_REPARSE_POINT | type_option,
         )
     };
-    if written == 0 || written as usize >= buffer.len() {
+    if status < 0 {
+        // SAFETY：RtlNtStatusToDosError 对任意 NTSTATUS 返回对应 Win32 错误码。
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(code as i32));
+    }
+    // SAFETY：NtOpenFile 成功返回当前进程持有的 handle，立即转交给 File 管理。
+    let file = unsafe { fs::File::from_raw_handle(handle as _) };
+    if is_windows_reparse_point(&file)? {
+        return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    }
+    Ok(file)
+}
+
+/// 判断 Windows 已打开 handle 是否指向 reparse point。
+#[cfg(windows)]
+fn is_windows_reparse_point(file: &fs::File) -> std::io::Result<bool> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY：file handle 有效，info 缓冲区尺寸与请求的信息类匹配。
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(String::from_utf16_lossy(&buffer[..written as usize]))
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 /// 将日志目录中的普通文件流式写入目标目录中的 ZIP。
