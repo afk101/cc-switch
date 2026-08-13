@@ -415,6 +415,8 @@
         "exportDescription": "將全部應用程式診斷日誌匯出為 ZIP 檔案並儲存到系統下載目錄",
         "exporting": "正在匯出...",
         "exportSuccess": "日誌匯出成功",
+        "exportNoLogs": "暫無可匯出的日誌",
+        "exportFailed": "日誌匯出失敗，請稍後重試",
         "levels": {
           "error": "錯誤",
           "warn": "警告",

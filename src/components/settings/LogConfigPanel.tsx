@@ -12,8 +12,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { settingsApi, type LogConfig } from "@/lib/api/settings";
+import { LOG_EXPORT_ERROR_CODES } from "@/config/constants";
 
 const LOG_LEVELS = ["error", "warn", "info", "debug", "trace"] as const;
+
+/** 把后端稳定错误码映射到本地化消息键。 */
+function getExportErrorMessageKey(error: unknown): string {
+  return String(error).startsWith(LOG_EXPORT_ERROR_CODES.NO_LOGS)
+    ? "settings.advanced.logConfig.exportNoLogs"
+    : "settings.advanced.logConfig.exportFailed";
+}
 
 export function LogConfigPanel() {
   const { t } = useTranslation();
@@ -54,7 +62,7 @@ export function LogConfigPanel() {
         description: path,
       });
     } catch (e) {
-      toast.error(String(e));
+      toast.error(t(getExportErrorMessageKey(e)));
     } finally {
       setIsExporting(false);
     }

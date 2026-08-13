@@ -415,6 +415,8 @@
         "exportDescription": "Export all application diagnostic logs to a ZIP file in the system Downloads folder",
         "exporting": "Exporting...",
         "exportSuccess": "Logs exported successfully",
+        "exportNoLogs": "No logs are available to export",
+        "exportFailed": "Failed to export logs. Please try again later",
         "levels": {
           "error": "Error",
           "warn": "Warning",

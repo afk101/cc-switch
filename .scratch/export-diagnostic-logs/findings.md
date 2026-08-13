@@ -158,3 +158,15 @@
 - 前端 worktree 起初缺少 `node_modules`，已按仓库约束临时链接主 worktree 依赖；首次聚焦命令因 `pnpm test:unit -- <file>` 实际运行全套仍取得目标测试 RED（缺少 `settingsApi.exportLogs`），后续改用 `pnpm exec vitest run <file>` 做真正聚焦验证，完成后必须删除软链接。
 - 设置面板 GREEN 已从公开交互验证：按钮点击后显示导出中并禁用，重复点击不会再次调用后端，成功 toast 展示完整 ZIP 路径，最终恢复可用。
 - Issue 01 最终验证通过：Rust 两条 `log_export::tests`、前端 `LogConfigPanel` 聚焦测试、`cargo check`、`cargo fmt --check`、TypeScript typecheck、Prettier 全前端检查；临时 `node_modules` 软链接已删除。
+
+## Issue 02 实施记录
+
+- 归档 seam 的无日志 RED 证明原实现会生成空 ZIP；GREEN 返回稳定 `NO_LOGS`，且不存在、空目录或只有不可归档项时不创建输出。
+- 同名避让 RED 证明无覆盖持久化会因同名失败；GREEN 选择 `-2` 起的递增序号，并由 `persist_noclobber` 保证已有 ZIP 内容不变。
+- 符号链接测试确认目录内文件/目录链接不会入包；额外 RED 发现日志根自身为链接时 `Path::is_dir` 会越界跟随，GREEN 改用 `symlink_metadata` 拒绝该根目录。
+- 归档清单现在固定普通文件的枚举时长度，64 KiB 固定缓冲流式写入；追加测试验证 ZIP 条目不超过快照长度，缩短测试验证变化条目被放弃而稳定日志继续归档，完成提示不包含内部跳过信息。
+- 临时 ZIP 使用与最终目标相同目录中的 `NamedTempFile`，显式 `finish` 后 `persist_noclobber` 落位；目标不是可用目录时测试证明既有文件不变且无临时或最终半成品。
+- 命令 seam 的 RED 证明 Issue 01 只接受下载目录；GREEN 按下载、桌面顺序尝试，无效下载目录可回退桌面，两个系统目录均缺失时返回稳定 `LOG_EXPORT_FAILED` 类别。
+- 设置面板 RED 证明原实现直接展示后端错误串；GREEN 将 `NO_LOGS` 与通用失败映射到四语本地化消息，并在两种失败后恢复按钮可重试。
+- 前端依赖首次尝试复用旧主工作树 `node_modules` 软链接失败（目标不存在），已立即移除；离线安装因缓存缺包失败后改用正常锁文件安装成功，未重复失败操作。
+- Issue 02 最终验证通过：日志导出 Rust 聚焦测试 11 项、`LogConfigPanel` 聚焦测试 3 项、前端完整单测、Rust 完整测试（2629 passed / 5 ignored）、TypeScript typecheck、`cargo check`、Rustfmt 与相关前端 Prettier 检查。

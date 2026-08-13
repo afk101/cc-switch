@@ -35,7 +35,7 @@ pub mod webdav_auto_sync;
 pub mod webdav_sync;
 
 pub use config::ConfigService;
-pub use log_export::export_logs_archive;
+pub use log_export::{export_logs_archive, LogExportError};
 pub use mcp::McpService;
 pub use omo::OmoService;
 pub use prompt::PromptService;

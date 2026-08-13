@@ -415,6 +415,8 @@
         "exportDescription": "すべてのアプリ診断ログを ZIP ファイルとしてシステムのダウンロードフォルダーに保存します",
         "exporting": "エクスポート中...",
         "exportSuccess": "ログをエクスポートしました",
+        "exportNoLogs": "エクスポートできるログがありません",
+        "exportFailed": "ログをエクスポートできませんでした。後でもう一度お試しください",
         "levels": {
           "error": "エラー",
           "warn": "警告",

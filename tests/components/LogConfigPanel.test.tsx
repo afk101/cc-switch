@@ -4,12 +4,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
 import { settingsApi } from "@/lib/api/settings";
 
-const { toastSuccess } = vi.hoisted(() => ({ toastSuccess: vi.fn() }));
+const { toastError, toastSuccess } = vi.hoisted(() => ({
+  toastError: vi.fn(),
+  toastSuccess: vi.fn(),
+}));
 
 vi.mock("sonner", () => ({
   toast: {
     success: toastSuccess,
-    error: vi.fn(),
+    error: toastError,
   },
 }));
 
@@ -20,6 +23,7 @@ vi.mock("react-i18next", () => ({
 describe("LogConfigPanel", () => {
   beforeEach(() => {
     toastSuccess.mockReset();
+    toastError.mockReset();
     vi.spyOn(settingsApi, "getLogConfig").mockResolvedValue({
       enabled: true,
       level: "info",
@@ -58,6 +62,26 @@ describe("LogConfigPanel", () => {
         },
       ),
     );
+    expect(exportButton).toBeEnabled();
+  });
+
+  it.each([
+    ["NO_LOGS", "settings.advanced.logConfig.exportNoLogs"],
+    [
+      "LOG_EXPORT_FAILED: unavailable",
+      "settings.advanced.logConfig.exportFailed",
+    ],
+  ])("导出错误 %s 显示本地化提示并恢复按钮", async (error, message) => {
+    const user = userEvent.setup();
+    vi.spyOn(settingsApi, "exportLogs").mockRejectedValue(error);
+    render(<LogConfigPanel />);
+    const exportButton = await screen.findByRole("button", {
+      name: "settings.advanced.logConfig.export",
+    });
+
+    await user.click(exportButton);
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(message));
     expect(exportButton).toBeEnabled();
   });
 });

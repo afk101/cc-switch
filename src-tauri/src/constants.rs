@@ -9,3 +9,9 @@ pub const LOG_EXPORT_FILE_EXTENSION: &str = ".zip";
 
 /// 日志导出文件的本地时间格式。
 pub const LOG_EXPORT_TIMESTAMP_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// 日志导出流式复制缓冲区大小。
+pub const LOG_EXPORT_BUFFER_SIZE: usize = 64 * 1024;
+
+/// 没有可归档日志时返回的稳定错误码。
+pub const LOG_EXPORT_NO_LOGS_ERROR: &str = "NO_LOGS";
