@@ -204,3 +204,19 @@
 - 第二次采用不同策略串行运行 `cargo test --all-targets -- --test-threads=1`：lib 2643 passed、0 failed、5 ignored；随后 `tests/provider_commands.rs` 为 6 passed、4 failed。首个实质失败 `switch_provider_codex_missing_auth_returns_error_and_keeps_state` 期望 config error，实际得到 `InvalidInput("Codex 供应商切换必须指定 Codex Profile")`；其余三项因共享 mutex poison 失败。
 - 完整 suite 的三种尝试路径已经是：默认并行、失败项精确重跑、串行完整运行。它们均未指向 body dump 变更；依照 Three Failed Agreements 不再重复相同验证，保留为范围外既存不稳定项。
 - 未验证边界：真实应用启动后的 24 小时墙钟 tick 未等待验证；代码接线与受控 tick seam 已验证。
+
+## Code Review
+
+### Standards
+
+- finding 1（判断项，Duplicated Code / Speculative Generality）：仅测试构建保留的旧 `cleanup_old_dump_files` 与新生产 tree cleanup 重复遍历、日期判断与删除逻辑，并保留不同告警语义。需迁移旧测试到生产 seam 后删除重复 helper。
+- 未发现违反 `AGENTS.md`、`CONTRIBUTING.md` 或 task 执行约束的硬性规范问题。
+
+### Spec
+
+- finding 1（P2）：TS-02 现有测试手工连续调用 `run_body_dump_maintenance_at`，没有驱动 production maintenance 编排或 24 小时 timer；删除启动/周期接线时测试仍可能通过，`REQ-03`、`REQ-09`、`SCN-10` 的验证证据不足。
+- 除此之外未发现功能缺失、scope creep 或实现错误。
+
+### Remediation
+
+- 新增 Issue 03，受 Issue 02 阻塞；使用 fresh worker 按 TDD 补齐 production 调度 seam 覆盖并消除重复 helper。
