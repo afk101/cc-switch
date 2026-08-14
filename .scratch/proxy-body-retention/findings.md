@@ -194,3 +194,13 @@
 - Worker 验证：body dump tests 16/16、`cargo fmt --check`、`git diff --check`、使用系统 clang 的 `cargo check` 均通过。
 - 环境问题：裸 `cargo check` 命中 PATH 中 Node 环境的 `cc`，报 `unknown option -MD`；按不重复失败规则改为 `CC=/usr/bin/clang AR=/usr/bin/ar` 后通过。
 - 未验证边界：并发删除 `NotFound` 的真实 race 不适合作为 deterministic fixture；当前由明确 `ErrorKind::NotFound` 分支和后续代码审查证明。
+- Issue 02 已完成，worker commit：`7e1299a6`。
+- Issue 02 将启动立即清理与现有 24 小时 timer 收敛到单一 periodic maintenance tick；body dump 树扫描通过 blocking task 执行，且不依赖 `DUMP_ENABLED`。
+- 请求级 BodyDumper 已不再调用 retention；旧平面 helper 仅保留在 `#[cfg(test)]` 下以遵守不删除既有说明/测试的约束。
+- TDD Red→Green 证据：缺少 maintenance seam（E0425）→ 失败后下一 tick 可恢复并收敛多目录；缺少无-retention 构造 seam（E0599）→ 创建 dumper 保留同目录旧日志。
+- Issue 02 验证：TS-02/TS-03 1/1、body dump tests 18/18、受控 legacy 根层 + inactive Profile repro、`cargo fmt --check`、`git diff --check`、`cargo check --all-targets`、`pnpm typecheck` 均通过；无 `[DEBUG-...]` instrumentation。
+- 完整 Rust suite 首轮命令：`CC=/usr/bin/clang AR=/usr/bin/ar cargo test --manifest-path src-tauri/Cargo.toml --all-targets`。lib 结果 2642 passed、1 failed、5 ignored；失败为 `services::model_pricing::tests::repeated_seeded_tombstone_deletion_does_not_backfill_unrelated_usage`，断言 `left: 0` / `right: 1`。
+- 上述 `model_pricing` 测试使用 `--lib -- --exact` 精确重跑结果 1 passed（0.01s），表明首次失败受共享状态/并行影响。
+- 第二次采用不同策略串行运行 `cargo test --all-targets -- --test-threads=1`：lib 2643 passed、0 failed、5 ignored；随后 `tests/provider_commands.rs` 为 6 passed、4 failed。首个实质失败 `switch_provider_codex_missing_auth_returns_error_and_keeps_state` 期望 config error，实际得到 `InvalidInput("Codex 供应商切换必须指定 Codex Profile")`；其余三项因共享 mutex poison 失败。
+- 完整 suite 的三种尝试路径已经是：默认并行、失败项精确重跑、串行完整运行。它们均未指向 body dump 变更；依照 Three Failed Agreements 不再重复相同验证，保留为范围外既存不稳定项。
+- 未验证边界：真实应用启动后的 24 小时墙钟 tick 未等待验证；代码接线与受控 tick seam 已验证。

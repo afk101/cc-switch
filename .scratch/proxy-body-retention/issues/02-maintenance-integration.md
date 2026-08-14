@@ -1,6 +1,6 @@
 # 02 — 接入应用维护生命周期并移除请求清理
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 **构建内容：** 让应用启动与现有每日 maintenance 统一执行全局 body dump retention，即使 dump 未启用也能自动迁移历史日志，同时让代理请求不再承担目录扫描与删除。
 
@@ -42,3 +42,7 @@
 - 容量上限、压缩归档和非标准文件迁移。
 
 ## Comments
+
+- 已由 fresh worker 按 TDD 完成并提交：`7e1299a6`。
+- Red→Green：缺少 maintenance tick seam（E0425）与缺少无-retention BodyDumper 构造 seam（E0599）均已转绿。
+- 验证：TS-02/TS-03、body dump 18 个测试、受控多目录 repro、格式/diff、Cargo all-targets check、前端 typecheck 均通过；未触碰真实日志目录。
