@@ -318,12 +318,12 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+        crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
+    ));
+    interval.tick().await;
     run_tick().await;
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
-        ));
-        interval.tick().await;
         loop {
             interval.tick().await;
             run_tick().await;
@@ -2396,10 +2396,6 @@ mod tests {
     };
     use crate::app_config::AppType;
     use crate::database::Database;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
 
     #[test]
     fn restore_proxy_state_candidates_exclude_codex_profiles() {
@@ -2521,28 +2517,31 @@ mod tests {
         let parent = tempfile::tempdir().expect("tempdir");
         let root = parent.path().join("proxy-bodies");
         std::fs::write(&root, "not a directory").expect("write blocking root fixture");
-        let run_count = Arc::new(AtomicUsize::new(0));
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let maintenance_task = start_periodic_maintenance({
             let root = root.clone();
-            let run_count = Arc::clone(&run_count);
             move || {
                 let root = root.clone();
-                let run_count = Arc::clone(&run_count);
+                let completion_tx = completion_tx.clone();
                 async move {
-                    run_count.fetch_add(1, Ordering::SeqCst);
                     crate::proxy::body_dump::run_body_dump_maintenance_at(
                         root,
                         "20260708".to_string(),
                     )
                     .await;
+                    completion_tx
+                        .send(())
+                        .expect("record completed maintenance");
                 }
             }
         })
         .await;
-        tokio::task::yield_now().await;
 
-        assert_eq!(run_count.load(Ordering::SeqCst), 1);
+        completion_rx
+            .recv()
+            .await
+            .expect("observe startup maintenance completion");
         assert!(root.is_file());
 
         std::fs::remove_file(&root).expect("remove blocking root fixture");
@@ -2557,15 +2556,13 @@ mod tests {
             crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
         ))
         .await;
-        for _ in 0..100 {
-            if !legacy_old.exists() && !inactive_old.exists() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::time::resume();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completion_rx.recv())
+            .await
+            .expect("periodic maintenance should complete after its deadline")
+            .expect("maintenance completion channel should remain open");
 
         maintenance_task.abort();
-        assert_eq!(run_count.load(Ordering::SeqCst), 2);
         assert_eq!((legacy_old.exists(), inactive_old.exists()), (false, false));
     }
 

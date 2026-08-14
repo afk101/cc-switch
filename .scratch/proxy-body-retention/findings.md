@@ -230,3 +230,7 @@
 - Standards finding 已关闭：旧平面清理测试改为复用 production `cleanup_body_dump_tree`，第二套 test-only `cleanup_old_dump_files` 可执行实现已删除，原说明性备注保留。
 - Issue 03 验证：production maintenance 调度测试 1/1、body dump 模块测试 18/18、`cargo fmt --check`、`git diff --check`、使用系统 clang 的 `cargo check --all-targets` 均通过。
 - 受控 fixture 全部位于 `tempfile`；未读取、删除或修改用户真实 `~/.cc-switch/logs/proxy-bodies`，也未触碰范围外 `.scratch/codex-claude-chat-401/`。
+- 协调 Agent 独立运行 `cargo test ... tests::periodic_maintenance_runs_on_startup_and_after_a_failed_tick --lib -- --exact` 得到失败：推进虚拟 24 小时后 `(legacy_old.exists(), inactive_old.exists()) == (true, true)`。这证明当前 Green 非 deterministic；下一步不重复原命令，改为在 scheduler spawn 前建立可观察的 interval 基线或等价同步门禁，再重新验证。
+- deterministic repair 已完成：interval 在 spawn 前初始化并消费 immediate tick，避免虚拟时间先于 timer 基线；测试不再用固定 100 次 `yield_now` 猜测结束，而是在真实 `run_body_dump_maintenance_at` 返回后通过 channel 发出 completion barrier。
+- 修复后的首次验证暴露 paused Tokio timeout 会先于真实 blocking pool 完成而瞬时超时；测试在推进到周期 deadline 后恢复实时时钟，再使用 1 秒有界 timeout 等待完成信号，既保留虚拟 24 小时的快速性，又给 blocking task 真实执行时间。
+- 最终验证证据：精确调度测试先单次通过，再连续运行 20 次全部通过；body dump 模块 18/18、`cargo fmt --check`、`git diff --check`、系统 clang 的 `cargo check --all-targets` 均通过。

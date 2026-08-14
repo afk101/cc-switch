@@ -46,3 +46,6 @@
 - 调度测试首次真实运行时发现 Tauri 全局 runtime 不受当前测试的 paused clock 控制；改用项目既有 Tokio runtime 后，虚拟 24 小时 tick 可确定性触发，测试耗时 0.01 秒。
 - 旧平面清理测试已改用 production `cleanup_body_dump_tree`，重复的 test-only `cleanup_old_dump_files` 可执行实现已删除，原说明性备注保留。
 - 验证：maintenance 定向测试 1/1、body dump 测试 18/18、`cargo fmt --check`、`git diff --check` 与 `cargo check --all-targets` 均通过；未触碰真实日志目录。
+- 协调 Agent 独立精确重跑时测试失败：推进 24 小时后 legacy 根层和 inactive Profile 文件均仍存在。interval 在 spawned task 内建立，虚拟时间可能先于其基线初始化，当前测试不是 deterministic；Issue 03 重新打开修复。
+- 修复后 interval 在 spawn 前建立并消费 immediate tick，`start_periodic_maintenance` 返回时下一次周期 deadline 已确定；测试改为只在真实 blocking cleanup 返回后发送 completion 信号。
+- 修复后的精确测试单次通过，并连续运行 20 次全部通过；body dump 18/18、格式、diff 与 all-targets check 再次通过，Issue 03 重新关闭。
