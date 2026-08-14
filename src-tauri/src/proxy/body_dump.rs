@@ -326,6 +326,105 @@ fn cleanup_old_dump_files(dir: &std::path::Path, today_key: &str) {
     }
 }
 
+/// Body dump 树级清理的可观察结果。
+#[derive(Debug, Default)]
+pub struct BodyDumpCleanupSummary {
+    removed_files: usize,
+    error_count: usize,
+    error_samples: Vec<String>,
+}
+
+impl BodyDumpCleanupSummary {
+    /// 记录非幂等文件系统错误，并限制保存的样本数量。
+    fn record_error(&mut self, operation: &str, path: &std::path::Path, error: &std::io::Error) {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return;
+        }
+        self.error_count = self.error_count.saturating_add(1);
+        if self.error_samples.len() < crate::constants::BODY_DUMP_CLEANUP_ERROR_SAMPLE_LIMIT {
+            self.error_samples
+                .push(format!("{operation} {}: {error}", path.display()));
+        }
+    }
+
+    /// 在一次清理结束后输出单条有界错误摘要。
+    fn log_errors(&self) {
+        if self.error_count == 0 {
+            return;
+        }
+        log::warn!(
+            "[BodyDump] 全局历史日志清理部分失败: errors={}, samples=[{}]",
+            self.error_count,
+            self.error_samples.join(" | ")
+        );
+    }
+}
+
+/// 清理日志根层及恰好一层真实 Profile 目录中的过期 body dump 日志。
+pub fn cleanup_body_dump_tree(root: &std::path::Path, today_key: &str) -> BodyDumpCleanupSummary {
+    let mut summary = BodyDumpCleanupSummary::default();
+    cleanup_dump_directory(root, today_key, true, &mut summary);
+    summary.log_errors();
+    summary
+}
+
+/// 清理指定目录的一层普通日志，并按需进入其真实子目录一次。
+fn cleanup_dump_directory(
+    dir: &std::path::Path,
+    today_key: &str,
+    visit_profile_directories: bool,
+    summary: &mut BodyDumpCleanupSummary,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            summary.record_error("读取目录失败", dir, &error);
+            return;
+        }
+    };
+
+    for entry_result in entries {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(error) => {
+                summary.record_error("读取目录项失败", dir, &error);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                summary.record_error("读取文件类型失败", &path, &error);
+                continue;
+            }
+        };
+        if file_type.is_file() {
+            remove_expired_dump_file(&path, today_key, summary);
+        } else if visit_profile_directories && file_type.is_dir() {
+            cleanup_dump_directory(&path, today_key, false, summary);
+        }
+    }
+}
+
+/// 删除可确认早于今天的标准 body dump 普通文件。
+fn remove_expired_dump_file(
+    path: &std::path::Path,
+    today_key: &str,
+    summary: &mut BodyDumpCleanupSummary,
+) {
+    let Some(date_key) = dump_file_date_key(path) else {
+        return;
+    };
+    if date_key >= today_key {
+        return;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => summary.removed_files = summary.removed_files.saturating_add(1),
+        Err(error) => summary.record_error("删除文件失败", path, &error),
+    }
+}
+
 /// 从 dump 文件名中提取 `YYYYMMDD` 日期键；无法确认是 dump log 时返回 `None`。
 fn dump_file_date_key(path: &std::path::Path) -> Option<&str> {
     if path.extension().and_then(|ext| ext.to_str()) != Some(DUMP_LOG_EXTENSION) {
@@ -340,7 +439,10 @@ fn dump_file_date_key(path: &std::path::Path) -> Option<&str> {
     }
 
     let date_key = &file_name[..DUMP_DATE_KEY_LEN];
-    if date_key.bytes().all(|b| b.is_ascii_digit()) {
+    if date_key.bytes().all(|b| b.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(date_key, crate::constants::BODY_DUMP_DATE_FORMAT)
+            .is_ok()
+    {
         Some(date_key)
     } else {
         None
@@ -539,6 +641,192 @@ mod tests {
         assert!(future.exists());
         assert!(malformed.exists());
         assert!(note.exists());
+    }
+
+    /// 一次树级清理应同时收敛根层和所有一层 Profile 目录中的过期日志。
+    #[test]
+    fn cleanup_body_dump_tree_removes_expired_logs_from_root_and_profiles() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let inactive_profile = root.path().join("inactive-profile");
+        let deleted_profile = root.path().join("deleted-profile");
+        std::fs::create_dir_all(&inactive_profile).expect("create inactive profile");
+        std::fs::create_dir_all(&deleted_profile).expect("create deleted profile");
+
+        let root_old = root.path().join("20260707-235959-root.log");
+        let inactive_old = inactive_profile.join("20260707-235959-inactive.log");
+        let deleted_old = deleted_profile.join("20260707-235959-deleted.log");
+        std::fs::write(&root_old, "old").expect("write root old");
+        std::fs::write(&inactive_old, "old").expect("write inactive old");
+        std::fs::write(&deleted_old, "old").expect("write deleted old");
+
+        cleanup_body_dump_tree(root.path(), "20260708");
+
+        assert_eq!(
+            [
+                root_old.exists(),
+                inactive_old.exists(),
+                deleted_old.exists()
+            ],
+            [false, false, false]
+        );
+    }
+
+    /// 树级清理必须保留未过期、无法确认归属及超过固定深度的对象。
+    #[test]
+    fn cleanup_body_dump_tree_preserves_nonexpired_and_unowned_entries() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let profile = root.path().join("profile-a");
+        let nested = profile.join("nested");
+        let empty = root.path().join("empty-profile");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        std::fs::create_dir_all(&empty).expect("create empty directory");
+
+        let today = root.path().join("20260708-000001-today.log");
+        let future = profile.join("20260709-000001-future.log");
+        let invalid_date = root.path().join("20260230-000001-invalid.log");
+        let malformed = profile.join("body-dump.log");
+        let other_extension = profile.join("20260707-000001-note.txt");
+        let deeply_nested = nested.join("20260707-000001-deep.log");
+        for path in [
+            &today,
+            &future,
+            &invalid_date,
+            &malformed,
+            &other_extension,
+            &deeply_nested,
+        ] {
+            std::fs::write(path, "keep").expect("write retained fixture");
+        }
+
+        cleanup_body_dump_tree(root.path(), "20260708");
+
+        assert_eq!(
+            [
+                today.exists(),
+                future.exists(),
+                invalid_date.exists(),
+                malformed.exists(),
+                other_extension.exists(),
+                deeply_nested.exists(),
+                empty.exists(),
+            ],
+            [true, true, true, true, true, true, true]
+        );
+    }
+
+    /// 单个 Profile 无法读取时应继续清理其它 Profile，并只保留有限错误样本。
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_body_dump_tree_reports_bounded_errors_and_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let accessible = root.path().join("accessible");
+        std::fs::create_dir(&accessible).expect("create accessible profile");
+        let removable = accessible.join("20260707-000001-old.log");
+        std::fs::write(&removable, "old").expect("write removable fixture");
+
+        let mut inaccessible_profiles = Vec::new();
+        for index in 0..7 {
+            let profile = root.path().join(format!("inaccessible-{index}"));
+            std::fs::create_dir(&profile).expect("create inaccessible profile");
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o000))
+                .expect("restrict profile permissions");
+            inaccessible_profiles.push(profile);
+        }
+
+        let summary = cleanup_body_dump_tree(root.path(), "20260708");
+
+        for profile in &inaccessible_profiles {
+            std::fs::set_permissions(profile, std::fs::Permissions::from_mode(0o700))
+                .expect("restore profile permissions");
+        }
+        assert_eq!(
+            (
+                removable.exists(),
+                summary.error_count,
+                summary.error_samples.len()
+            ),
+            (false, 7, 5)
+        );
+    }
+
+    /// 根目录不存在时清理应安静结束，且不能创建目录。
+    #[test]
+    fn cleanup_body_dump_tree_does_not_create_missing_root() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let missing_root = parent.path().join("missing-proxy-bodies");
+
+        let summary = cleanup_body_dump_tree(&missing_root, "20260708");
+
+        assert_eq!((missing_root.exists(), summary.error_count), (false, 0));
+    }
+
+    /// 清理不得跟随文件或 Profile 目录 symlink，也不得删除特殊文件。
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_body_dump_tree_skips_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let external = tempfile::tempdir().expect("external tempdir");
+        let external_old = external.path().join("20260707-000001-external.log");
+        std::fs::write(&external_old, "keep").expect("write external fixture");
+
+        let linked_profile = root.path().join("linked-profile");
+        let linked_file = root.path().join("20260707-000001-linked.log");
+        symlink(external.path(), &linked_profile).expect("link profile directory");
+        symlink(&external_old, &linked_file).expect("link dump file");
+        let socket_path = root.path().join("20260707-000001-socket.log");
+        let _socket = UnixListener::bind(&socket_path).expect("bind unix socket");
+
+        cleanup_body_dump_tree(root.path(), "20260708");
+
+        assert_eq!(
+            [
+                linked_profile.exists(),
+                linked_file.exists(),
+                socket_path.exists(),
+                external_old.exists(),
+            ],
+            [true, true, true, true]
+        );
+    }
+
+    /// 删除失败不能阻止同目录后续项及其它 Profile 的清理。
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_body_dump_tree_continues_after_delete_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let read_only = root.path().join("read-only");
+        let accessible = root.path().join("accessible");
+        std::fs::create_dir(&read_only).expect("create read-only profile");
+        std::fs::create_dir(&accessible).expect("create accessible profile");
+        let blocked_a = read_only.join("20260707-000001-blocked-a.log");
+        let blocked_b = read_only.join("20260707-000002-blocked-b.log");
+        let removable = accessible.join("20260707-000001-removable.log");
+        std::fs::write(&blocked_a, "keep").expect("write blocked fixture a");
+        std::fs::write(&blocked_b, "keep").expect("write blocked fixture b");
+        std::fs::write(&removable, "old").expect("write removable fixture");
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o500))
+            .expect("restrict delete permissions");
+
+        let summary = cleanup_body_dump_tree(root.path(), "20260708");
+
+        std::fs::set_permissions(&read_only, std::fs::Permissions::from_mode(0o700))
+            .expect("restore delete permissions");
+        assert_eq!(
+            (
+                blocked_a.exists(),
+                blocked_b.exists(),
+                removable.exists(),
+                summary.error_count,
+            ),
+            (true, true, false, 2)
+        );
     }
 
     /// 前 N 个事件全部保留，超出部分挤入末尾环形缓冲；中间被丢弃但总数正确。

@@ -21,3 +21,9 @@ pub const LOG_EXPORT_FAILED_ERROR: &str = "LOG_EXPORT_FAILED";
 
 /// 已有日志导出正在运行时返回的稳定错误码。
 pub const LOG_EXPORT_BUSY_ERROR: &str = "LOG_EXPORT_BUSY";
+
+/// Body dump 文件名日期前缀的解析格式。
+pub const BODY_DUMP_DATE_FORMAT: &str = "%Y%m%d";
+
+/// Body dump 清理摘要最多保留的错误样本数。
+pub const BODY_DUMP_CLEANUP_ERROR_SAMPLE_LIMIT: usize = 5;
