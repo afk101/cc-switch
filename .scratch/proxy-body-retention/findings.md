@@ -234,3 +234,17 @@
 - deterministic repair 已完成：interval 在 spawn 前初始化并消费 immediate tick，避免虚拟时间先于 timer 基线；测试不再用固定 100 次 `yield_now` 猜测结束，而是在真实 `run_body_dump_maintenance_at` 返回后通过 channel 发出 completion barrier。
 - 修复后的首次验证暴露 paused Tokio timeout 会先于真实 blocking pool 完成而瞬时超时；测试在推进到周期 deadline 后恢复实时时钟，再使用 1 秒有界 timeout 等待完成信号，既保留虚拟 24 小时的快速性，又给 blocking task 真实执行时间。
 - 最终验证证据：精确调度测试先单次通过，再连续运行 20 次全部通过；body dump 模块 18/18、`cargo fmt --check`、`git diff --check`、系统 clang 的 `cargo check --all-targets` 均通过。
+
+## Final Verification & Completion Audit
+
+- 协调 Agent 在 final HEAD 独立重跑 production scheduler 精确测试：1 passed、0 failed，耗时 0.01 秒。
+- 协调 Agent 独立重跑 body dump 模块：18 passed、0 failed，覆盖根层/多 Profile、保留边界、symlink/特殊文件、错误摘要、missing root、请求无 retention 与 maintenance 恢复。
+- `CC=/usr/bin/clang AR=/usr/bin/ar cargo check --all-targets` 通过；`pnpm typecheck` 通过；`cargo fmt --all -- --check` 与 `git diff --check <Review Base>...HEAD` 通过。
+- `[DEBUG-...]` 搜索仅命中文档中的验收文字，生产与测试代码无临时 instrumentation；不存在 throwaway prototype。
+- `REQ-01/02/06/07/08/11` 由 TS-01 的 18 个 body dump 测试及 tree cleanup 代码路径证明；`REQ-03/09/10` 由 production scheduler paused-time test 与 blocking seam 证明；`REQ-04/05` 由 maintenance 无条件接线及 BodyDumper 无 retention 测试/调用搜索证明。
+- Stage 5 完成：多目录 regression 在实现前因接口缺失变红，生产 tree seam 实现后转绿；请求路径回归也完成 Red→Green。
+- Stage 6 完成：受控 legacy 根层 + inactive Profile repro 已转绿，相关回归与编译 gate 通过，临时 instrumentation 清理完成。用户真实日志未在测试中删除；修复版本正常启动时按确认的 migration contract 自动收敛。
+- 完整 Rust suite 的范围外不稳定项已按 Three Failed Agreements 留证：默认并行的 model_pricing 单项精确重跑通过；串行 lib 2643/2643 通过后，provider_commands 出现既存契约断言与 mutex poison。无失败指向本变更。
+- 最终双轴 code review：Standards 0 findings，Spec 0 findings；先前重复 helper 与 TS-02 覆盖不足 findings 均已关闭。
+- 项目根不存在 `docs-spec/`，按 `$implement` contract 跳过 `$oms-spec-sync-docs`，不自动初始化。
+- 工作区唯一范围外未跟踪目录仍为 `.scratch/codex-claude-chat-401/`，未读取修改、未暂存、未提交。
