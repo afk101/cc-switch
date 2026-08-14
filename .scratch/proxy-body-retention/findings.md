@@ -248,3 +248,9 @@
 - 最终双轴 code review：Standards 0 findings，Spec 0 findings；先前重复 helper 与 TS-02 覆盖不足 findings 均已关闭。
 - 项目根不存在 `docs-spec/`，按 `$implement` contract 跳过 `$oms-spec-sync-docs`，不自动初始化。
 - 工作区唯一范围外未跟踪目录仍为 `.scratch/codex-claude-chat-401/`，未读取修改、未暂存、未提交。
+
+## Prevention Decision
+
+- 已按 `$implement` 的 Bug 收尾 contract 向用户询问如何防止再次发生，并给出推荐方案。
+- 结合用户“执行直到完成”的持续目标，在没有新增架构审计范围的情况下采用推荐默认：以应用级单一 retention owner、固定两层 tree regression test、production scheduler deterministic test 作为防复发措施。
+- 当前缺失 test seam 已在本任务内补齐，调用职责也已集中；不需要移交 `/improve-codebase-architecture`，不扩大为全项目日志体系审计。
