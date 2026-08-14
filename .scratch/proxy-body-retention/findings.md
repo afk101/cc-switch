@@ -220,3 +220,13 @@
 ### Remediation
 
 - 新增 Issue 03，受 Issue 02 阻塞；使用 fresh worker 按 TDD 补齐 production 调度 seam 覆盖并消除重复 helper。
+
+## Review Remediation Progress
+
+- Issue 03 已完成：应用启动接线改为调用 production `start_periodic_maintenance` seam；该 seam 先等待启动 maintenance 完成，再启动固定 24 小时循环，避免启动与周期逻辑分裂。
+- 调度回归测试使用暂停 Tokio 时间并真实调用 `run_body_dump_maintenance_at` 的 blocking seam：第一次让日志根路径成为普通文件以制造 best-effort 失败，修复隔离 fixture 后推进 24 小时，第二次 tick 会同时收敛 legacy 根层与不活跃 Profile 的旧日志。
+- TDD Red：首次定向编译因缺少 `start_periodic_maintenance`（E0432）及隔离目录 maintenance seam 不可访问（E0603）失败。Green：完整测试路径实际执行 1 项并通过，耗时 0.01 秒。
+- 首次 Green 尝试使用短测试名配合 `--exact`，实际执行 0 项，未计为 Green；改用完整模块路径后得到真实结果。随后测试暴露 Tauri 全局 runtime 与 paused Tokio clock 不同源，改用项目既有 `tokio::spawn` 后虚拟周期 tick 确定性通过。
+- Standards finding 已关闭：旧平面清理测试改为复用 production `cleanup_body_dump_tree`，第二套 test-only `cleanup_old_dump_files` 可执行实现已删除，原说明性备注保留。
+- Issue 03 验证：production maintenance 调度测试 1/1、body dump 模块测试 18/18、`cargo fmt --check`、`git diff --check`、使用系统 clang 的 `cargo check --all-targets` 均通过。
+- 受控 fixture 全部位于 `tempfile`；未读取、删除或修改用户真实 `~/.cc-switch/logs/proxy-bodies`，也未触碰范围外 `.scratch/codex-claude-chat-401/`。

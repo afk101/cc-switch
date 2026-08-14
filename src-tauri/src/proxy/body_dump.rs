@@ -311,33 +311,7 @@ fn sanitize_profile_id(profile_id: &str) -> String {
     }
 }
 
-/// 清理早于今天的 body dump 日志；失败只记录警告，不影响代理主流程。
-#[cfg(test)]
-fn cleanup_old_dump_files(dir: &std::path::Path, today_key: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        log::warn!(
-            "[BodyDump] 读取 dump 目录失败，跳过历史日志清理: {}",
-            dir.display()
-        );
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(date_key) = dump_file_date_key(&path) else {
-            continue;
-        };
-        if date_key >= today_key {
-            continue;
-        }
-        if let Err(err) = std::fs::remove_file(&path) {
-            log::warn!(
-                "[BodyDump] 删除过期 dump 文件失败: {}: {err}",
-                path.display()
-            );
-        }
-    }
-}
+// 清理早于今天的 body dump 日志；失败只记录警告，不影响代理主流程。
 
 /// Body dump 树级清理的可观察结果。
 #[derive(Debug, Default)]
@@ -391,7 +365,7 @@ pub(crate) async fn run_body_dump_maintenance() {
 }
 
 /// 对指定日志根目录执行 maintenance tick，供隔离目录测试复用。
-async fn run_body_dump_maintenance_at(root: PathBuf, today_key: String) {
+pub(crate) async fn run_body_dump_maintenance_at(root: PathBuf, today_key: String) {
     let task = tauri::async_runtime::spawn_blocking(move || {
         cleanup_body_dump_tree(&root, &today_key);
     });
@@ -652,7 +626,7 @@ mod tests {
 
     /// 清理策略删除早于今天的 dump log，保留今天和未来日期的 dump log。
     #[test]
-    fn cleanup_old_dump_files_removes_only_logs_before_today() {
+    fn cleanup_body_dump_tree_removes_only_logs_before_today() {
         let dir = tempfile::tempdir().expect("tempdir");
         let old = dir.path().join("20260707-235959-old.log");
         let today = dir.path().join("20260708-000001-today.log");
@@ -666,7 +640,7 @@ mod tests {
         std::fs::write(&malformed, "malformed").expect("write malformed");
         std::fs::write(&note, "note").expect("write note");
 
-        cleanup_old_dump_files(dir.path(), "20260708");
+        cleanup_body_dump_tree(dir.path(), "20260708");
 
         assert!(!old.exists());
         assert!(today.exists());

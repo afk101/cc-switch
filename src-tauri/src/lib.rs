@@ -312,6 +312,25 @@ async fn run_periodic_maintenance_tick(db: &database::Database) {
     crate::proxy::body_dump::run_body_dump_maintenance().await;
 }
 
+/// 启动应用级周期维护：先立即执行一次，再按固定间隔持续执行。
+async fn start_periodic_maintenance<F, Fut>(mut run_tick: F) -> tokio::task::JoinHandle<()>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    run_tick().await;
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
+        ));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            run_tick().await;
+        }
+    })
+}
+
 /// 统一处理 ccswitch:// 深链接 URL
 ///
 /// - 解析 URL
@@ -1346,21 +1365,15 @@ pub fn run() {
                 // 检查 settings 表中的旧全局代理状态，只恢复 Claude/Gemini。
                 restore_proxy_state_on_startup(&state).await;
 
-                // Periodic maintenance check (on startup)
-                run_periodic_maintenance_tick(state.db.as_ref()).await;
-
-                // Periodic maintenance timer: run once per day while the app is running
+                // 应用启动时立即维护一次，之后在应用运行期间每天维护一次。
                 let db_for_timer = state.db.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                        crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
-                    ));
-                    interval.tick().await; // skip immediate first tick (already checked above)
-                    loop {
-                        interval.tick().await;
-                        run_periodic_maintenance_tick(db_for_timer.as_ref()).await;
+                start_periodic_maintenance(move || {
+                    let db = db_for_timer.clone();
+                    async move {
+                        run_periodic_maintenance_tick(db.as_ref()).await;
                     }
-                });
+                })
+                .await;
 
                 // Session log usage sync: 启动时同步一次，之后每 60 秒检查
                 let db_for_session_sync = state.db.clone();
@@ -2379,10 +2392,14 @@ mod tests {
     use super::{
         classify_exit_request, enabled_proxy_apps_on_startup, global_proxy_startup_app_types,
         redact_url_for_log, redact_url_for_log_with_secrets, redact_url_origin_for_log,
-        runtime_log_level_allows, ExitRequestAction,
+        runtime_log_level_allows, start_periodic_maintenance, ExitRequestAction,
     };
     use crate::app_config::AppType;
     use crate::database::Database;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[test]
     fn restore_proxy_state_candidates_exclude_codex_profiles() {
@@ -2496,6 +2513,60 @@ mod tests {
             classify_exit_request(Some(1)),
             ExitRequestAction::CleanupAndExit
         );
+    }
+
+    /// 应用级维护必须在启动时立即执行，并在失败后继续响应下一次周期 tick。
+    #[tokio::test(start_paused = true)]
+    async fn periodic_maintenance_runs_on_startup_and_after_a_failed_tick() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = parent.path().join("proxy-bodies");
+        std::fs::write(&root, "not a directory").expect("write blocking root fixture");
+        let run_count = Arc::new(AtomicUsize::new(0));
+
+        let maintenance_task = start_periodic_maintenance({
+            let root = root.clone();
+            let run_count = Arc::clone(&run_count);
+            move || {
+                let root = root.clone();
+                let run_count = Arc::clone(&run_count);
+                async move {
+                    run_count.fetch_add(1, Ordering::SeqCst);
+                    crate::proxy::body_dump::run_body_dump_maintenance_at(
+                        root,
+                        "20260708".to_string(),
+                    )
+                    .await;
+                }
+            }
+        })
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(run_count.load(Ordering::SeqCst), 1);
+        assert!(root.is_file());
+
+        std::fs::remove_file(&root).expect("remove blocking root fixture");
+        let inactive_profile = root.join("inactive-profile");
+        std::fs::create_dir_all(&inactive_profile).expect("create inactive profile");
+        let legacy_old = root.join("20260707-235959-legacy.log");
+        let inactive_old = inactive_profile.join("20260707-235959-inactive.log");
+        std::fs::write(&legacy_old, "old").expect("write legacy fixture");
+        std::fs::write(&inactive_old, "old").expect("write inactive fixture");
+
+        tokio::time::advance(std::time::Duration::from_secs(
+            crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
+        ))
+        .await;
+        for _ in 0..100 {
+            if !legacy_old.exists() && !inactive_old.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        maintenance_task.abort();
+        assert_eq!(run_count.load(Ordering::SeqCst), 2);
+        assert_eq!((legacy_old.exists(), inactive_old.exists()), (false, false));
     }
 
     #[tokio::test]

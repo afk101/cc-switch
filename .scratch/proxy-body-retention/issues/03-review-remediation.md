@@ -1,6 +1,6 @@
 # 03 — 补齐维护调度回归覆盖并消除重复清理
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 **构建内容：** 让自动化测试真实驱动应用级 maintenance 调度 seam，证明启动立即执行、周期 tick 继续执行且单次失败不会终止后续循环；同时让历史平面清理测试复用生产树级 seam，避免两套 retention 实现漂移。
 
@@ -41,3 +41,8 @@
 
 ## Comments
 
+- 已由 fresh worker 按 TDD 完成；production `start_periodic_maintenance` seam 统一拥有启动立即执行与 24 小时周期执行。
+- Red→Green：测试最初因缺少 production 调度 seam（E0432）和隔离目录 maintenance seam 不可访问（E0603）而失败；最小实现后，暂停 Tokio 时间的真实 maintenance 测试通过。
+- 调度测试首次真实运行时发现 Tauri 全局 runtime 不受当前测试的 paused clock 控制；改用项目既有 Tokio runtime 后，虚拟 24 小时 tick 可确定性触发，测试耗时 0.01 秒。
+- 旧平面清理测试已改用 production `cleanup_body_dump_tree`，重复的 test-only `cleanup_old_dump_files` 可执行实现已删除，原说明性备注保留。
+- 验证：maintenance 定向测试 1/1、body dump 测试 18/18、`cargo fmt --check`、`git diff --check` 与 `cargo check --all-targets` 均通过；未触碰真实日志目录。
