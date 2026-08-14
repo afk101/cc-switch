@@ -185,3 +185,12 @@
 ## Execution Context
 
 - Review Base Commit: `eee07a7b8dc64e5e7ffd00b30159418d851d73d8`
+
+## Implementation Progress
+
+- Issue 01 已完成，worker commit：`8f4b8ca0`。
+- Issue 01 交付固定两层全局清理、严格日历日期判断、有界错误摘要与 TS-01 回归测试；未接入 maintenance，也未移除请求路径清理，符合 issue 边界。
+- TDD Red→Green 证据：缺少树级接口（E0425）→ 多目录清理通过；无效日期 `20260230` 被误删 → 严格日期解析后保留；缺少 summary 字段（E0609）→ 真实权限错误 partial-success 与 5 条样本上限通过。
+- Worker 验证：body dump tests 16/16、`cargo fmt --check`、`git diff --check`、使用系统 clang 的 `cargo check` 均通过。
+- 环境问题：裸 `cargo check` 命中 PATH 中 Node 环境的 `cc`，报 `unknown option -MD`；按不重复失败规则改为 `CC=/usr/bin/clang AR=/usr/bin/ar` 后通过。
+- 未验证边界：并发删除 `NotFound` 的真实 race 不适合作为 deterministic fixture；当前由明确 `ErrorKind::NotFound` 分支和后续代码审查证明。

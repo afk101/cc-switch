@@ -1,5 +1,7 @@
 # 01 — 建立全局树级按日清理
 
+**Status:** resolved
+
 **构建内容：** 为整个 body dump 固定两层日志树提供安全、best-effort 的按日清理能力，使根层遗留日志和所有 Profile 的过期标准日志都能在一次调用中收敛。
 
 **受阻于：** 无——可以立即开始。
@@ -40,3 +42,7 @@
 - 当天容量上限、空目录回收和 UI 配置。
 
 ## Comments
+
+- 已由 fresh worker 按 TDD 完成并提交：`8f4b8ca0`。
+- Red→Green：全局接口缺失、无效日期误删、错误摘要接口缺失三个独立失败信号均已转绿。
+- 验证：body dump 模块 16 个测试通过，格式、diff 与使用系统 clang 的 Cargo check 通过。
