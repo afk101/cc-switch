@@ -27,3 +27,9 @@ pub const BODY_DUMP_DATE_FORMAT: &str = "%Y%m%d";
 
 /// Body dump 清理摘要最多保留的错误样本数。
 pub const BODY_DUMP_CLEANUP_ERROR_SAMPLE_LIMIT: usize = 5;
+
+/// Body dump 日志根目录名称。
+pub const BODY_DUMP_DIRECTORY_NAME: &str = "proxy-bodies";
+
+/// 应用级维护任务的执行间隔（24 小时）。
+pub const PERIODIC_MAINTENANCE_INTERVAL_SECS: u64 = 24 * 60 * 60;

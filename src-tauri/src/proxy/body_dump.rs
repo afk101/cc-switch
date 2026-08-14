@@ -117,9 +117,16 @@ impl BodyDumper {
         profile_id: Option<&str>,
     ) -> std::io::Result<Self> {
         let dir = dump_dir(profile_id)?;
+        Self::try_new_in_directory(request_id, endpoint, &dir)
+    }
+
+    /// 在已准备好的目录中创建请求级 dumper，不执行历史日志维护。
+    fn try_new_in_directory(
+        request_id: &str,
+        endpoint: &str,
+        dir: &std::path::Path,
+    ) -> std::io::Result<Self> {
         let now = chrono::Local::now();
-        let today_key = now.format("%Y%m%d").to_string();
-        cleanup_old_dump_files(&dir, &today_key);
         let file_name = format!("{}-{}.log", now.format("%Y%m%d-%H%M%S"), request_id);
         let path: PathBuf = dir.join(file_name);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -270,13 +277,18 @@ impl BodyDumper {
 
 /// 计算 dump 文件所在目录，Profile 路由使用隔离后的子目录。
 fn dump_dir(profile_id: Option<&str>) -> std::io::Result<PathBuf> {
-    let base = crate::panic_hook::get_log_dir().join("proxy-bodies");
+    let base = body_dump_root();
     let dir = profile_id
         .map(sanitize_profile_id)
         .map(|profile_id| base.join(profile_id))
         .unwrap_or(base);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// 返回 body dump 日志树根目录，不主动创建目录。
+fn body_dump_root() -> PathBuf {
+    crate::panic_hook::get_log_dir().join(crate::constants::BODY_DUMP_DIRECTORY_NAME)
 }
 
 /// 将 Profile 标识净化为安全、稳定的单层目录名。
@@ -300,6 +312,7 @@ fn sanitize_profile_id(profile_id: &str) -> String {
 }
 
 /// 清理早于今天的 body dump 日志；失败只记录警告，不影响代理主流程。
+#[cfg(test)]
 fn cleanup_old_dump_files(dir: &std::path::Path, today_key: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         log::warn!(
@@ -366,6 +379,25 @@ pub fn cleanup_body_dump_tree(root: &std::path::Path, today_key: &str) -> BodyDu
     cleanup_dump_directory(root, today_key, true, &mut summary);
     summary.log_errors();
     summary
+}
+
+/// 在 blocking task 中执行一次应用级 body dump 维护。
+pub(crate) async fn run_body_dump_maintenance() {
+    let root = body_dump_root();
+    let today_key = chrono::Local::now()
+        .format(crate::constants::BODY_DUMP_DATE_FORMAT)
+        .to_string();
+    run_body_dump_maintenance_at(root, today_key).await;
+}
+
+/// 对指定日志根目录执行 maintenance tick，供隔离目录测试复用。
+async fn run_body_dump_maintenance_at(root: PathBuf, today_key: String) {
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        cleanup_body_dump_tree(&root, &today_key);
+    });
+    if let Err(error) = task.await {
+        log::warn!("[BodyDump] 全局历史日志清理任务异常结束: {error}");
+    }
 }
 
 /// 清理指定目录的一层普通日志，并按需进入其真实子目录一次。
@@ -641,6 +673,44 @@ mod tests {
         assert!(future.exists());
         assert!(malformed.exists());
         assert!(note.exists());
+    }
+
+    /// maintenance tick 失败后不得阻断下一轮对历史日志的收敛。
+    #[tokio::test]
+    async fn body_dump_maintenance_tick_recovers_after_a_failed_run() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = parent.path().join("proxy-bodies");
+        std::fs::write(&root, "not a directory").expect("write blocking root fixture");
+
+        run_body_dump_maintenance_at(root.clone(), "20260708".to_string()).await;
+        assert!(root.is_file());
+
+        std::fs::remove_file(&root).expect("remove blocking root fixture");
+        let inactive_profile = root.join("inactive-profile");
+        std::fs::create_dir_all(&inactive_profile).expect("create inactive profile");
+        let legacy_old = root.join("20260707-235959-legacy.log");
+        let inactive_old = inactive_profile.join("20260707-235959-inactive.log");
+        std::fs::write(&legacy_old, "old").expect("write legacy fixture");
+        std::fs::write(&inactive_old, "old").expect("write inactive fixture");
+
+        run_body_dump_maintenance_at(root, "20260708".to_string()).await;
+
+        assert_eq!((legacy_old.exists(), inactive_old.exists()), (false, false));
+    }
+
+    /// 创建请求级 dumper 只能创建当天日志，不得顺带扫描和删除历史日志。
+    #[test]
+    fn body_dumper_creation_does_not_cleanup_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("20260707-235959-old.log");
+        std::fs::write(&old, "old").expect("write old fixture");
+
+        let dumper =
+            BodyDumper::try_new_in_directory("request-without-retention", "/responses", dir.path())
+                .expect("create dumper");
+
+        assert!(old.exists());
+        assert_eq!(dumper.request_id(), "request-without-retention");
     }
 
     /// 一次树级清理应同时收敛根层和所有一层 Profile 目录中的过期日志。

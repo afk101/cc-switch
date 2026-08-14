@@ -304,6 +304,14 @@ fn runtime_log_level_allows(level: log::Level, max_level: log::LevelFilter) -> b
     max_level.to_level().is_some_and(|maximum| level <= maximum)
 }
 
+/// 执行一次应用级周期维护；单项失败不得阻断其它维护能力。
+async fn run_periodic_maintenance_tick(db: &database::Database) {
+    if let Err(error) = db.periodic_backup_if_needed() {
+        log::warn!("Periodic database backup failed: {error}");
+    }
+    crate::proxy::body_dump::run_body_dump_maintenance().await;
+}
+
 /// 统一处理 ccswitch:// 深链接 URL
 ///
 /// - 解析 URL
@@ -1338,24 +1346,19 @@ pub fn run() {
                 // 检查 settings 表中的旧全局代理状态，只恢复 Claude/Gemini。
                 restore_proxy_state_on_startup(&state).await;
 
-                // Periodic backup check (on startup)
-                if let Err(e) = state.db.periodic_backup_if_needed() {
-                    log::warn!("Periodic backup failed on startup: {e}");
-                }
+                // Periodic maintenance check (on startup)
+                run_periodic_maintenance_tick(state.db.as_ref()).await;
 
                 // Periodic maintenance timer: run once per day while the app is running
                 let db_for_timer = state.db.clone();
                 tauri::async_runtime::spawn(async move {
-                    const PERIODIC_MAINTENANCE_INTERVAL_SECS: u64 = 24 * 60 * 60;
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                        PERIODIC_MAINTENANCE_INTERVAL_SECS,
+                        crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
                     ));
                     interval.tick().await; // skip immediate first tick (already checked above)
                     loop {
                         interval.tick().await;
-                        if let Err(e) = db_for_timer.periodic_backup_if_needed() {
-                            log::warn!("Periodic maintenance timer failed: {e}");
-                        }
+                        run_periodic_maintenance_tick(db_for_timer.as_ref()).await;
                     }
                 });
 
