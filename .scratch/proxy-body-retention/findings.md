@@ -181,3 +181,7 @@
 - Blocking graph 为 `01 → 02`，无环；每个 issue 均能独立验证，粒度适合 fresh worker context。
 - Bug Stage 5 contract 由 Issue 01 的失败回归测试与 red → green 覆盖；Stage 6 contract 由 Issue 02 的受控原始 repro、完整验证和 instrumentation 清理检查覆盖。
 - 范围外未跟踪目录 `.scratch/codex-claude-chat-401/` 不属于本 task，不会纳入任何提交。
+
+## Execution Context
+
+- Review Base Commit: `eee07a7b8dc64e5e7ffd00b30159418d851d73d8`
