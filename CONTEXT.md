@@ -32,6 +32,18 @@ _Avoid_: Profile 独立配置、Home 源配置
 由 Profile 的供应商引用和共享供应商共同确定、可以从权威数据重新生成的生效状态。它本身不作为配置事实来源。
 _Avoid_: Profile 权威配置、独立运行配置
 
+**有效模型族**：
+共享供应商配置与 Common Config 按既有优先级合并后得到的顶层 `model` 和全部顶层 `model_reasoning_*`。在保存、切换、手动 Sync、数据库导入或云恢复这些明确同步动作中，它对 Managed Profile Home 的对应字段具有权威性：声明则覆盖，缺失则删除，空字符串 `model` 按缺失处理。
+_Avoid_: Profile 默认模型副本、启动模型
+
+**Profile 自有扩展**：
+不属于供应商受管字段或严格路由字段、由单个 Profile Home 持有的 Desktop、插件、未知扩展及其他用户设置。同步有效模型族时必须保留这些字段。
+_Avoid_: 供应商扩展、可重建模型配置
+
+**明确 Profile 同步**：
+由保存、切换、手动 Sync、数据库导入或云恢复触发的 Profile 派生状态收敛。普通应用启动和启动对账不属于明确 Profile 同步，必须保留 Home 当前 model family；未完成的模型族残留等待下一次明确动作收敛。
+_Avoid_: 启动对账、后台模型重置
+
 **Profile 私有身份状态**：
 归单个 Codex Profile 所有的官方登录身份与会话数据。共享供应商保存和其他 Profile 不得复制、替换或清理这些数据。
 _Avoid_: 共享登录状态、供应商身份副本

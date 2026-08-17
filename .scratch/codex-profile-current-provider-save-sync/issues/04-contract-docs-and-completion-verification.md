@@ -1,6 +1,6 @@
 # 04 — 合同文档与完成验证封口
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 用最终实现和测试结果固化 Codex Profile model-family 所有权、启动例外、原子保存与 best-effort 同步合同，并完成 Bug 的全量回归和清理审计。
 
@@ -14,14 +14,14 @@ Status: ready-for-agent
 
 ## Acceptance Criteria
 
-- [ ] 领域文档和 ADR 明确：Provider effective model family 权威、Profile 扩展保留、普通 startup 保留 model family。
-- [ ] 文档区分交互式 provider save 的原子合同与 Sync/Import/Restore 的 best-effort 合同。
-- [ ] 文档说明无 journal 的崩溃残留由下一次明确动作收敛。
-- [ ] 原始反馈环和所有新增回归测试通过，Base URL、MCP、catalog、runtime、External、failover、startup、rollback 既有测试无回退。
-- [ ] Rust、前端 typecheck/测试、格式与静态检查按仓库能力完成；任何环境或既有失败均有归因证据。
-- [ ] 仓库不存在本任务添加的 `[DEBUG-...]` instrumentation 或 throwaway prototype。
-- [ ] 最终 issue commit/总结说明被证实的 hypothesis：自动投影无条件保留 model family 导致保存成功但 Home 保留旧值。
-- [ ] Findings 的 requirement/scenario 覆盖矩阵与完成审计更新为最终证据。
+- [x] 领域文档和 ADR 明确：Provider effective model family 权威、Profile 扩展保留、普通 startup 保留 model family。
+- [x] 文档区分交互式 provider save 的原子合同与 Sync/Import/Restore 的 best-effort 合同。
+- [x] 文档说明无 journal 的崩溃残留由下一次明确动作收敛。
+- [x] 原始反馈环和所有新增回归测试通过，Base URL、MCP、catalog、runtime、External、failover、startup、rollback 既有测试无回退。
+- [x] Rust、前端 typecheck/测试、格式与静态检查按仓库能力完成；任何环境或既有失败均有归因证据。
+- [x] 仓库不存在本任务添加的 `[DEBUG-...]` instrumentation 或 throwaway prototype。
+- [x] 最终 issue commit/总结说明被证实的 hypothesis：自动投影无条件保留 model family 导致保存成功但 Home 保留旧值。
+- [x] Findings 的 requirement/scenario 覆盖矩阵与完成审计更新为最终证据。
 
 ## 验证方式
 
@@ -44,3 +44,8 @@ Status: ready-for-agent
 ## Comments
 
 - Review 与 docs-spec 同步由 `$implement` coordinator 在所有 issues 完成后按 skill 门禁执行。
+- 领域合同：`CONTEXT.md` 新增有效模型族、Profile 自有扩展与明确 Profile 同步词汇；ADR-0001 已明确 effective Provider + Common Config 的字段级权威、External/failover 边界、startup 例外、provider save 原子补偿、Sync/Import/Restore best-effort warning 以及无 journal 的下一次明确动作收敛。
+- Stage 6：原始反馈环已 GREEN；最终 hypothesis 确认为自动投影的 `PreserveUserModel` 无条件保留 model family，导致数据库保存成功而 Home 仍为旧值。Base URL、MCP、catalog、runtime/in-flight、External、failover、startup、CAS 与 rollback 回归均通过，未发现 `[DEBUG-...]` 或 throwaway artifact。
+- 完成审计：findings 已逐项列出 REQ-01～REQ-17 与 SCN-01～SCN-18 的公开 seam 证据，全部结论为已证实；没有用窄测试替代宽合同。
+- Rust：原始反馈环 1/1、model-family 3/3、provider save 15/15、explicit sync 3/3、startup 2/2、import/export 26/26 通过；全量 lib 2651 passed/5 ignored，其余集成目标通过。既有 `provider_commands` 有两个不带 Profile 的旧 Codex switch 测试与当前合同失配，另两个失败仅为 mutex poison 连带；Review Base 已含失配，隔离运行证实无关用例通过。fmt、check、非严格 Clippy 通过；严格 Clippy 仅报告 10 个既有无关 lint。
+- 前端：756 个 Vitest 测试通过；全量命令唯一失败为 Vitest 错收 Node TAP 文件，正确 `node --test scripts/upgrade.test.js` 1/1 通过。typecheck、Prettier check 与 renderer build 通过。

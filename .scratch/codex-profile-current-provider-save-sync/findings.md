@@ -190,3 +190,65 @@
 ## Execution Context
 
 - Review Base Commit: `4d5af755`
+
+## Stage 6 最终结论
+
+- 最终 hypothesis：根因假设 1 与 3 被证实。`29768fe5` 引入的自动直连投影使用 `PreserveUserModel`，无条件跳过顶层 `model` 与全部 `model_reasoning_*`；共享供应商保存又复用了该自动投影，所以数据库提交成功时 Profile Home 仍保留旧模型。假设 2 被保存后的数据库新值断言排除，假设 4 被计划阶段与写盘终态证据排除。
+- 修复后的原始反馈环 `shared_provider_save_updates_disabled_primary_profile_model` 已通过：数据库与 Profile Home 均在保存返回前使用 `new-model`，不再需要切换供应商。
+- Base URL 对照、MCP、模型目录、runtime snapshot、在途请求、External、failover-only、startup 保留、CAS 冲突与原子补偿均由下列公开 seam 回归覆盖，没有用 private helper 断言替代用户可观察结果。
+- 清理审计：仓库搜索未发现本任务添加的 `[DEBUG-...]`、临时 harness、throwaway prototype 或未处理的本任务 TODO；`git diff --check 4d5af755..HEAD` 通过。
+
+## Requirement 完成审计
+
+| Requirement | 最终证据 | 结论 |
+|---|---|---|
+| REQ-01 | `shared_provider_save_updates_disabled_primary_profile_model`、`shared_provider_save_hot_swaps_enabled_primary_runtime_without_restarting` 与多 Profile Base URL 高层测试 | 已证实 enabled/disabled Managed 主引用均在保存返回前同步 |
+| REQ-02 | `model_family_projection_overwrites_declared_fields_and_preserves_extensions` | 已证实顶层 `model` 与任意顶层 `model_reasoning_*` 均纳入模型族 |
+| REQ-03 | `model_family_projection_removes_absent_fields_and_normalizes_empty_model`、`shared_provider_save_removes_enabled_primary_model_family_without_restarting` | 已证实覆盖、缺失删除与空模型归一化 |
+| REQ-04 | `model_family_projection_uses_common_config_final_value` 与 `shared_provider_save_updates_disabled_primary_profile_direct_config` | 已证实 Common Config 最终优先且业务链路使用有效配置 |
+| REQ-05 | `model_family_projection_overwrites_declared_fields_and_preserves_extensions`、`shared_provider_save_applies_disabled_managed_model_family_and_preserves_extensions` | 已证实 Desktop、插件、未知扩展与非模型字段保留 |
+| REQ-06 | `shared_provider_save_updates_disabled_primary_profile_direct_config`、`shared_provider_save_preserves_database_managed_mcp_in_disabled_profile`、`shared_provider_save_syncs_referenced_home_catalog` | 已证实直连配置、MCP 与目录同步 |
+| REQ-07 | `shared_provider_save_hot_swaps_enabled_primary_runtime_without_restarting` | 已证实 listener 严格字段保持、目录/runtime 热替换、零重启以及在途/新请求快照隔离 |
+| REQ-08 | 同一 enabled 保存测试在保存后执行 `disable` 并验证严格路由字段恢复、模型族与扩展保留 | 已证实 |
+| REQ-09 | `shared_provider_save_skips_external_home_and_updates_managed_profile`、`shared_provider_save_updates_only_enabled_failover_runtime_snapshot`、`explicit_sync_uses_each_managed_profile_primary_provider_and_skips_external` | 已证实 External 全跳过、failover-only 只更新运行时 |
+| REQ-10 | `disabled_managed_startup_reconcile_authoritatively_updates_inline_provider_fields`、`startup_restore_uses_database_provider_versions_without_replacing_user_mcp` | 已证实 disabled/enabled 启动对账均保留 Home 当前模型族 |
+| REQ-11 | `explicit_sync_uses_each_managed_profile_primary_provider_and_skips_external`、`explicit_sync_updates_enabled_profile_without_restarting_listener`，以及 Import/backup/WebDAV/S3 命令到 `run_post_import_sync` 的接线 | 已证实所有明确入口按各自主供应商同步 Managed Profile |
+| REQ-12 | `explicit_sync_continues_after_profile_failure_and_returns_sanitized_warning` | 已证实单个失败不回滚成功 Profile 且继续后续 Profile |
+| REQ-13 | 同一部分失败测试、`attach_profile_sync_result_preserves_restore_success_and_exposes_structured_warnings`、前端 Import warning 测试 | 已证实完成但有警告、逐 Profile 脱敏原因与数据库成功状态保持 |
+| REQ-14 | `shared_provider_save_rolls_back_all_disabled_homes_when_one_write_fails`、`shared_provider_save_restores_mixed_profiles_when_database_commit_fails`、enabled runtime 缺失预检测试 | 已证实 Home/目录/runtime/数据库处于同一交互式补偿边界 |
+| REQ-15 | `shared_provider_save_rejects_concurrent_home_change_without_sensitive_detail` 与显式同步脱敏 warning 测试 | 已证实 CAS 拒绝覆盖且公开错误不含 token、URL 或配置正文 |
+| REQ-16 | startup 保留测试、显式同步可重复公开入口、无 schema/journal 变更的代码差异 | 已证实普通启动不强制修复模型族，下一次明确动作可继续收敛且未引入 journal |
+| REQ-17 | `codex_provider_update_preflight_rejects_id_change_before_write` | 已证实 Codex provider key rename 在写入前拒绝 |
+
+## Scenario 完成审计
+
+| Scenario | 最终证据 | 结论 |
+|---|---|---|
+| SCN-01 | 原始反馈环 `shared_provider_save_updates_disabled_primary_profile_model` | 已证实 |
+| SCN-02 | `shared_provider_save_updates_disabled_primary_profile_direct_config`：供应商模型不变、Home 临时模型不同，只修改 Base URL 仍重新应用有效模型 | 已证实 |
+| SCN-03 | Home 配置服务删除/空模型测试与 enabled 删除测试 | 已证实 |
+| SCN-04 | Common Config 原语测试与命令层保存测试 | 已证实 |
+| SCN-05 | Home 配置服务扩展保留测试及 disabled/enabled 高层扩展断言 | 已证实 |
+| SCN-06 | enabled 热替换高层测试 | 已证实 |
+| SCN-07 | enabled 热替换测试保存 `in_flight_snapshot` 并对照热替换后的 runtime snapshot | 已证实 |
+| SCN-08 | enabled 热替换测试保存后关闭路由并验证最终 Home | 已证实 |
+| SCN-09 | 多主引用命令测试、External 测试、failover-only runtime 测试 | 已证实 |
+| SCN-10 | 多 Home 写失败回滚、混合 Profile 数据库提交失败补偿及脱敏断言 | 已证实 |
+| SCN-11 | disabled 与 enabled startup 对账测试 | 已证实 |
+| SCN-12 | 多主供应商显式同步测试 | 已证实 |
+| SCN-13 | 显式同步全成功结果、恢复成功 payload 测试及全部恢复入口接线 | 已证实 |
+| SCN-14 | best-effort 部分失败测试、恢复成功 payload 保持测试与前端 warning 展示测试 | 已证实 |
+| SCN-15 | best-effort 部分失败测试 | 已证实 |
+| SCN-16 | provider save CAS 冲突测试；best-effort 使用同一指纹保护计划并转为逐 Profile outcome | 已证实 |
+| SCN-17 | 空有效模型族删除原语测试与 enabled 无模型保存测试；实现对 Official/Custom 不设分支 | 已证实 |
+| SCN-18 | 无 journal 差异审计、startup 保留测试与可重复显式同步入口 | 已证实残留不会被 startup 改写且可由下一次明确动作收敛 |
+
+## 最终验证记录
+
+- 原始反馈环：系统 Clang 环境下 `shared_provider_save_updates_disabled_primary_profile_model` 为 `1 passed`。
+- 相关 Rust 行为集：model-family `3/3`、`shared_provider_save_*` `15/15`、explicit sync `3/3`、disabled/enabled startup 精确回归 `2/2`、`import_export_sync` `26/26` 均通过。
+- Rust 全量：`cargo test --all-targets -- --test-threads=1` 的 lib 为 `2651 passed, 5 ignored`；在 `provider_commands` 前已执行的集成测试全部通过。命令在该既有测试目标以 `6 passed, 4 failed` 停止；其中两个 Codex switch 用例仍调用不带 Profile 的旧 test hook，和自 `98809e66` 起的“Codex 切换必须指定 Codex Profile”公开合同不一致，另外两个失败是首个 panic 毒化共享 mutex 的连带结果。Review Base `4d5af755` 已同时包含旧测试期望与新合同，本任务未修改该测试目标或 switch 路径。隔离验证中两个 Codex 旧用例稳定报相同 `InvalidInput`，两个连带用例单独运行通过；被全量命令截断的 `provider_service 36/36`、`proxy_commands 2/2`、`skill_sync 7/7`、`support 0/0` 已另行全部通过。
+- 前端全量：Vitest 的 756 个实际测试全部通过；唯一 suite 失败是其错误收集 Node TAP 文件 `scripts/upgrade.test.js` 并报告 `No test suite found`。使用正确 runner 执行 `node --test scripts/upgrade.test.js` 为 `1/1` 通过。
+- 前端静态/构建：`pnpm typecheck`、`pnpm format:check`、`pnpm build:renderer` 全部通过；构建只有既有依赖数据过期、动态/静态 import 和 chunk size warning。
+- Rust 静态：`cargo fmt --check`、`cargo check --all-targets`、非严格 `cargo clippy --all-targets` 通过。严格 `-D warnings` 被 10 个 Review Base 已存在且与本任务无关的 lint 阻断：`migration.rs` 1、`body_dump.rs` 6、`forwarder.rs` 1、`route_manager.rs` 既有测试 1、`prompt_files.rs` 1；本任务新增/修改代码没有 Clippy warning。
+- 最终卫生：`git diff --check` 通过；全仓搜索未发现 `[DEBUG-...]` 或本任务 throwaway artifact。
