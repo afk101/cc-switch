@@ -1,36 +1,52 @@
 use serde_json::{json, Value};
-use std::sync::Arc;
 
-use crate::database::Database;
 use crate::error::AppError;
 use crate::services::provider::ProviderService;
 use crate::settings;
 use crate::store::AppState;
 
-pub(crate) fn run_post_import_sync(db: Arc<Database>) -> Result<(), AppError> {
-    let app_state = AppState::new(db);
-    ProviderService::sync_current_to_live(&app_state)?;
-    settings::reload_settings()?;
-    Ok(())
+use crate::codex_profile::CodexExplicitSyncResult;
+
+/// 显式同步完成后的统一命令层结果，数据库恢复成功不会被后置失败推翻。
+pub(crate) struct PostOperationSyncResult {
+    pub profile_sync: Option<CodexExplicitSyncResult>,
+    pub warning: Option<String>,
 }
 
-fn post_sync_warning<E: std::fmt::Display>(err: E) -> String {
+/// 执行手动 Sync、Import 与云恢复共用的后置同步合同。
+pub(crate) async fn run_post_import_sync(state: &AppState) -> PostOperationSyncResult {
+    let db = state.db.clone();
+    let live_sync = tauri::async_runtime::spawn_blocking(move || {
+        let app_state = AppState::new(db);
+        ProviderService::sync_current_to_live(&app_state)
+    })
+    .await;
+    // Profile 投影最后执行，确保旧 global Live 同步不会覆盖默认 Profile 自己的主供应商。
+    let profile_sync = state
+        .codex_route_manager
+        .sync_managed_profiles_explicit(state.db.as_ref())
+        .await
+        .ok();
+    let settings_sync = settings::reload_settings();
+    let warning =
+        if profile_sync.is_none() || !matches!(live_sync, Ok(Ok(()))) || settings_sync.is_err() {
+            Some(post_sync_warning())
+        } else {
+            None
+        };
+    PostOperationSyncResult {
+        profile_sync,
+        warning,
+    }
+}
+
+fn post_sync_warning() -> String {
     AppError::localized(
         "sync.post_operation_sync_failed",
-        format!("后置同步状态失败: {err}"),
-        format!("Post-operation synchronization failed: {err}"),
+        "后置同步未完全完成，请修复配置或文件权限后重试",
+        "Post-operation synchronization did not fully complete; fix the configuration or file permissions and retry.",
     )
     .to_string()
-}
-
-pub(crate) fn post_sync_warning_from_result(
-    result: Result<Result<(), AppError>, String>,
-) -> Option<String> {
-    match result {
-        Ok(Ok(())) => None,
-        Ok(Err(err)) => Some(post_sync_warning(err)),
-        Err(err) => Some(post_sync_warning(err)),
-    }
 }
 
 pub(crate) fn attach_warning(mut value: Value, warning: Option<String>) -> Value {
@@ -40,6 +56,39 @@ pub(crate) fn attach_warning(mut value: Value, warning: Option<String>) -> Value
         }
     }
     value
+}
+
+/// 将结构化 Profile 同步结果附加到既有成功 payload，不改变导入或恢复成功语义。
+pub(crate) fn attach_profile_sync_result(
+    mut value: Value,
+    profile_sync: CodexExplicitSyncResult,
+) -> Value {
+    let warnings = serde_json::to_value(&profile_sync.warnings).unwrap_or_else(|_| json!([]));
+    let profile_sync_value = serde_json::to_value(profile_sync).unwrap_or_else(|_| {
+        json!({
+            "status": "completed_with_warnings",
+            "synchronizedCount": 0,
+            "skippedCount": 0,
+            "warnings": [],
+            "outcomes": []
+        })
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.insert("warnings".to_string(), warnings);
+        object.insert("profileSync".to_string(), profile_sync_value);
+    }
+    value
+}
+
+/// 将统一后置同步结果附加到既有操作 payload。
+pub(crate) fn attach_post_operation_sync_result(
+    mut value: Value,
+    sync_result: PostOperationSyncResult,
+) -> Value {
+    if let Some(profile_sync) = sync_result.profile_sync {
+        value = attach_profile_sync_result(value, profile_sync);
+    }
+    attach_warning(value, sync_result.warning)
 }
 
 pub(crate) fn success_payload_with_warning(backup_id: String, warning: Option<String>) -> Value {
@@ -55,31 +104,11 @@ pub(crate) fn success_payload_with_warning(backup_id: String, warning: Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_warning, post_sync_warning_from_result};
+    use super::{attach_profile_sync_result, attach_warning};
+    use crate::codex_profile::{
+        CodexExplicitProfileSyncOutcome, CodexExplicitSyncResult, CodexProfileSyncWarning,
+    };
     use serde_json::json;
-
-    #[test]
-    fn post_sync_warning_from_result_returns_none_on_success() {
-        let warning = post_sync_warning_from_result(Ok(Ok(())));
-        assert!(warning.is_none());
-    }
-
-    #[test]
-    fn post_sync_warning_from_result_returns_some_on_sync_error() {
-        let warning =
-            post_sync_warning_from_result(Ok(Err(crate::error::AppError::Config("boom".into()))));
-        assert!(warning.is_some());
-    }
-
-    #[tokio::test]
-    async fn post_sync_warning_from_result_returns_some_on_join_error() {
-        let handle = tokio::spawn(async move {
-            panic!("forced join error");
-        });
-        let join_err = handle.await.expect_err("task should panic");
-        let warning = post_sync_warning_from_result(Err(join_err.to_string()));
-        assert!(warning.is_some());
-    }
 
     #[test]
     fn attach_warning_adds_warning_without_dropping_existing_fields() {
@@ -93,5 +122,39 @@ mod tests {
             updated.get("warning").and_then(|v| v.as_str()),
             Some("post sync warning")
         );
+    }
+
+    #[test]
+    fn attach_profile_sync_result_preserves_restore_success_and_exposes_structured_warnings() {
+        let profile_warning = CodexProfileSyncWarning {
+            profile_id: "profile-failed".to_string(),
+            profile_name: "Failed Profile".to_string(),
+            home_path: "/tmp/profile-failed".to_string(),
+            reason: "Profile Home 同步失败".to_string(),
+        };
+        let sync_result = CodexExplicitSyncResult {
+            status: "completed_with_warnings".to_string(),
+            synchronized_count: 1,
+            skipped_count: 0,
+            warnings: vec![profile_warning],
+            outcomes: vec![CodexExplicitProfileSyncOutcome {
+                profile_id: "profile-failed".to_string(),
+                profile_name: "Failed Profile".to_string(),
+                home_path: "/tmp/profile-failed".to_string(),
+                status: "failed".to_string(),
+                warning: Some("Profile Home 同步失败".to_string()),
+            }],
+        };
+
+        let payload = attach_profile_sync_result(
+            json!({ "success": true, "backupId": "safety-backup" }),
+            sync_result,
+        );
+
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["backupId"], "safety-backup");
+        assert_eq!(payload["profileSync"]["status"], "completed_with_warnings");
+        assert_eq!(payload["warnings"][0]["profileId"], "profile-failed");
+        assert_eq!(payload["warnings"][0]["reason"], "Profile Home 同步失败");
     }
 }

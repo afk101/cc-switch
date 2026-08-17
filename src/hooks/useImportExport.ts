@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { settingsApi } from "@/lib/api";
-import { syncCurrentProvidersLiveSafe } from "@/utils/postChangeSync";
+import { formatProfileSyncWarnings } from "@/utils/postChangeSync";
 
 export type ImportStatus =
   | "idle"
@@ -101,8 +101,7 @@ export function useImportExport(
       // - 避免依赖 setTimeout（组件卸载会取消）
       void onImportSuccess?.();
 
-      const syncResult = await syncCurrentProvidersLiveSafe();
-      if (syncResult.ok) {
+      if (!result.warning && !result.warnings?.length) {
         setStatus("success");
         toast.success(
           t("settings.importSuccess", {
@@ -111,16 +110,17 @@ export function useImportExport(
           { closeButton: true },
         );
       } else {
-        console.error(
-          "[useImportExport] Failed to sync live config",
-          syncResult.error,
-        );
         setStatus("partial-success");
         toast.warning(
           t("settings.importPartialSuccess", {
             defaultValue:
               "配置已导入，但同步到当前供应商失败。请手动重新选择一次供应商。",
           }),
+          {
+            description:
+              formatProfileSyncWarnings(result.warnings) ?? result.warning,
+            closeButton: true,
+          },
         );
       }
     } catch (error) {

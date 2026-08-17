@@ -22,6 +22,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useBackupManager } from "@/hooks/useBackupManager";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { formatProfileSyncWarnings } from "@/utils/postChangeSync";
 
 interface BackupListSectionProps {
   backupIntervalHours?: number;
@@ -87,16 +88,23 @@ export function BackupListSection({
   const handleRestore = async () => {
     if (!confirmFilename) return;
     try {
-      const safetyId = await restore(confirmFilename);
+      const result = await restore(confirmFilename);
       setConfirmFilename(null);
-      toast.success(
+      const notify =
+        result.warning || result.warnings?.length
+          ? toast.warning
+          : toast.success;
+      notify(
         t("settings.backupManager.restoreSuccess", {
           defaultValue: "Restore successful! Safety backup created",
         }),
         {
-          description: safetyId
-            ? `${t("settings.backupManager.safetyBackupId", { defaultValue: "Safety Backup ID" })}: ${safetyId}`
-            : undefined,
+          description:
+            formatProfileSyncWarnings(result.warnings) ??
+            result.warning ??
+            (result.backupId
+              ? `${t("settings.backupManager.safetyBackupId", { defaultValue: "Safety Backup ID" })}: ${result.backupId}`
+              : undefined),
           duration: 6000,
           closeButton: true,
         },

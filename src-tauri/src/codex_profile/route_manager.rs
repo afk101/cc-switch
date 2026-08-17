@@ -18,10 +18,17 @@ use crate::codex_profile::{
     CodexProfileScope, CodexProfileSecretStore, CodexProvenPreviousListenerToken,
     CodexRouteConfigPlan, CodexRouteProviderSnapshot, CodexRouteRuntime, CodexRouteRuntimeFactory,
     CodexRouteRuntimeStartError, CodexRuntimeStatus, CODEX_CATALOG_RECONCILE_ERROR_PREFIX,
-    CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR,
-    CODEX_ROUTE_RECOVERY_OPERATION_DELETE, CODEX_ROUTE_RECOVERY_OPERATION_DISABLE,
-    CODEX_ROUTE_RECOVERY_OPERATION_ENABLE, CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE,
-    CODEX_ROUTE_RECOVERY_OPERATION_SWITCH, CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
+    CODEX_DERIVED_STATE_RECONCILE_ERROR_PREFIX, CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED,
+    CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SKIPPED_EXTERNAL,
+    CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SYNCHRONIZED, CODEX_EXPLICIT_SYNC_STATUS_COMPLETED,
+    CODEX_EXPLICIT_SYNC_STATUS_COMPLETED_WITH_WARNINGS, CODEX_EXPLICIT_SYNC_WARNING_APPLY_FAILED,
+    CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED, CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING,
+    CODEX_EXPLICIT_SYNC_WARNING_PROVIDER_UNAVAILABLE, CODEX_EXPLICIT_SYNC_WARNING_ROUTE_MISSING,
+    CODEX_EXPLICIT_SYNC_WARNING_RUNTIME_UNAVAILABLE, CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE,
+    CODEX_ROUTE_COMPENSATION_UNCONVERGED_ERROR, CODEX_ROUTE_RECOVERY_OPERATION_DELETE,
+    CODEX_ROUTE_RECOVERY_OPERATION_DISABLE, CODEX_ROUTE_RECOVERY_OPERATION_ENABLE,
+    CODEX_ROUTE_RECOVERY_OPERATION_RECONCILE, CODEX_ROUTE_RECOVERY_OPERATION_SWITCH,
+    CODEX_ROUTE_RECOVERY_PHASE_DELETE_DATABASE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DELETE_TOKEN_PENDING,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_HOME_RESTORE_FAILED,
     CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOPPED, CODEX_ROUTE_RECOVERY_PHASE_DISABLE_STOP_FAILED,
@@ -168,6 +175,39 @@ struct CodexProviderRuntimeUpdate {
 struct CodexProviderSaveProjection {
     home_entries: Vec<CodexProviderHomeProjectionEntry>,
     runtime_updates: Vec<CodexProviderRuntimeUpdate>,
+}
+
+/// 单个 Profile 显式同步的结构化公开结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexExplicitProfileSyncOutcome {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub home_path: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// 可展示给用户的逐 Profile 脱敏 warning。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexProfileSyncWarning {
+    pub profile_id: String,
+    pub profile_name: String,
+    pub home_path: String,
+    pub reason: String,
+}
+
+/// 手动 Sync、Import 与云恢复共用的 Profile 显式同步结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexExplicitSyncResult {
+    pub status: String,
+    pub synchronized_count: usize,
+    pub skipped_count: usize,
+    pub warnings: Vec<CodexProfileSyncWarning>,
+    pub outcomes: Vec<CodexExplicitProfileSyncOutcome>,
 }
 
 /// 已启用 Profile 在启动阶段完成所有权检查后的准备结果。
@@ -524,6 +564,212 @@ impl CodexRouteManager {
             }
         }
         Ok(false)
+    }
+
+    /// 按每个 Profile 自己的主供应商执行 route-aware 显式同步。
+    pub async fn sync_managed_profiles_explicit(
+        &self,
+        db: &Database,
+    ) -> Result<CodexExplicitSyncResult, AppError> {
+        let _catalog_guard = self.catalog_sync_lock.lock().await;
+        let mut profiles = self.persistence.list_profiles()?;
+        profiles.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut outcomes = Vec::with_capacity(profiles.len());
+
+        for profile in profiles {
+            outcomes.push(self.sync_profile_explicit(db, profile).await);
+        }
+
+        let synchronized_count = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SYNCHRONIZED)
+            .count();
+        let skipped_count = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SKIPPED_EXTERNAL)
+            .count();
+        let warnings = outcomes
+            .iter()
+            .filter(|outcome| outcome.status == CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED)
+            .filter_map(|outcome| {
+                outcome
+                    .warning
+                    .as_ref()
+                    .map(|reason| CodexProfileSyncWarning {
+                        profile_id: outcome.profile_id.clone(),
+                        profile_name: outcome.profile_name.clone(),
+                        home_path: outcome.home_path.clone(),
+                        reason: reason.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        let status = if warnings.is_empty() {
+            CODEX_EXPLICIT_SYNC_STATUS_COMPLETED
+        } else {
+            CODEX_EXPLICIT_SYNC_STATUS_COMPLETED_WITH_WARNINGS
+        };
+        Ok(CodexExplicitSyncResult {
+            status: status.to_string(),
+            synchronized_count,
+            skipped_count,
+            warnings,
+            outcomes,
+        })
+    }
+
+    /// 隔离执行单个 Profile 的显式同步，失败只转换为该 Profile 的脱敏结果。
+    async fn sync_profile_explicit(
+        &self,
+        db: &Database,
+        profile: CodexProfile,
+    ) -> CodexExplicitProfileSyncOutcome {
+        let home_path = std::path::PathBuf::from(&profile.canonical_home_path);
+        let lock = match self.profile_lock(&profile.id) {
+            Ok(lock) => lock,
+            Err(_) => {
+                return Self::explicit_sync_failed_outcome(
+                    &profile,
+                    CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE,
+                );
+            }
+        };
+        let _guard = lock.lock().await;
+        let route = match self.persistence.get_route(&profile.id) {
+            Ok(Some(route)) => route,
+            Ok(None) => {
+                return Self::explicit_sync_failed_outcome(
+                    &profile,
+                    CODEX_EXPLICIT_SYNC_WARNING_ROUTE_MISSING,
+                );
+            }
+            Err(_) => {
+                return Self::explicit_sync_failed_outcome(
+                    &profile,
+                    CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE,
+                );
+            }
+        };
+        if route.home_ownership == CodexHomeOwnership::External {
+            return CodexExplicitProfileSyncOutcome {
+                profile_id: profile.id,
+                profile_name: profile.name,
+                home_path: home_path.display().to_string(),
+                status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SKIPPED_EXTERNAL.to_string(),
+                warning: None,
+            };
+        }
+        let Some(provider_id) = route.current_provider_id.as_deref() else {
+            return Self::explicit_sync_failed_outcome(
+                &profile,
+                CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING,
+            );
+        };
+        let mut provider = match self.persistence.get_provider(provider_id) {
+            Ok(Some(provider)) => provider,
+            Ok(None) | Err(_) => {
+                return Self::explicit_sync_failed_outcome(
+                    &profile,
+                    CODEX_EXPLICIT_SYNC_WARNING_PROVIDER_UNAVAILABLE,
+                );
+            }
+        };
+        provider.settings_config =
+            match build_effective_settings_with_common_config(db, &AppType::Codex, &provider) {
+                Ok(settings) => settings,
+                Err(_) => {
+                    return Self::explicit_sync_failed_outcome(
+                        &profile,
+                        CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED,
+                    );
+                }
+            };
+
+        let sync_result = if route.enabled {
+            self.sync_enabled_profile_explicit(db, &profile, &provider)
+                .await
+        } else {
+            self.sync_disabled_profile_explicit(db, &home_path, &provider)
+        };
+        match sync_result {
+            Ok(()) => CodexExplicitProfileSyncOutcome {
+                profile_id: profile.id,
+                profile_name: profile.name,
+                home_path: home_path.display().to_string(),
+                status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SYNCHRONIZED.to_string(),
+                warning: None,
+            },
+            Err(summary) => Self::explicit_sync_failed_outcome(&profile, summary),
+        }
+    }
+
+    /// 显式同步单个关闭态 Managed Profile 的直连 Home。
+    fn sync_disabled_profile_explicit(
+        &self,
+        db: &Database,
+        home_path: &std::path::Path,
+        provider: &Provider,
+    ) -> Result<(), &'static str> {
+        let mut home_provider = provider.clone();
+        home_provider.settings_config = McpService::project_enabled_codex_servers_to_settings(
+            db,
+            &home_provider.settings_config,
+        )
+        .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED)?;
+        let plan = self
+            .home_config
+            .build_authoritative_direct_provider_plan(home_path, &home_provider)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED)?;
+        self.home_config
+            .apply_direct_provider_plan(&plan)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_APPLY_FAILED)
+    }
+
+    /// 显式同步单个开启态 Managed Profile 的 routed Home、目录与运行时快照。
+    async fn sync_enabled_profile_explicit(
+        &self,
+        db: &Database,
+        profile: &CodexProfile,
+        provider: &Provider,
+    ) -> Result<(), &'static str> {
+        let runtime = self
+            .runtime(&profile.id)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_RUNTIME_UNAVAILABLE)?;
+        if !runtime.status().await.is_active() {
+            return Err(CODEX_EXPLICIT_SYNC_WARNING_RUNTIME_UNAVAILABLE);
+        }
+        let failover_ids = self
+            .persistence
+            .list_failovers(&profile.id)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE)?;
+        let snapshot = self
+            .provider_snapshot_with_override(db, &provider.id, &failover_ids, provider)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED)?;
+        let plan = self
+            .home_config
+            .build_authoritative_routed_provider_plan(
+                std::path::Path::new(&profile.canonical_home_path),
+                provider,
+            )
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED)?;
+        self.home_config
+            .apply_authoritative_routed_provider_plan(&plan)
+            .map_err(|_| CODEX_EXPLICIT_SYNC_WARNING_APPLY_FAILED)?;
+        runtime.swap_provider_snapshot(snapshot).await;
+        Ok(())
+    }
+
+    /// 构造不包含配置正文、token 或底层错误文本的 Profile warning outcome。
+    fn explicit_sync_failed_outcome(
+        profile: &CodexProfile,
+        summary: &'static str,
+    ) -> CodexExplicitProfileSyncOutcome {
+        CodexExplicitProfileSyncOutcome {
+            profile_id: profile.id.clone(),
+            profile_name: profile.name.clone(),
+            home_path: profile.canonical_home_path.clone(),
+            status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED.to_string(),
+            warning: Some(summary.to_string()),
+        }
     }
 
     /// 返回主供应商引用匹配的 Profile，故障转移引用不参与目录扇出。
@@ -5673,6 +5919,263 @@ mod codex_route_manager {
         })?;
         let direct_plan = home_config.build_direct_provider_plan(home, provider)?;
         home_config.apply_direct_provider_plan(&direct_plan)
+    }
+
+    /// 显式同步必须让每个 Managed Profile 使用自己的主供应商，并跳过 External Home。
+    #[tokio::test]
+    async fn explicit_sync_uses_each_managed_profile_primary_provider_and_skips_external(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let home_a = tempfile::tempdir().expect("创建显式同步 Home A");
+        let home_b = tempfile::tempdir().expect("创建显式同步 Home B");
+        let external_home = tempfile::tempdir().expect("创建 External Home");
+        let mut provider_a = provider_with_route_catalog("provider-sync-a", "catalog-a");
+        provider_a.settings_config["config"] = json!(
+            "model = \"model-a\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://a.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut provider_b = provider_with_route_catalog("provider-sync-b", "catalog-b");
+        provider_b.settings_config["config"] = json!(
+            "model = \"model-b\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://b.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        for provider in [&provider_a, &provider_b] {
+            db.save_provider(AppType::Codex.as_str(), provider)?;
+        }
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home_a.path(),
+            "profile-sync-a",
+            16_101,
+            &provider_a,
+        )?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home_b.path(),
+            "profile-sync-b",
+            16_102,
+            &provider_b,
+        )?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            external_home.path(),
+            "profile-sync-external",
+            16_103,
+            &provider_a,
+        )?;
+        let mut external_route = db
+            .get_codex_profile_route("profile-sync-external")?
+            .expect("External 路由存在");
+        external_route.home_ownership = CodexHomeOwnership::External;
+        db.save_codex_profile_route(&external_route)?;
+        for home in [home_a.path(), home_b.path(), external_home.path()] {
+            fs::write(
+                codex_config_path_for_home(home),
+                "model = \"temporary-model\"\nmodel_reasoning_summary = \"legacy\"\nuser_extension = \"keep\"\n",
+            )
+            .expect("写入显式同步前配置");
+        }
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let result = manager.sync_managed_profiles_explicit(db.as_ref()).await?;
+
+        let home_a_text = fs::read_to_string(codex_config_path_for_home(home_a.path()))
+            .expect("读取显式同步 Home A");
+        let home_b_text = fs::read_to_string(codex_config_path_for_home(home_b.path()))
+            .expect("读取显式同步 Home B");
+        let external_text = fs::read_to_string(codex_config_path_for_home(external_home.path()))
+            .expect("读取 External Home");
+        assert!(home_a_text.contains("model = \"model-a\""));
+        assert!(home_a_text.contains("model_reasoning_effort = \"high\""));
+        assert!(!home_a_text.contains("model_reasoning_summary"));
+        assert!(home_b_text.contains("model = \"model-b\""));
+        assert!(!home_b_text.contains("model_reasoning_summary"));
+        assert!(home_a_text.contains("user_extension = \"keep\""));
+        assert!(home_b_text.contains("user_extension = \"keep\""));
+        assert!(external_text.contains("model = \"temporary-model\""));
+        assert!(external_text.contains("model_reasoning_summary = \"legacy\""));
+
+        let result_json = serde_json::to_value(result).expect("序列化显式同步结果");
+        assert_eq!(result_json["status"], "completed");
+        assert_eq!(result_json["synchronizedCount"], 2);
+        assert_eq!(result_json["skippedCount"], 1);
+        assert_eq!(result_json["warnings"], json!([]));
+        assert_eq!(result_json["outcomes"].as_array().map(Vec::len), Some(3));
+        Ok(())
+    }
+
+    /// 单个 Home 失败不得阻止后续 Profile，结构化 warning 必须在错误源附近脱敏。
+    #[tokio::test]
+    async fn explicit_sync_continues_after_profile_failure_and_returns_sanitized_warning(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let setup_home_config = CodexHomeConfigService::system();
+        let failed_home = tempfile::tempdir().expect("创建失败 Profile Home");
+        let successful_home = tempfile::tempdir().expect("创建成功 Profile Home");
+        let missing_primary_home = tempfile::tempdir().expect("创建缺少主供应商 Profile Home");
+        let mut provider = provider_with_route_catalog("provider-best-effort", "catalog-model");
+        provider.settings_config["config"] = json!(
+            "model = \"provider-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://best-effort.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-provider-token\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            &setup_home_config,
+            failed_home.path(),
+            "profile-a-fails",
+            16_111,
+            &provider,
+        )?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            &setup_home_config,
+            successful_home.path(),
+            "profile-b-succeeds",
+            16_112,
+            &provider,
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-c-missing-primary".to_string(),
+            name: "Missing Primary Profile".to_string(),
+            canonical_home_path: missing_primary_home.path().display().to_string(),
+            listen_port: 16_113,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-c-missing-primary".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        for home in [failed_home.path(), successful_home.path()] {
+            fs::write(
+                codex_config_path_for_home(home),
+                "model = \"temporary-model\"\nuser_extension = \"keep\"\n",
+            )
+            .expect("写入 best-effort 同步前配置");
+        }
+        let failed_config_path = codex_config_path_for_home(failed_home.path());
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(Arc::new(FailSpecificReadOps {
+                fail_path: failed_config_path.clone(),
+            }))),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let result = manager.sync_managed_profiles_explicit(db.as_ref()).await?;
+
+        assert!(fs::read_to_string(&failed_config_path)
+            .expect("读取失败 Profile 原配置")
+            .contains("model = \"temporary-model\""));
+        assert!(
+            fs::read_to_string(codex_config_path_for_home(successful_home.path()))
+                .expect("读取后续成功 Profile 配置")
+                .contains("model = \"provider-model\"")
+        );
+        let result_json = serde_json::to_value(result).expect("序列化 best-effort 结果");
+        assert_eq!(result_json["status"], "completed_with_warnings");
+        assert_eq!(result_json["synchronizedCount"], 1);
+        assert_eq!(result_json["warnings"].as_array().map(Vec::len), Some(2));
+        assert_eq!(result_json["warnings"][0]["profileId"], "profile-a-fails");
+        assert!(result_json["warnings"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("配置格式") || reason.contains("Home 权限")));
+        assert_eq!(
+            result_json["warnings"][1]["profileId"],
+            "profile-c-missing-primary"
+        );
+        assert_eq!(
+            result_json["warnings"][1]["reason"],
+            CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING
+        );
+        let public_result = result_json.to_string();
+        assert!(!public_result.contains("private-plan-error-body"));
+        assert!(!public_result.contains("private-provider-token"));
+        assert!(!public_result.contains("best-effort.example.com"));
+        Ok(())
+    }
+
+    /// 已启用 Profile 的显式同步必须保持 listener，并热更新 Home、目录与运行时。
+    #[tokio::test]
+    async fn explicit_sync_updates_enabled_profile_without_restarting_listener(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let home = tempfile::tempdir().expect("创建已启用显式同步 Home");
+        let mut old_provider = provider_with_route_catalog("provider-enabled-sync", "old-catalog");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        prepare_enabled_catalog_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-enabled-explicit-sync",
+            16_121,
+            &old_provider,
+        )?;
+        let mut new_provider = provider_with_route_catalog("provider-enabled-sync", "new-catalog");
+        new_provider.settings_config["config"] = json!(
+            "model = \"new-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &new_provider)?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let runtime = snapshot_tracking_runtime(old_provider, Vec::new());
+        manager.runtimes.lock()?.insert(
+            "profile-enabled-explicit-sync".to_string(),
+            runtime.clone() as Arc<dyn CodexRouteRuntime>,
+        );
+
+        let result = manager.sync_managed_profiles_explicit(db.as_ref()).await?;
+
+        let home_text = fs::read_to_string(codex_config_path_for_home(home.path()))
+            .expect("读取已启用显式同步配置");
+        assert!(home_text.contains("model = \"new-model\""));
+        assert!(home_text.contains("model_reasoning_effort = \"high\""));
+        assert!(home_text.contains("http://127.0.0.1:16121/v1"));
+        assert!(!home_text.contains("https://new.example.com/v1"));
+        let catalog = fs::read_to_string(
+            home.path()
+                .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME),
+        )
+        .expect("读取已启用显式同步模型目录");
+        assert!(catalog.contains("new-catalog"));
+        assert!(!catalog.contains("old-catalog"));
+        assert_eq!(runtime.swaps.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
+        assert_eq!(result.synchronized_count, 1);
+        assert!(result.warnings.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

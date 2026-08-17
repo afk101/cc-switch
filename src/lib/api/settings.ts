@@ -13,6 +13,40 @@ export interface ConfigTransferResult {
   message: string;
   filePath?: string;
   backupId?: string;
+  warning?: string;
+  warnings?: ProfileSyncWarning[];
+  profileSync?: ProfileSyncResult;
+}
+
+export interface ProfileSyncWarning {
+  profileId: string;
+  profileName: string;
+  homePath: string;
+  reason: string;
+}
+
+export interface ProfileSyncOutcome {
+  profileId: string;
+  profileName: string;
+  homePath: string;
+  status: "synchronized" | "skipped_external" | "failed";
+  warning?: string;
+}
+
+export interface ProfileSyncResult {
+  status: "completed" | "completed_with_warnings";
+  synchronizedCount: number;
+  skippedCount: number;
+  warnings: ProfileSyncWarning[];
+  outcomes: ProfileSyncOutcome[];
+}
+
+export interface ExplicitSyncCommandResult {
+  success: boolean;
+  message: string;
+  warning?: string;
+  warnings?: ProfileSyncWarning[];
+  profileSync?: ProfileSyncResult;
 }
 
 export interface WebDavTestResult {
@@ -29,6 +63,9 @@ export interface CodexUnifyHistoryRestoreResult {
 
 export interface WebDavSyncResult {
   status: string;
+  warning?: string;
+  warnings?: ProfileSyncWarning[];
+  profileSync?: ProfileSyncResult;
 }
 
 export const settingsApi = {
@@ -208,14 +245,14 @@ export const settingsApi = {
     return await invoke("s3_sync_fetch_remote_info");
   },
 
-  async syncCurrentProvidersLive(): Promise<void> {
-    const result = (await invoke("sync_current_providers_live")) as {
-      success?: boolean;
-      message?: string;
-    };
+  async syncCurrentProvidersLive(): Promise<ExplicitSyncCommandResult> {
+    const result = await invoke<ExplicitSyncCommandResult>(
+      "sync_current_providers_live",
+    );
     if (!result?.success) {
       throw new Error(result?.message || "Sync current providers failed");
     }
+    return result;
   },
 
   async openExternal(url: string): Promise<void> {
@@ -352,6 +389,8 @@ export interface BackupEntry {
   createdAt: string;
 }
 
+export type DatabaseRestoreResult = ConfigTransferResult;
+
 export const backupsApi = {
   async createDbBackup(): Promise<string> {
     return await invoke("create_db_backup");
@@ -361,7 +400,7 @@ export const backupsApi = {
     return await invoke("list_db_backups");
   },
 
-  async restoreDbBackup(filename: string): Promise<string> {
+  async restoreDbBackup(filename: string): Promise<DatabaseRestoreResult> {
     return await invoke("restore_db_backup", { filename });
   },
 

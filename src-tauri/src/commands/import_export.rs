@@ -6,12 +6,11 @@ use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::commands::sync_support::{
-    post_sync_warning_from_result, run_post_import_sync, success_payload_with_warning,
+    attach_post_operation_sync_result, run_post_import_sync, success_payload_with_warning,
 };
 use crate::database::backup::BackupEntry;
 use crate::database::Database;
 use crate::error::AppError;
-use crate::services::provider::ProviderService;
 use crate::store::AppState;
 
 // ─── File import/export ──────────────────────────────────────
@@ -44,35 +43,30 @@ pub async fn import_config_from_file(
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let db = state.db.clone();
-    let db_for_sync = db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let backup_id = tauri::async_runtime::spawn_blocking(move || {
         let path_buf = PathBuf::from(&filePath);
-        let backup_id = db.import_sql(&path_buf)?;
-        let warning = post_sync_warning_from_result(Ok(run_post_import_sync(db_for_sync)));
-        if let Some(msg) = warning.as_ref() {
-            log::warn!("[Import] post-import sync warning: {msg}");
-        }
-        Ok::<_, AppError>(success_payload_with_warning(backup_id, warning))
+        db.import_sql(&path_buf)
     })
     .await
     .map_err(|e| format!("导入配置失败: {e}"))?
-    .map_err(|e: AppError| e.to_string())
+    .map_err(|e: AppError| e.to_string())?;
+    let sync_result = run_post_import_sync(state.inner()).await;
+    Ok(attach_post_operation_sync_result(
+        success_payload_with_warning(backup_id, None),
+        sync_result,
+    ))
 }
 
 #[tauri::command]
 pub async fn sync_current_providers_live(state: State<'_, AppState>) -> Result<Value, String> {
-    let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let app_state = AppState::new(db);
-        ProviderService::sync_current_to_live(&app_state)?;
-        Ok::<_, AppError>(json!({
+    let sync_result = run_post_import_sync(state.inner()).await;
+    Ok(attach_post_operation_sync_result(
+        json!({
             "success": true,
             "message": "Live configuration synchronized"
-        }))
-    })
-    .await
-    .map_err(|e| format!("同步当前供应商失败: {e}"))?
-    .map_err(|e: AppError| e.to_string())
+        }),
+        sync_result,
+    ))
 }
 
 // ─── File dialogs ────────────────────────────────────────────
@@ -152,12 +146,21 @@ pub fn list_db_backups() -> Result<Vec<BackupEntry>, String> {
 pub async fn restore_db_backup(
     state: State<'_, AppState>,
     filename: String,
-) -> Result<String, String> {
+) -> Result<Value, String> {
     let db = state.db.clone();
-    tauri::async_runtime::spawn_blocking(move || db.restore_from_backup(&filename))
+    let safety_id = tauri::async_runtime::spawn_blocking(move || db.restore_from_backup(&filename))
         .await
         .map_err(|e| format!("Restore failed: {e}"))?
-        .map_err(|e: AppError| e.to_string())
+        .map_err(|e: AppError| e.to_string())?;
+    let sync_result = run_post_import_sync(state.inner()).await;
+    Ok(attach_post_operation_sync_result(
+        json!({
+            "success": true,
+            "message": "Database restored successfully",
+            "backupId": safety_id
+        }),
+        sync_result,
+    ))
 }
 
 /// Rename a database backup file

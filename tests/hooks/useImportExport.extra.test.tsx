@@ -105,6 +105,39 @@ describe("useImportExport Hook (edge cases)", () => {
     expect(result.current.status).toBe("error");
   });
 
+  it("shows structured Profile warnings from import without running a duplicate sync", async () => {
+    openFileDialogMock.mockResolvedValue("/config.sql");
+    importConfigMock.mockResolvedValue({
+      success: true,
+      backupId: "backup-001",
+      warnings: [
+        {
+          profileId: "profile-a",
+          profileName: "工作 Profile",
+          homePath: "/private/profile-a",
+          reason: "Profile Home 同步失败，请检查文件权限",
+        },
+      ],
+    });
+    const { result } = renderHook(() => useImportExport());
+
+    await act(async () => {
+      await result.current.selectImportFile();
+    });
+    await act(async () => {
+      await result.current.importConfig();
+    });
+
+    expect(result.current.status).toBe("partial-success");
+    expect(syncCurrentProvidersLiveMock).not.toHaveBeenCalled();
+    expect(toastWarningMock).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        description: "工作 Profile: Profile Home 同步失败，请检查文件权限",
+      }),
+    );
+  });
+
   it("propagates export success message to toast with saved path", async () => {
     saveFileDialogMock.mockResolvedValue("/exports/config.json");
     exportConfigMock.mockResolvedValue({

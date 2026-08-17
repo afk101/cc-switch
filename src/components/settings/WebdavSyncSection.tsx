@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { settingsApi } from "@/lib/api";
+import { formatProfileSyncWarnings } from "@/utils/postChangeSync";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import type { SettingsFormState } from "@/hooks/useSettings";
 import type {
@@ -635,8 +636,16 @@ export function WebdavSyncSection({
     closeDialog();
     setActionState("downloading");
     try {
-      await settingsApi.webdavSyncDownload();
-      toast.success(t("settings.webdavSync.downloadSuccess"));
+      const result = await settingsApi.webdavSyncDownload();
+      if (result.warning || result.warnings?.length) {
+        toast.warning(t("settings.webdavSync.downloadSuccess"), {
+          description:
+            formatProfileSyncWarnings(result.warnings) ?? result.warning,
+          closeButton: true,
+        });
+      } else {
+        toast.success(t("settings.webdavSync.downloadSuccess"));
+      }
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
@@ -846,8 +855,16 @@ export function WebdavSyncSection({
     closeS3Dialog();
     setS3ActionState("downloading");
     try {
-      await settingsApi.s3SyncDownload();
-      toast.success(t("settings.s3Sync.downloadSuccess"));
+      const result = await settingsApi.s3SyncDownload();
+      if (result.warning || result.warnings?.length) {
+        toast.warning(t("settings.s3Sync.downloadSuccess"), {
+          description:
+            formatProfileSyncWarnings(result.warnings) ?? result.warning,
+          closeButton: true,
+        });
+      } else {
+        toast.success(t("settings.s3Sync.downloadSuccess"));
+      }
       await queryClient.invalidateQueries();
     } catch (error) {
       toast.error(
