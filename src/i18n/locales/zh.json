@@ -453,6 +453,18 @@
     "syncLiveFailed": "已导入，但同步到当前供应商失败，请手动重新选择一次供应商。",
     "importPartialSuccess": "配置已导入，但同步到当前供应商失败。",
     "importPartialHint": "请手动重新选择一次供应商以刷新对应配置。",
+    "profileSyncWarnings": {
+      "reasons": {
+        "routeMissing": "Profile 路由记录不存在。",
+        "primaryMissing": "Profile 未配置主供应商。",
+        "providerUnavailable": "主供应商不存在或暂时不可读取。",
+        "stateUnavailable": "Profile 同步状态暂时不可读取。",
+        "planFailed": "供应商配置无法应用，请检查配置格式与 Home 权限。",
+        "runtimeUnavailable": "Profile 路由运行时不可用，请先恢复或关闭路由。",
+        "applyFailed": "Profile Home 同步失败，请检查文件权限或外部并发修改。",
+        "unknown": "Profile 同步失败，请检查配置与文件权限。"
+      }
+    },
     "configExported": "配置已导出到：",
     "exportFailed": "导出失败",
     "selectFileFailed": "请选择有效的 SQL 备份文件",

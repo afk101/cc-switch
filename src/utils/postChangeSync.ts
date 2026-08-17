@@ -1,13 +1,60 @@
 import { settingsApi } from "@/lib/api";
 import type { ProfileSyncWarning } from "@/lib/api/settings";
+import type { TFunction } from "i18next";
+import { CODEX_PROFILE_SYNC_REASON_CODES } from "@/config/constants";
 
-/** 将逐 Profile 脱敏 warning 格式化为可直接展示的多行文本。 */
+const PROFILE_SYNC_REASON_TRANSLATION_KEYS: Readonly<Record<string, string>> = {
+  [CODEX_PROFILE_SYNC_REASON_CODES.ROUTE_MISSING]:
+    "settings.profileSyncWarnings.reasons.routeMissing",
+  [CODEX_PROFILE_SYNC_REASON_CODES.PRIMARY_MISSING]:
+    "settings.profileSyncWarnings.reasons.primaryMissing",
+  [CODEX_PROFILE_SYNC_REASON_CODES.PROVIDER_UNAVAILABLE]:
+    "settings.profileSyncWarnings.reasons.providerUnavailable",
+  [CODEX_PROFILE_SYNC_REASON_CODES.STATE_UNAVAILABLE]:
+    "settings.profileSyncWarnings.reasons.stateUnavailable",
+  [CODEX_PROFILE_SYNC_REASON_CODES.PLAN_FAILED]:
+    "settings.profileSyncWarnings.reasons.planFailed",
+  [CODEX_PROFILE_SYNC_REASON_CODES.RUNTIME_UNAVAILABLE]:
+    "settings.profileSyncWarnings.reasons.runtimeUnavailable",
+  [CODEX_PROFILE_SYNC_REASON_CODES.APPLY_FAILED]:
+    "settings.profileSyncWarnings.reasons.applyFailed",
+};
+
+/**
+ * 将公开同步原因码转换为本地化文案。
+ * 未知原因码与旧版 reason payload 均返回固定脱敏文案，绝不展示后端原文。
+ *
+ * @param warning 后端返回的结构化 Profile 同步警告
+ * @param t i18next 翻译函数
+ * @returns 当前界面的本地化脱敏原因
+ */
+function translateProfileSyncReason(
+  warning: ProfileSyncWarning,
+  t: TFunction,
+): string {
+  const translationKey = warning.reasonCode
+    ? PROFILE_SYNC_REASON_TRANSLATION_KEYS[warning.reasonCode]
+    : undefined;
+  return t(translationKey ?? "settings.profileSyncWarnings.reasons.unknown");
+}
+
+/**
+ * 将逐 Profile 脱敏 warning 格式化为可直接展示的多行本地化文本。
+ *
+ * @param warnings 后端返回的逐 Profile 同步警告
+ * @param t i18next 翻译函数
+ * @returns 多行本地化警告；没有警告时返回 undefined
+ */
 export function formatProfileSyncWarnings(
   warnings: ProfileSyncWarning[] | undefined,
+  t: TFunction,
 ): string | undefined {
   if (!warnings?.length) return undefined;
   return warnings
-    .map((warning) => `${warning.profileName}: ${warning.reason}`)
+    .map(
+      (warning) =>
+        `${warning.profileName}: ${translateProfileSyncReason(warning, t)}`,
+    )
     .join("\n");
 }
 

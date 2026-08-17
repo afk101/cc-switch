@@ -453,6 +453,18 @@
     "syncLiveFailed": "インポートしましたが、現在のプロバイダーへの同期に失敗しました。手動で再選択してください。",
     "importPartialSuccess": "設定はインポートされましたが、現在のプロバイダーへの同期に失敗しました。",
     "importPartialHint": "ライブ設定を更新するため、もう一度プロバイダーを選択してください。",
+    "profileSyncWarnings": {
+      "reasons": {
+        "routeMissing": "Profile のルート情報が見つかりません。",
+        "primaryMissing": "この Profile にはプライマリプロバイダーが設定されていません。",
+        "providerUnavailable": "プライマリプロバイダーが存在しないか、一時的に読み取れません。",
+        "stateUnavailable": "Profile の同期状態を一時的に読み取れません。",
+        "planFailed": "プロバイダー設定を適用できません。設定形式と Home の権限を確認してください。",
+        "runtimeUnavailable": "Profile のルートランタイムを利用できません。先にルートを復旧または無効化してください。",
+        "applyFailed": "Profile Home の同期に失敗しました。ファイル権限または外部からの同時変更を確認してください。",
+        "unknown": "Profile の同期に失敗しました。設定とファイル権限を確認してください。"
+      }
+    },
     "configExported": "設定をエクスポートしました:",
     "exportFailed": "エクスポートに失敗しました",
     "selectFileFailed": "有効な SQL バックアップファイルを選択してください",

@@ -453,6 +453,18 @@
     "syncLiveFailed": "Imported, but failed to sync to the current provider. Please reselect the provider manually.",
     "importPartialSuccess": "Config imported, but failed to sync to the current provider.",
     "importPartialHint": "Please manually reselect the provider to refresh the live configuration.",
+    "profileSyncWarnings": {
+      "reasons": {
+        "routeMissing": "The Profile route record is missing.",
+        "primaryMissing": "No primary provider is configured for this Profile.",
+        "providerUnavailable": "The primary provider is missing or temporarily unavailable.",
+        "stateUnavailable": "The Profile sync state is temporarily unavailable.",
+        "planFailed": "The provider config could not be applied. Check its format and the Home permissions.",
+        "runtimeUnavailable": "The Profile route runtime is unavailable. Recover or disable the route first.",
+        "applyFailed": "Failed to sync the Profile Home. Check file permissions or concurrent external changes.",
+        "unknown": "Profile sync failed. Check the configuration and file permissions."
+      }
+    },
     "configExported": "Config exported to:",
     "exportFailed": "Export failed",
     "selectFileFailed": "Please choose a valid SQL backup file",

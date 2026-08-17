@@ -22,7 +22,7 @@ export interface ProfileSyncWarning {
   profileId: string;
   profileName: string;
   homePath: string;
-  reason: string;
+  reasonCode: string;
 }
 
 export interface ProfileSyncOutcome {
@@ -30,7 +30,7 @@ export interface ProfileSyncOutcome {
   profileName: string;
   homePath: string;
   status: "synchronized" | "skipped_external" | "failed";
-  warning?: string;
+  reasonCode?: string;
 }
 
 export interface ProfileSyncResult {

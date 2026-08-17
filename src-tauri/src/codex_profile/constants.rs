@@ -167,23 +167,20 @@ pub const CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SYNCHRONIZED: &str = "synchronized"
 pub const CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SKIPPED_EXTERNAL: &str = "skipped_external";
 /// 单个 Managed Profile 显式同步失败时的结构化状态。
 pub const CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED: &str = "failed";
-/// Managed Profile 没有路由记录时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_ROUTE_MISSING: &str = "Profile 路由记录不存在";
-/// Managed Profile 没有主供应商时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING: &str = "Profile 未配置主供应商";
-/// Managed Profile 主供应商不可读取时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_PROVIDER_UNAVAILABLE: &str = "主供应商不存在或暂时不可读取";
-/// Managed Profile 同步锁或数据库状态不可读取时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE: &str = "Profile 同步状态暂时不可读取";
-/// Managed Profile 有效配置或 Home 计划无法构造时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED: &str =
-    "供应商配置无法应用，请检查配置格式与 Home 权限";
-/// 已启用 Profile 的运行时无法热更新时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_RUNTIME_UNAVAILABLE: &str =
-    "Profile 路由运行时不可用，请先恢复或关闭路由";
-/// Managed Profile Home 写入或 CAS 校验失败时的脱敏同步摘要。
-pub const CODEX_EXPLICIT_SYNC_WARNING_APPLY_FAILED: &str =
-    "Profile Home 同步失败，请检查文件权限或外部并发修改";
+/// Managed Profile 没有路由记录时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_ROUTE_MISSING: &str = "route_missing";
+/// Managed Profile 没有主供应商时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING: &str = "primary_missing";
+/// Managed Profile 主供应商不可读取时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_PROVIDER_UNAVAILABLE: &str = "provider_unavailable";
+/// Managed Profile 同步锁或数据库状态不可读取时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_STATE_UNAVAILABLE: &str = "state_unavailable";
+/// Managed Profile 有效配置或 Home 计划无法构造时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_PLAN_FAILED: &str = "plan_failed";
+/// 已启用 Profile 的运行时无法热更新时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_RUNTIME_UNAVAILABLE: &str = "runtime_unavailable";
+/// Managed Profile Home 写入或 CAS 校验失败时的稳定同步原因码。
+pub const CODEX_EXPLICIT_SYNC_WARNING_APPLY_FAILED: &str = "apply_failed";
 /// Codex Profile 启动恢复诊断的稳定操作标识。
 pub const CODEX_STARTUP_RESTORE_OPERATION: &str = "startup_restore";
 /// 启动恢复获取 Profile 生命周期锁阶段。

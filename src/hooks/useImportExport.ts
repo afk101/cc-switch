@@ -118,7 +118,7 @@ export function useImportExport(
           }),
           {
             description:
-              formatProfileSyncWarnings(result.warnings) ?? result.warning,
+              formatProfileSyncWarnings(result.warnings, t) ?? result.warning,
             closeButton: true,
           },
         );

@@ -252,3 +252,12 @@
 - 前端静态/构建：`pnpm typecheck`、`pnpm format:check`、`pnpm build:renderer` 全部通过；构建只有既有依赖数据过期、动态/静态 import 和 chunk size warning。
 - Rust 静态：`cargo fmt --check`、`cargo check --all-targets`、非严格 `cargo clippy --all-targets` 通过。严格 `-D warnings` 被 10 个 Review Base 已存在且与本任务无关的 lint 阻断：`migration.rs` 1、`body_dump.rs` 6、`forwarder.rs` 1、`route_manager.rs` 既有测试 1、`prompt_files.rs` 1；本任务新增/修改代码没有 Clippy warning。
 - 最终卫生：`git diff --check` 通过；全仓搜索未发现 `[DEBUG-...]` 或本任务 throwaway artifact。
+
+## Code Review P2 修复：Profile 同步 warning 国际化
+
+- Standards review 发现：显式同步结果把固定中文 `reason` 直接序列化到 Tauri payload，前端 `postChangeSync.ts` 又原样展示，导致英文/日文界面混入中文，并让未来底层错误文本存在被直接展示的风险。
+- RED（前端公开格式化 seam）：`pnpm vitest run src/utils/postChangeSync.test.ts` 首次为 `2 failed, 1 passed`；已知 `reasonCode` 得到 `undefined`，未知 code 与旧 payload 则泄露测试中的 token/Base URL 原文。
+- RED（Rust/Tauri payload seam）：`attach_profile_sync_result_preserves_restore_success_and_exposes_structured_warnings` 首次因 `CodexProfileSyncWarning`/`CodexExplicitProfileSyncOutcome` 不存在 `reason_code` 字段编译失败。
+- GREEN：后端现在只公开稳定 `reasonCode`（camelCase），不再序列化原因文案；前端通过调用方现有 i18next `t()` 映射原因码，未知 code 与旧 `reason` payload 统一使用本地化脱敏兜底，绝不展示后端原文或 `homePath`。新增文案已同步 en/zh/ja，并同时补齐仓库支持的 zh-TW。
+- 定向验证：前端格式化测试 `3/3`；Rust payload contract `1/1`；best-effort 显式同步与敏感信息断言 `1/1`。
+- 静态验证：`pnpm typecheck`、`pnpm format:check`、`cargo fmt --all -- --check`、系统 Clang 环境下 `cargo check --all-targets` 全部通过。

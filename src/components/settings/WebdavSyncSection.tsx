@@ -640,7 +640,7 @@ export function WebdavSyncSection({
       if (result.warning || result.warnings?.length) {
         toast.warning(t("settings.webdavSync.downloadSuccess"), {
           description:
-            formatProfileSyncWarnings(result.warnings) ?? result.warning,
+            formatProfileSyncWarnings(result.warnings, t) ?? result.warning,
           closeButton: true,
         });
       } else {
@@ -859,7 +859,7 @@ export function WebdavSyncSection({
       if (result.warning || result.warnings?.length) {
         toast.warning(t("settings.s3Sync.downloadSuccess"), {
           description:
-            formatProfileSyncWarnings(result.warnings) ?? result.warning,
+            formatProfileSyncWarnings(result.warnings, t) ?? result.warning,
           closeButton: true,
         });
       } else {

@@ -130,7 +130,7 @@ mod tests {
             profile_id: "profile-failed".to_string(),
             profile_name: "Failed Profile".to_string(),
             home_path: "/tmp/profile-failed".to_string(),
-            reason: "Profile Home 同步失败".to_string(),
+            reason_code: "apply_failed".to_string(),
         };
         let sync_result = CodexExplicitSyncResult {
             status: "completed_with_warnings".to_string(),
@@ -142,7 +142,7 @@ mod tests {
                 profile_name: "Failed Profile".to_string(),
                 home_path: "/tmp/profile-failed".to_string(),
                 status: "failed".to_string(),
-                warning: Some("Profile Home 同步失败".to_string()),
+                reason_code: Some("apply_failed".to_string()),
             }],
         };
 
@@ -155,6 +155,11 @@ mod tests {
         assert_eq!(payload["backupId"], "safety-backup");
         assert_eq!(payload["profileSync"]["status"], "completed_with_warnings");
         assert_eq!(payload["warnings"][0]["profileId"], "profile-failed");
-        assert_eq!(payload["warnings"][0]["reason"], "Profile Home 同步失败");
+        assert_eq!(payload["warnings"][0]["reasonCode"], "apply_failed");
+        assert!(payload["warnings"][0].get("reason").is_none());
+        assert_eq!(
+            payload["profileSync"]["outcomes"][0]["reasonCode"],
+            "apply_failed"
+        );
     }
 }

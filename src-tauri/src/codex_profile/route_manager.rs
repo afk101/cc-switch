@@ -186,7 +186,7 @@ pub struct CodexExplicitProfileSyncOutcome {
     pub home_path: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<String>,
+    pub reason_code: Option<String>,
 }
 
 /// 可展示给用户的逐 Profile 脱敏 warning。
@@ -196,7 +196,7 @@ pub struct CodexProfileSyncWarning {
     pub profile_id: String,
     pub profile_name: String,
     pub home_path: String,
-    pub reason: String,
+    pub reason_code: String,
 }
 
 /// 手动 Sync、Import 与云恢复共用的 Profile 显式同步结果。
@@ -593,13 +593,13 @@ impl CodexRouteManager {
             .filter(|outcome| outcome.status == CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED)
             .filter_map(|outcome| {
                 outcome
-                    .warning
+                    .reason_code
                     .as_ref()
-                    .map(|reason| CodexProfileSyncWarning {
+                    .map(|reason_code| CodexProfileSyncWarning {
                         profile_id: outcome.profile_id.clone(),
                         profile_name: outcome.profile_name.clone(),
                         home_path: outcome.home_path.clone(),
-                        reason: reason.clone(),
+                        reason_code: reason_code.clone(),
                     })
             })
             .collect::<Vec<_>>();
@@ -655,7 +655,7 @@ impl CodexRouteManager {
                 profile_name: profile.name,
                 home_path: home_path.display().to_string(),
                 status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SKIPPED_EXTERNAL.to_string(),
-                warning: None,
+                reason_code: None,
             };
         }
         let Some(provider_id) = route.current_provider_id.as_deref() else {
@@ -696,7 +696,7 @@ impl CodexRouteManager {
                 profile_name: profile.name,
                 home_path: home_path.display().to_string(),
                 status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_SYNCHRONIZED.to_string(),
-                warning: None,
+                reason_code: None,
             },
             Err(summary) => Self::explicit_sync_failed_outcome(&profile, summary),
         }
@@ -761,14 +761,14 @@ impl CodexRouteManager {
     /// 构造不包含配置正文、token 或底层错误文本的 Profile warning outcome。
     fn explicit_sync_failed_outcome(
         profile: &CodexProfile,
-        summary: &'static str,
+        reason_code: &'static str,
     ) -> CodexExplicitProfileSyncOutcome {
         CodexExplicitProfileSyncOutcome {
             profile_id: profile.id.clone(),
             profile_name: profile.name.clone(),
             home_path: profile.canonical_home_path.clone(),
             status: CODEX_EXPLICIT_PROFILE_SYNC_STATUS_FAILED.to_string(),
-            warning: Some(summary.to_string()),
+            reason_code: Some(reason_code.to_string()),
         }
     }
 
@@ -6097,15 +6097,14 @@ mod codex_route_manager {
         assert_eq!(result_json["synchronizedCount"], 1);
         assert_eq!(result_json["warnings"].as_array().map(Vec::len), Some(2));
         assert_eq!(result_json["warnings"][0]["profileId"], "profile-a-fails");
-        assert!(result_json["warnings"][0]["reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("配置格式") || reason.contains("Home 权限")));
+        assert_eq!(result_json["warnings"][0]["reasonCode"], "plan_failed");
+        assert!(result_json["warnings"][0].get("reason").is_none());
         assert_eq!(
             result_json["warnings"][1]["profileId"],
             "profile-c-missing-primary"
         );
         assert_eq!(
-            result_json["warnings"][1]["reason"],
+            result_json["warnings"][1]["reasonCode"],
             CODEX_EXPLICIT_SYNC_WARNING_PRIMARY_MISSING
         );
         let public_result = result_json.to_string();

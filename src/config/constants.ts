@@ -41,6 +41,17 @@ export const CODEX_DEFAULT_PROFILE_ID = "codex-default";
 export const CODEX_PROFILE_MIN_PORT = 1;
 export const CODEX_PROFILE_MAX_PORT = 65_535;
 
+// Codex Profile 显式同步公开原因码
+export const CODEX_PROFILE_SYNC_REASON_CODES = {
+  ROUTE_MISSING: "route_missing",
+  PRIMARY_MISSING: "primary_missing",
+  PROVIDER_UNAVAILABLE: "provider_unavailable",
+  STATE_UNAVAILABLE: "state_unavailable",
+  PLAN_FAILED: "plan_failed",
+  RUNTIME_UNAVAILABLE: "runtime_unavailable",
+  APPLY_FAILED: "apply_failed",
+} as const;
+
 // Codex 供应商需要本地路由的原因
 export const CODEX_PROVIDER_ROUTE_REQUIREMENTS = {
   OPENAI_CHAT: "openaiChat",

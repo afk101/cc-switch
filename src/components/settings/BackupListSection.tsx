@@ -100,7 +100,7 @@ export function BackupListSection({
         }),
         {
           description:
-            formatProfileSyncWarnings(result.warnings) ??
+            formatProfileSyncWarnings(result.warnings, t) ??
             result.warning ??
             (result.backupId
               ? `${t("settings.backupManager.safetyBackupId", { defaultValue: "Safety Backup ID" })}: ${result.backupId}`
