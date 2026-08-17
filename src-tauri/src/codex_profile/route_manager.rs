@@ -1462,13 +1462,6 @@ impl CodexRouteManager {
                 .ok_or_else(|| AppError::InvalidInput("Codex 供应商不存在".to_string()))?,
         };
         if !route.enabled {
-            if route.current_provider_id.as_deref() == Some(provider_id) {
-                return self.update_disabled_provider_selection_locked(
-                    &profile,
-                    route,
-                    failover_ids,
-                );
-            }
             return self.switch_direct_provider_locked(
                 &profile,
                 route,
@@ -1786,29 +1779,41 @@ impl CodexRouteManager {
         Ok(())
     }
 
-    /// 关闭态重复选择当前供应商时只更新关系，不改写用户 Home。
-    fn update_disabled_provider_selection_locked(
+    /// 持久化关闭态显式选择，失败时同时恢复路由与 Home 计划。
+    fn persist_disabled_provider_selection_locked(
         &self,
         profile: &CodexProfile,
         route: CodexProfileRoute,
+        provider_id: String,
         failover_ids: Vec<String>,
+        plan: &crate::codex_profile::CodexDirectProviderConfigPlan,
     ) -> Result<(), AppError> {
         let changed = CodexProfileRoute {
+            current_provider_id: Some(provider_id),
             enabled: false,
+            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
+            live_backup_json: None,
             last_error: None,
             recovery_json: None,
             updated_at: Utc::now().timestamp_millis(),
             ..route.clone()
         };
-        self.persistence.save_route(&changed)?;
+        if let Err(error) = self.persistence.save_route(&changed) {
+            let compensation_error = self.home_config.restore_direct_provider_plan(plan).err();
+            return Err(Self::compensation_failure_error(
+                &error,
+                compensation_error.as_ref(),
+            ));
+        }
         if let Err(error) = self
             .persistence
             .replace_failovers(&profile.id, &failover_ids)
         {
             let compensation_error = self.persistence.save_route(&route).err();
+            let home_compensation = self.home_config.restore_direct_provider_plan(plan).err();
             return Err(Self::compensation_failure_error(
                 &error,
-                compensation_error.as_ref(),
+                compensation_error.or(home_compensation).as_ref(),
             ));
         }
         Ok(())
@@ -1825,38 +1830,15 @@ impl CodexRouteManager {
         let home = std::path::Path::new(&profile.canonical_home_path);
         let plan = self
             .home_config
-            .build_direct_provider_plan(home, &provider)?;
+            .build_authoritative_direct_provider_plan(home, &provider)?;
         self.home_config.apply_direct_provider_plan(&plan)?;
-        let changed = CodexProfileRoute {
-            current_provider_id: Some(provider.id),
-            enabled: false,
-            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
-            live_backup_json: None,
-            last_error: None,
-            recovery_json: None,
-            updated_at: Utc::now().timestamp_millis(),
-            ..route.clone()
-        };
-        if let Err(error) = self.persistence.save_route(&changed) {
-            let compensation_error = self.home_config.restore_direct_provider_plan(&plan).err();
-            return Err(Self::compensation_failure_error(
-                &error,
-                compensation_error.as_ref(),
-            ));
-        }
-        if let Err(error) = self
-            .persistence
-            .replace_failovers(&profile.id, &failover_ids)
-        {
-            let route_compensation = self.persistence.save_route(&route).err();
-            let home_compensation = self.home_config.restore_direct_provider_plan(&plan).err();
-            let compensation_error = route_compensation.or(home_compensation);
-            return Err(Self::compensation_failure_error(
-                &error,
-                compensation_error.as_ref(),
-            ));
-        }
-        Ok(())
+        self.persist_disabled_provider_selection_locked(
+            profile,
+            route,
+            provider.id,
+            failover_ids,
+            &plan,
+        )
     }
 
     /// 先恢复 Home，再立即拒绝新请求并停止监听器，最后持久化关闭状态。
@@ -10654,75 +10636,27 @@ experimental_bearer_token = "PROXY_MANAGED"
         Ok(())
     }
 
-    /// 显式选择当前供应商不是供应商切换，不得修改用户模型。
+    /// 开启态显式切换必须以有效供应商权威收敛模型族，关闭后仍保留终态。
     #[tokio::test]
-    async fn switching_to_same_provider_preserves_user_model() -> Result<(), AppError> {
-        use crate::codex_config::codex_config_path_for_home;
-
-        let db = Arc::new(Database::memory()?);
-        let home = tempfile::tempdir().expect("临时 Home 目录");
-        db.save_provider(
-            AppType::Codex.as_str(),
-            &Provider::with_id(
-                "provider-a".to_string(),
-                "Provider A".to_string(),
-                json!({"auth": {}, "config": "model = \"provider-default\"\n"}),
-                None,
-            ),
-        )?;
-        db.insert_codex_profile(&CodexProfile {
-            id: "profile-a".to_string(),
-            name: "Profile A".to_string(),
-            canonical_home_path: home.path().display().to_string(),
-            listen_port: 16001,
-            created_at: 1,
-            updated_at: 1,
-        })?;
-        let config_path = codex_config_path_for_home(home.path());
-        fs::write(&config_path, "model = \"user-selected\"\n").expect("写入用户模型");
-        let manager = CodexRouteManager::new(
-            db,
-            Arc::new(CodexHomeConfigService::system()),
-            Arc::new(TrackingTokenStore {
-                ensured: AtomicUsize::new(0),
-                deleted: AtomicUsize::new(0),
-            }),
-            Arc::new(FakeFactory),
-        );
-
-        manager.enable("profile-a", "provider-a", vec![]).await?;
-        manager
-            .switch_provider("profile-a", "provider-a", vec![])
-            .await?;
-
-        let routed = fs::read_to_string(config_path).expect("读取切换后配置");
-        assert!(routed.contains("model = \"user-selected\""));
-        Ok(())
-    }
-
-    /// 关闭态再次选择当前供应商不得改写 Home，切换到其他供应商才应用其模型。
-    #[tokio::test]
-    async fn switching_disabled_route_only_applies_model_for_different_provider(
+    async fn switching_enabled_profile_authoritatively_replaces_model_family(
     ) -> Result<(), AppError> {
         use crate::codex_config::codex_config_path_for_home;
 
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
-        for (provider_id, provider_name, provider_model) in [
-            ("provider-a", "Provider A", "provider-a-default"),
-            ("provider-b", "Provider B", "provider-b-default"),
+        for (provider_id, provider_config) in [
+            (
+                "provider-a",
+                "model = \"provider-a-default\"\nmodel_reasoning_effort = \"low\"\nmodel_reasoning_summary = \"detailed\"\n",
+            ),
+            ("provider-b", "model = \"database-model\"\n"),
         ] {
             db.save_provider(
                 AppType::Codex.as_str(),
                 &Provider::with_id(
                     provider_id.to_string(),
-                    provider_name.to_string(),
-                    json!({
-                        "auth": {},
-                        "config": format!(
-                            "model = \"{provider_model}\"\nunknown_setting = \"provider-value\"\n"
-                        )
-                    }),
+                    provider_id.to_string(),
+                    json!({"auth": {}, "config": provider_config}),
                     None,
                 ),
             )?;
@@ -10738,9 +10672,82 @@ experimental_bearer_token = "PROXY_MANAGED"
         let config_path = codex_config_path_for_home(home.path());
         fs::write(
             &config_path,
-            "model = \"user-selected\"\nuser_setting = \"keep-me\"\n",
+            "model = \"stale-model\"\nmodel_reasoning_effort = \"medium\"\nmodel_reasoning_summary = \"stale\"\nprofile_extension = \"keep-me\"\n",
         )
-        .expect("写入用户配置");
+        .expect("写入残留模型族");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager.enable("profile-a", "provider-a", vec![]).await?;
+        let effective_provider = Provider::with_id(
+            "provider-b".to_string(),
+            "Provider B".to_string(),
+            json!({
+                "auth": {},
+                "config": "model_reasoning_effort = \"high\"\n"
+            }),
+            None,
+        );
+        manager
+            .switch_provider_with_effective_settings("profile-a", effective_provider, vec![])
+            .await?;
+
+        let routed = fs::read_to_string(&config_path).expect("读取切换后配置");
+        assert!(!routed.contains("model ="));
+        assert!(routed.contains("model_reasoning_effort = \"high\""));
+        assert!(!routed.contains("model_reasoning_summary"));
+        assert!(routed.contains("profile_extension = \"keep-me\""));
+        assert!(routed.contains("http://127.0.0.1:16001/v1"));
+
+        manager.disable("profile-a").await?;
+        let disabled = fs::read_to_string(config_path).expect("读取关闭后配置");
+        assert!(!disabled.contains("model ="));
+        assert!(disabled.contains("model_reasoning_effort = \"high\""));
+        assert!(!disabled.contains("model_reasoning_summary"));
+        assert!(disabled.contains("profile_extension = \"keep-me\""));
+        Ok(())
+    }
+
+    /// 关闭态重选当前供应商也是显式收敛动作，必须治愈 Home 残留。
+    #[tokio::test]
+    async fn switching_disabled_same_provider_heals_stale_model_family() -> Result<(), AppError> {
+        use crate::codex_config::codex_config_path_for_home;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Home 目录");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-a".to_string(),
+                "Provider A".to_string(),
+                json!({
+                    "auth": {},
+                    "config": "model = \"provider-default\"\nmodel_reasoning_effort = \"high\"\nunknown_setting = \"provider-value\"\n"
+                }),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"stale-model\"\nmodel_reasoning_effort = \"low\"\nmodel_reasoning_summary = \"stale\"\nuser_setting = \"keep-me\"\n",
+        )
+        .expect("写入残留配置");
         let manager = CodexRouteManager::new(
             db,
             Arc::new(CodexHomeConfigService::system()),
@@ -10756,16 +10763,11 @@ experimental_bearer_token = "PROXY_MANAGED"
         manager
             .switch_provider("profile-a", "provider-a", vec![])
             .await?;
-        let unchanged = fs::read_to_string(&config_path).expect("读取同供应商切换后的配置");
-        assert!(unchanged.contains("model = \"user-selected\""));
-        assert!(unchanged.contains("user_setting = \"keep-me\""));
-
-        manager
-            .switch_provider("profile-a", "provider-b", vec![])
-            .await?;
-        let switched = fs::read_to_string(config_path).expect("读取不同供应商切换后的配置");
-        assert!(switched.contains("model = \"provider-b-default\""));
-        assert!(!switched.contains("model = \"user-selected\""));
+        let switched = fs::read_to_string(config_path).expect("读取同供应商切换后的配置");
+        assert!(switched.contains("model = \"provider-default\""));
+        assert!(switched.contains("model_reasoning_effort = \"high\""));
+        assert!(!switched.contains("model_reasoning_summary"));
+        assert!(switched.contains("user_setting = \"keep-me\""));
         Ok(())
     }
 

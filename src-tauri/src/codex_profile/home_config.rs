@@ -618,12 +618,38 @@ impl CodexHomeConfigService {
         route_provider: Option<&Provider>,
         listener_token: &str,
     ) -> Result<(CodexModelCatalogProjectionPlan, CodexRouteConfigPlan), AppError> {
-        self.build_profile_lifecycle_plans(
+        let (catalog_plan, route_plan) = self.build_profile_lifecycle_plans(
             home,
             provider,
             listen_port,
             route_provider,
             listener_token,
+        )?;
+        let authoritative_route_plan =
+            self.apply_provider_model_family_to_route_plan(route_plan, provider)?;
+        Ok((catalog_plan, authoritative_route_plan))
+    }
+
+    /// 在已构造的路由目标上重新施加有效供应商模型族，保留 listener 与 Profile 扩展。
+    fn apply_provider_model_family_to_route_plan(
+        &self,
+        route_plan: CodexRouteConfigPlan,
+        provider: &Provider,
+    ) -> Result<CodexRouteConfigPlan, AppError> {
+        let mut target_document = parse_codex_document(&route_plan.target_content, "显式切换路由")?;
+        let effective_config = provider
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let effective_document = effective_config.parse::<DocumentMut>().map_err(|error| {
+            AppError::Config(format!("有效供应商 Codex config.toml 无效: {error}"))
+        })?;
+        apply_authoritative_model_family(&mut target_document, &effective_document);
+        self.build_route_plan_from_snapshot(
+            &route_plan.home_path,
+            route_plan.previous,
+            &target_document.to_string(),
         )
     }
 

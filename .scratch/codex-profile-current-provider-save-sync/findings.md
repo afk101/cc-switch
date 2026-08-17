@@ -261,3 +261,11 @@
 - GREEN：后端现在只公开稳定 `reasonCode`（camelCase），不再序列化原因文案；前端通过调用方现有 i18next `t()` 映射原因码，未知 code 与旧 `reason` payload 统一使用本地化脱敏兜底，绝不展示后端原文或 `homePath`。新增文案已同步 en/zh/ja，并同时补齐仓库支持的 zh-TW。
 - 定向验证：前端格式化测试 `3/3`；Rust payload contract `1/1`；best-effort 显式同步与敏感信息断言 `1/1`。
 - 静态验证：`pnpm typecheck`、`pnpm format:check`、`cargo fmt --all -- --check`、系统 Clang 环境下 `cargo check --all-targets` 全部通过。
+
+## Code Review P1 修复：显式 Switch 模型族收敛
+
+- Spec review 发现：关闭态重选同一供应商会直接返回，开启态旧 switch builder 只在不同供应商且目标声明 `model` 时写入该字段；两条路径都不能权威删除缺失/空 `model`，也未处理全部顶层 `model_reasoning_*`。这违反了 Spec 对 Save/Switch/Sync/Import/Restore 明确收敛动作的统一定义。
+- RED（Codex Route Manager 公开 seam）：`switching_disabled_same_provider_heals_stale_model_family` 稳定失败，Home 仍保留 `stale-model`；`switching_enabled_profile_authoritatively_replaces_model_family` 稳定失败，切到无模型、新 reasoning 的有效供应商后仍保留旧 `model`。
+- GREEN：disabled 显式切换不再对同 provider 短路，统一使用 Issue 01 的 authoritative direct projection；enabled 显式切换在 listener/目录路由目标上重新施加同一 authoritative model-family projection。Provider + Common Config 的有效终值权威覆盖/删除模型族，Profile 扩展、listener、备份、runtime 和 disable 合同保持。
+- 回归验证：两条新用例各 `1/1`；`switching_` 路由切换集 `15/15`；model-family 原语集 `3/3`；direct-provider 相关集 `2/2`；原始用户反馈环 `shared_provider_save_updates_disabled_primary_profile_model` `1/1`。
+- 静态验证：`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` 通过；系统 Clang 环境下 `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 通过。本修复不触及已记录的 Review Base 既有全量测试/Clippy 失败。
