@@ -1,6 +1,6 @@
 # 01 — Model family 权威投影原语
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 为 Codex Profile 提供一条可独立验证的 model-family 投影路径：明确同步供应商有效 `model` 与全部 `model_reasoning_*`，支持权威删除和空模型归一化，同时保留 Profile 自有扩展。
 
@@ -41,3 +41,6 @@ Status: ready-for-agent
 ## Comments
 
 - 此 issue 是后续所有业务路径的 blocking primitive。
+- 实现提交（追加 tracker 元数据前）：`178a70257304248d72dcc6279b9cb7b6b83658ad`。
+- RED/GREEN：`model_family_projection_overwrites_declared_fields_and_preserves_extensions` 先因公开投影方法缺失编译失败，最小实现后通过；`model_family_projection_removes_absent_fields_and_normalizes_empty_model` 先因旧模型未删除断言失败，补齐权威删除与空模型归一化后通过；`model_family_projection_uses_common_config_final_value` 先因 effective-provider 入口缺失编译失败，补齐薄委托后通过。
+- 验证：新增 model-family 测试 3/3、直连回归 3/3、自动投影回归 1/1、route restore 回归 9/9、provider 受管字段回归 1/1 均通过；目标文件 rustfmt 与 `cargo check --all-targets` 通过。严格 Clippy 已无本 issue lint，但仍被 10 个既有无关 lint 阻断。

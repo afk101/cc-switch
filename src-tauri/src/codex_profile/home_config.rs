@@ -486,6 +486,38 @@ impl CodexHomeConfigService {
         self.build_route_plan_from_snapshot(home, previous, route_config)
     }
 
+    /// 以有效供应商配置覆盖指定 Home 的顶层模型族字段，并保留其他字段。
+    pub fn build_model_family_projection_plan(
+        &self,
+        home: &Path,
+        effective_config: &str,
+    ) -> Result<CodexRouteConfigPlan, AppError> {
+        let current = self.inspect(home)?;
+        let mut current_document = match current.content.as_deref() {
+            Some(content) => parse_codex_document(content, "当前")?,
+            None => DocumentMut::default(),
+        };
+        let effective_document = effective_config.parse::<DocumentMut>().map_err(|error| {
+            AppError::Config(format!("有效供应商 Codex config.toml 无效: {error}"))
+        })?;
+        apply_authoritative_model_family(&mut current_document, &effective_document);
+        self.build_route_plan_from_snapshot(home, current, &current_document.to_string())
+    }
+
+    /// 从已完成 Common Config 合并的有效供应商构造 Home 模型族投影计划。
+    pub fn build_effective_provider_model_family_projection_plan(
+        &self,
+        home: &Path,
+        effective_provider: &Provider,
+    ) -> Result<CodexRouteConfigPlan, AppError> {
+        let effective_config = effective_provider
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        self.build_model_family_projection_plan(home, effective_config)
+    }
+
     /// 使用同一次 Home 快照构造配置计划，避免准备阶段重复读取覆盖外部变更。
     fn build_route_plan_from_snapshot(
         &self,
@@ -1607,6 +1639,32 @@ fn merge_automatic_direct_provider_projection(
     Ok(current_document.to_string())
 }
 
+/// 以有效供应商声明权威替换当前 Home 的全部顶层模型族字段。
+fn apply_authoritative_model_family(current: &mut DocumentMut, effective: &DocumentMut) {
+    let current_model_family_keys = current
+        .iter()
+        .filter(|(key, _)| is_model_family_field(key))
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>();
+    for key in current_model_family_keys {
+        current.as_table_mut().remove(&key);
+    }
+    for (key, item) in effective.iter() {
+        if !is_model_family_field(key) {
+            continue;
+        }
+        if key == CODEX_MODEL_FIELD && item.as_str().is_some_and(|model| model.trim().is_empty()) {
+            continue;
+        }
+        current.as_table_mut().insert(key, item.clone());
+    }
+}
+
+/// 判断字段名是否属于供应商权威管理的顶层模型族。
+fn is_model_family_field(key: &str) -> bool {
+    key == CODEX_MODEL_FIELD || key.starts_with(CODEX_MODEL_REASONING_FIELD_PREFIX)
+}
+
 /// 递归合并目标明确声明的派生字段，并保留当前文档的未知扩展字段。
 fn merge_automatic_projection_table(
     current: &mut dyn TableLike,
@@ -2523,8 +2581,11 @@ fn ensure_fingerprint(expected: &str, actual: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod codex_home_config {
     use super::*;
+    use crate::app_config::AppType;
     use crate::codex_config::{codex_auth_path_for_home, codex_config_path_for_home};
+    use crate::database::Database;
     use crate::error::AppError;
+    use crate::provider::ProviderMeta;
     use std::collections::VecDeque;
     use std::fs;
     use std::path::Path;
@@ -3180,6 +3241,142 @@ wire_api = "responses"
         assert!(config.contains("model = \"gpt-official\""));
         assert!(!config.contains("127.0.0.1:"));
         assert!(!config.contains("experimental_bearer_token"));
+        Ok(())
+    }
+
+    /// 显式模型族投影必须覆盖供应商声明的顶层字段，并保留 Profile 自有扩展。
+    #[test]
+    fn model_family_projection_overwrites_declared_fields_and_preserves_extensions(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            r#"model = "old-model"
+model_reasoning_effort = "low"
+user_setting = "keep-user-setting"
+
+[desktop]
+followUpQueueMode = "queue"
+
+[plugins.example]
+enabled = true
+
+[model_providers.custom]
+model_reasoning_extension = "keep-nested-extension"
+"#,
+        )
+        .expect("写入原始配置");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_model_family_projection_plan(
+            home.path(),
+            "model = \"new-model\"\nmodel_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\n",
+        )?;
+        service.apply_route_plan(&plan)?;
+
+        let projected = fs::read_to_string(config_path).expect("读取模型族投影结果");
+        let document = projected.parse::<DocumentMut>().expect("解析投影结果");
+        assert_eq!(
+            document.get("model").and_then(Item::as_str),
+            Some("new-model")
+        );
+        assert_eq!(
+            document
+                .get("model_reasoning_effort")
+                .and_then(Item::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            document
+                .get("model_reasoning_summary")
+                .and_then(Item::as_str),
+            Some("detailed")
+        );
+        assert!(projected.contains("user_setting = \"keep-user-setting\""));
+        assert!(projected.contains("followUpQueueMode = \"queue\""));
+        assert!(projected.contains("[plugins.example]"));
+        assert!(projected.contains("model_reasoning_extension = \"keep-nested-extension\""));
+        Ok(())
+    }
+
+    /// 有效配置未声明模型族或模型为空时必须删除 Home 的旧模型族字段。
+    #[test]
+    fn model_family_projection_removes_absent_fields_and_normalizes_empty_model(
+    ) -> Result<(), AppError> {
+        for effective_config in ["", "model = \"   \"\n"] {
+            let home = tempfile::tempdir().expect("创建临时 Home");
+            let config_path = codex_config_path_for_home(home.path());
+            fs::write(
+                &config_path,
+                "model = \"old-model\"\nmodel_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\nkeep = true\n",
+            )
+            .expect("写入旧模型族配置");
+            let service = CodexHomeConfigService::system();
+
+            let plan = service.build_model_family_projection_plan(home.path(), effective_config)?;
+            service.apply_route_plan(&plan)?;
+
+            let projected = fs::read_to_string(config_path).expect("读取权威删除结果");
+            let document = projected.parse::<DocumentMut>().expect("解析权威删除结果");
+            assert!(document.get(CODEX_MODEL_FIELD).is_none());
+            assert!(document.get("model_reasoning_effort").is_none());
+            assert!(document.get("model_reasoning_summary").is_none());
+            assert_eq!(document.get("keep").and_then(Item::as_bool), Some(true));
+        }
+        Ok(())
+    }
+
+    /// 模型族投影必须采用 Common Config 合并后的最终值。
+    #[test]
+    fn model_family_projection_uses_common_config_final_value() -> Result<(), AppError> {
+        let db = Database::memory().expect("创建内存数据库");
+        db.set_config_snippet(
+            AppType::Codex.as_str(),
+            Some("model = \"common-model\"\nmodel_reasoning_effort = \"high\"\n".to_string()),
+        )?;
+        let mut provider = Provider::with_id(
+            "custom".to_string(),
+            "Custom".to_string(),
+            serde_json::json!({
+                "config": "model = \"provider-model\"\nmodel_reasoning_effort = \"low\"\n"
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            common_config_enabled: Some(true),
+            ..Default::default()
+        });
+        let effective_settings =
+            crate::services::provider::build_effective_settings_with_common_config(
+                &db,
+                &AppType::Codex,
+                &provider,
+            )?;
+        let mut effective_provider = provider.clone();
+        effective_provider.settings_config = effective_settings;
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_effective_provider_model_family_projection_plan(
+            home.path(),
+            &effective_provider,
+        )?;
+        service.apply_route_plan(&plan)?;
+
+        let projected = fs::read_to_string(codex_config_path_for_home(home.path()))
+            .expect("读取 Common Config 投影结果");
+        let document = projected.parse::<DocumentMut>().expect("解析投影结果");
+        assert_eq!(
+            document.get(CODEX_MODEL_FIELD).and_then(Item::as_str),
+            Some("common-model")
+        );
+        assert_eq!(
+            document
+                .get("model_reasoning_effort")
+                .and_then(Item::as_str),
+            Some("high")
+        );
         Ok(())
     }
 
