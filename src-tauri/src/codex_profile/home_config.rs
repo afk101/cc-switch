@@ -57,16 +57,32 @@ pub struct CodexDirectProviderConfigPlan {
     model_catalog: Option<CodexAuxiliaryFilePlan>,
 }
 
+/// 已启用 Profile 的显式供应商保存计划。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRoutedProviderConfigPlan {
+    config: CodexRouteConfigPlan,
+    model_catalog: CodexModelCatalogProjectionPlan,
+}
+
 /// 直连供应商投影对用户模型选择的授权模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexDirectProviderProjectionMode {
     /// 用户显式切换到不同供应商，允许应用供应商模型。
     ApplyProviderModel,
+    /// 用户显式同步当前供应商，权威应用模型族并保留 Profile 扩展。
+    ApplyAuthoritativeModelFamily,
     /// 自动派生状态投影，保留 Home 中的用户模型与推理设置。
     PreserveUserModel,
 }
 
 impl CodexDirectProviderConfigPlan {
+    /// 返回计划所属的显式 Home，不暴露文件正文。
+    pub fn home_path(&self) -> &Path {
+        &self.config.home_path
+    }
+}
+
+impl CodexRoutedProviderConfigPlan {
     /// 返回计划所属的显式 Home，不暴露文件正文。
     pub fn home_path(&self) -> &Path {
         &self.config.home_path
@@ -546,6 +562,42 @@ impl CodexHomeConfigService {
         self.build_model_catalog_projection_plan_from_snapshot(home, provider, current)
     }
 
+    /// 从同一 Home 快照构造已启用 Profile 的模型族与目录组合计划。
+    pub fn build_authoritative_routed_provider_plan(
+        &self,
+        home: &Path,
+        provider: &Provider,
+    ) -> Result<CodexRoutedProviderConfigPlan, AppError> {
+        let current = self.inspect(home)?;
+        let model_catalog = self.build_model_catalog_projection_plan_from_snapshot(
+            home,
+            provider,
+            current.clone(),
+        )?;
+        let projected_content = model_catalog
+            .config
+            .as_ref()
+            .map(|plan| plan.target_content.as_slice())
+            .or(current.content.as_deref())
+            .unwrap_or_default();
+        let mut projected_document = parse_codex_document(projected_content, "当前路由")?;
+        let effective_config = provider
+            .settings_config
+            .get("config")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let effective_document = effective_config.parse::<DocumentMut>().map_err(|error| {
+            AppError::Config(format!("有效供应商 Codex config.toml 无效: {error}"))
+        })?;
+        apply_authoritative_model_family(&mut projected_document, &effective_document);
+        let config =
+            self.build_route_plan_from_snapshot(home, current, &projected_document.to_string())?;
+        Ok(CodexRoutedProviderConfigPlan {
+            config,
+            model_catalog,
+        })
+    }
+
     /// 从原始 Home 快照同时构造模型目录投影与路由接管计划，不产生文件副作用。
     pub fn build_profile_enable_plans(
         &self,
@@ -811,6 +863,19 @@ impl CodexHomeConfigService {
         )
     }
 
+    /// 构造显式供应商同步使用的直连计划，权威更新模型族并保留 Profile 扩展。
+    pub fn build_authoritative_direct_provider_plan(
+        &self,
+        home: &Path,
+        provider: &Provider,
+    ) -> Result<CodexDirectProviderConfigPlan, AppError> {
+        self.build_direct_provider_plan_with_mode(
+            home,
+            provider,
+            CodexDirectProviderProjectionMode::ApplyAuthoritativeModelFamily,
+        )
+    }
+
     /// 按调用方已确认的模型授权模式构造直连配置计划。
     fn build_direct_provider_plan_with_mode(
         &self,
@@ -847,6 +912,9 @@ impl CodexHomeConfigService {
         let current = self.inspect(home)?;
         let target_config = match mode {
             CodexDirectProviderProjectionMode::ApplyProviderModel => prepared.config_text,
+            CodexDirectProviderProjectionMode::ApplyAuthoritativeModelFamily => {
+                merge_authoritative_direct_provider_projection(&current, &prepared.config_text)?
+            }
             CodexDirectProviderProjectionMode::PreserveUserModel => {
                 merge_automatic_direct_provider_projection(&current, &prepared.config_text)?
             }
@@ -892,6 +960,44 @@ impl CodexHomeConfigService {
             self.restore_auxiliary_plan(catalog)?;
         }
         Ok(())
+    }
+
+    /// 原子应用已启用 Profile 的模型族与模型目录计划。
+    pub fn apply_authoritative_routed_provider_plan(
+        &self,
+        plan: &CodexRoutedProviderConfigPlan,
+    ) -> Result<(), AppError> {
+        self.apply_profile_enable_catalog_plan(&plan.model_catalog)?;
+        if let Err(error) = self.apply_route_plan(&plan.config) {
+            let compensation = self
+                .restore_profile_enable_catalog_plan(&plan.model_catalog)
+                .err();
+            return match compensation {
+                Some(compensation) => Err(AppError::Message(format!(
+                    "应用 Codex 路由供应商投影失败: {error}；模型目录补偿失败: {compensation}"
+                ))),
+                None => Err(error),
+            };
+        }
+        Ok(())
+    }
+
+    /// 反向恢复已启用 Profile 的模型族与模型目录计划。
+    pub fn restore_authoritative_routed_provider_plan(
+        &self,
+        plan: &CodexRoutedProviderConfigPlan,
+    ) -> Result<(), AppError> {
+        let config_error = self.restore(&plan.config).err();
+        let catalog_error = self
+            .restore_profile_enable_catalog_plan(&plan.model_catalog)
+            .err();
+        match (config_error, catalog_error) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(error),
+            (Some(config), Some(catalog)) => Err(AppError::Message(format!(
+                "恢复 Codex 路由供应商投影失败: 配置恢复失败: {config}；模型目录恢复失败: {catalog}"
+            ))),
+        }
     }
 
     /// 校验模型目录未被外部修改后原子写入目标内容。
@@ -1637,6 +1743,20 @@ fn merge_automatic_direct_provider_projection(
         true,
     );
     Ok(current_document.to_string())
+}
+
+/// 在自动直连派生字段基础上权威同步模型族，保留其余 Profile 扩展。
+fn merge_authoritative_direct_provider_projection(
+    current: &CodexLiveConfigSnapshot,
+    projected_config: &str,
+) -> Result<String, AppError> {
+    let merged = merge_automatic_direct_provider_projection(current, projected_config)?;
+    let mut merged_document = parse_codex_document(merged.as_bytes(), "自动直连投影")?;
+    let projected_document = projected_config.parse::<DocumentMut>().map_err(|error| {
+        AppError::Config(format!("显式直连投影 Codex config.toml 无效: {error}"))
+    })?;
+    apply_authoritative_model_family(&mut merged_document, &projected_document);
+    Ok(merged_document.to_string())
 }
 
 /// 以有效供应商声明权威替换当前 Home 的全部顶层模型族字段。

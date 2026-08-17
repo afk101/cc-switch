@@ -20,7 +20,7 @@ pub use home_config::{
     CodexHomeConfigService, CodexHomeExistingTokenPreflight, CodexHomeFileOps,
     CodexHomeMissingTokenPreflight, CodexHomeReconcileOwnership, CodexHomeRouteReadiness,
     CodexLiveConfigSnapshot, CodexModelCatalogProjectionPlan, CodexProvenPreviousListenerToken,
-    CodexRouteConfigPlan, SystemCodexHomeFileOps,
+    CodexRouteConfigPlan, CodexRoutedProviderConfigPlan, SystemCodexHomeFileOps,
 };
 pub use migration::{
     CodexProfileMigrationResult, CodexProfileMigrationService, LegacyCodexProfileSnapshot,

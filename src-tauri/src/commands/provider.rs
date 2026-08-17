@@ -224,10 +224,13 @@ mod tests {
         let home_b = tempfile::tempdir().expect("创建临时 Home B");
         let unrelated_home = tempfile::tempdir().expect("创建无关临时 Home");
         let home_config = CodexHomeConfigService::system();
-        let old_provider = codex_catalog_provider("old-model");
+        let mut old_provider = codex_catalog_provider("old-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"provider-default-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
         let mut new_provider = codex_catalog_provider("new-model");
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model = \"provider-default-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         new_provider.meta = Some(ProviderMeta {
             api_format: Some("openai_chat".to_string()),
@@ -249,7 +252,10 @@ mod tests {
             .expect("保存无关供应商");
         db.set_config_snippet(
             AppType::Codex.as_str(),
-            Some("[features]\nweb_search = true\n".to_string()),
+            Some(
+                "model = \"common-default-model\"\nmodel_reasoning_effort = \"high\"\n[features]\nweb_search = true\n"
+                    .to_string(),
+            ),
         )
         .expect("保存 Codex 通用配置");
         for (profile_id, home, provider_id, port) in [
@@ -290,6 +296,13 @@ mod tests {
             home_config
                 .apply_direct_provider_plan(&old_plan)
                 .expect("应用旧直连配置");
+            let config_path = crate::codex_config::codex_config_path_for_home(home);
+            let mut document = fs::read_to_string(&config_path)
+                .expect("读取临时选模前配置")
+                .parse::<toml_edit::DocumentMut>()
+                .expect("解析临时选模前配置");
+            document["model"] = toml_edit::value("temporary-home-model");
+            fs::write(config_path, document.to_string()).expect("写入 Home 临时模型");
         }
         let unrelated_plan = home_config
             .build_direct_provider_plan(unrelated_home.path(), &unrelated_provider)
@@ -319,6 +332,10 @@ mod tests {
                 .expect("读取同步后的直连配置");
             assert!(config.contains("https://updated.example.com/v1"));
             assert!(!config.contains("https://example.com/v1"));
+            assert!(config.contains("model = \"common-default-model\""));
+            assert!(config.contains("model_reasoning_effort = \"high\""));
+            assert!(!config.contains("temporary-home-model"));
+            assert!(!config.contains("provider-default-model"));
             assert!(config.contains("[features]"));
             assert!(config.contains("web_search = true"));
             let catalog = fs::read_to_string(home.join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME))
@@ -341,6 +358,72 @@ mod tests {
             fs::read(home_a.path().join("sessions/history.jsonl")).expect("读取 Profile 私有会话"),
             session_bytes
         );
+    }
+
+    #[tokio::test]
+    async fn shared_provider_save_updates_disabled_primary_profile_model() {
+        let db = Arc::new(Database::memory().expect("创建内存数据库"));
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("创建临时 Profile Home");
+        let home_config = CodexHomeConfigService::system();
+        let mut old_provider = codex_catalog_provider("catalog-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut new_provider = codex_catalog_provider("catalog-model");
+        new_provider.settings_config["config"] = json!(
+            "model = \"new-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)
+            .expect("保存旧供应商");
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-model".to_string(),
+            name: "Profile Model".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_001,
+            created_at: 1,
+            updated_at: 1,
+        })
+        .expect("保存 Profile");
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-model".to_string(),
+            current_provider_id: Some("provider-shared".to_string()),
+            enabled: false,
+            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })
+        .expect("保存路由");
+        let old_plan = home_config
+            .build_direct_provider_plan(home.path(), &old_provider)
+            .expect("构造旧直连配置计划");
+        home_config
+            .apply_direct_provider_plan(&old_plan)
+            .expect("应用旧直连配置");
+
+        state
+            .codex_route_manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await
+            .expect("共享供应商保存应成功");
+
+        let stored_provider = db
+            .get_provider_by_id("provider-shared", AppType::Codex.as_str())
+            .expect("读取保存后的供应商")
+            .expect("保存后的供应商应存在");
+        let stored_config = stored_provider.settings_config["config"]
+            .as_str()
+            .expect("供应商配置应为字符串");
+        assert!(stored_config.contains("model = \"new-model\""));
+        assert!(!stored_config.contains("model = \"old-model\""));
+
+        let config =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取同步后的直连配置");
+        assert!(config.contains("model = \"new-model\""), "{config}");
+        assert!(!config.contains("model = \"old-model\""), "{config}");
     }
 
     #[tokio::test]

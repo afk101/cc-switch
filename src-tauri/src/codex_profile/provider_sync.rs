@@ -1,5 +1,5 @@
 use crate::codex_profile::{
-    CodexDirectProviderConfigPlan, CodexHomeConfigService, CodexModelCatalogProjectionPlan,
+    CodexDirectProviderConfigPlan, CodexHomeConfigService, CodexRoutedProviderConfigPlan,
 };
 use crate::error::AppError;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub(crate) enum CodexProviderHomeProjectionPlan {
     Direct(CodexDirectProviderConfigPlan),
-    Catalog(CodexModelCatalogProjectionPlan),
+    Routed(CodexRoutedProviderConfigPlan),
 }
 
 impl CodexProviderHomeProjectionPlan {
@@ -16,7 +16,7 @@ impl CodexProviderHomeProjectionPlan {
     fn home_path(&self) -> &Path {
         match self {
             Self::Direct(plan) => plan.home_path(),
-            Self::Catalog(plan) => plan.home_path(),
+            Self::Routed(plan) => plan.home_path(),
         }
     }
 
@@ -24,7 +24,7 @@ impl CodexProviderHomeProjectionPlan {
     fn apply(&self, home_config: &CodexHomeConfigService) -> Result<(), AppError> {
         match self {
             Self::Direct(plan) => home_config.apply_direct_provider_plan(plan),
-            Self::Catalog(plan) => home_config.apply_model_catalog_projection_plan(plan),
+            Self::Routed(plan) => home_config.apply_authoritative_routed_provider_plan(plan),
         }
     }
 
@@ -32,7 +32,7 @@ impl CodexProviderHomeProjectionPlan {
     fn restore(&self, home_config: &CodexHomeConfigService) -> Result<(), AppError> {
         match self {
             Self::Direct(plan) => home_config.restore_direct_provider_plan(plan),
-            Self::Catalog(plan) => home_config.restore_model_catalog_projection_plan(plan),
+            Self::Routed(plan) => home_config.restore_authoritative_routed_provider_plan(plan),
         }
     }
 }

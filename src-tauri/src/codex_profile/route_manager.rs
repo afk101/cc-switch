@@ -664,9 +664,9 @@ impl CodexRouteManager {
             if reference.is_primary && reference.route.home_ownership == CodexHomeOwnership::Managed
             {
                 let plan = if reference.route.enabled {
-                    CodexProviderHomeProjectionPlan::Catalog(
+                    CodexProviderHomeProjectionPlan::Routed(
                         self.home_config
-                            .build_model_catalog_projection_plan(&home_path, provider)
+                            .build_authoritative_routed_provider_plan(&home_path, provider)
                             .map_err(|_| {
                                 Self::provider_projection_prepare_error(reference, &home_path)
                             })?,
@@ -683,7 +683,7 @@ impl CodexRouteManager {
                         })?;
                     CodexProviderHomeProjectionPlan::Direct(
                         self.home_config
-                            .build_automatic_direct_provider_plan(&home_path, &home_provider)
+                            .build_authoritative_direct_provider_plan(&home_path, &home_provider)
                             .map_err(|_| {
                                 Self::provider_projection_prepare_error(reference, &home_path)
                             })?,
@@ -5147,6 +5147,13 @@ mod codex_route_manager {
         fail_path: std::path::PathBuf,
     }
 
+    /// 在计划构造后的应用读取中注入外部修改，用于验证供应商保存 CAS 冲突。
+    struct ConcurrentChangeBeforeProviderApplyOps {
+        config_path: std::path::PathBuf,
+        config_reads: AtomicUsize,
+        external_content: Vec<u8>,
+    }
+
     /// 注入可重试 Home 读取故障，并记录是否发生越权写入。
     struct RetryableHomeReadErrorOps {
         fail_path: std::path::PathBuf,
@@ -5235,6 +5242,32 @@ mod codex_route_manager {
         fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
             if path == self.fail_path {
                 return Err(AppError::Config("private-plan-error-body".to_string()));
+            }
+            if path.exists() {
+                fs::read(path)
+                    .map(Some)
+                    .map_err(|error| AppError::io(path, error))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn write_atomic(&self, path: &Path, content: &[u8]) -> Result<(), AppError> {
+            crate::config::atomic_write(path, content)
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<(), AppError> {
+            if path.exists() {
+                fs::remove_file(path).map_err(|error| AppError::io(path, error))?;
+            }
+            Ok(())
+        }
+    }
+
+    impl crate::codex_profile::CodexHomeFileOps for ConcurrentChangeBeforeProviderApplyOps {
+        fn read(&self, path: &Path) -> Result<Option<Vec<u8>>, AppError> {
+            if path == self.config_path && self.config_reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                crate::config::atomic_write(path, &self.external_content)?;
             }
             if path.exists() {
                 fs::read(path)
@@ -5653,12 +5686,12 @@ mod codex_route_manager {
         let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
         old_provider.settings_config["auth"] = json!({});
         old_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"rollback-old-token\"\n"
+            "model = \"old-default-model\"\nmodel_reasoning_effort = \"low\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"rollback-old-token\"\n"
         );
         let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
         new_provider.settings_config["auth"] = json!({});
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
         for (profile_id, home, port) in [
@@ -5737,7 +5770,7 @@ mod codex_route_manager {
 
     /// 共享供应商保存应权威撤销受管字段，同时保留用户扩展。
     #[tokio::test]
-    async fn shared_provider_save_preserves_disabled_managed_user_model_and_non_route_fields(
+    async fn shared_provider_save_applies_disabled_managed_model_family_and_preserves_extensions(
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         let state = AppState::new(db.clone());
@@ -5788,8 +5821,9 @@ mod codex_route_manager {
             .await?;
 
         let updated = fs::read_to_string(&config_path).expect("读取共享供应商保存后配置");
-        assert!(updated.contains("model = \"user-selected-model\""));
-        assert!(updated.contains("model_reasoning_effort = \"medium\""));
+        assert!(updated.contains("model = \"new-default-model\""));
+        assert!(!updated.contains("user-selected-model"));
+        assert!(!updated.contains("model_reasoning_effort"));
         assert!(updated.contains("user_unknown_setting = \"keep-me\""));
         assert!(updated.contains("followUpQueueMode = \"queue\""));
         assert!(updated.contains("https://new.example.com/v1"));
@@ -5899,12 +5933,26 @@ mod codex_route_manager {
         let state = AppState::new(db.clone());
         let home = tempfile::tempdir().expect("临时启用态 Profile Home");
         let home_config = Arc::new(CodexHomeConfigService::system());
-        let old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-default-model\"\nmodel_reasoning_effort = \"low\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
         let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
+            "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        let initial_plan = home_config.build_direct_provider_plan(home.path(), &old_provider)?;
+        home_config.apply_direct_provider_plan(&initial_plan)?;
+        let initial_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let mut initial_document = fs::read_to_string(&initial_path)
+            .expect("读取启用前直连配置")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析启用前直连配置");
+        initial_document["user_unknown_setting"] = toml_edit::value("keep-me");
+        initial_document["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
+        initial_document["plugins"]["example"]["enabled"] = toml_edit::value(true);
+        fs::write(&initial_path, initial_document.to_string()).expect("写入启用前 Profile 扩展");
         prepare_enabled_catalog_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -5936,6 +5984,9 @@ mod codex_route_manager {
         let home_text =
             fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
                 .expect("读取路由接管配置");
+        assert!(home_text.contains("model = \"new-default-model\""));
+        assert!(home_text.contains("model_reasoning_effort = \"high\""));
+        assert!(!home_text.contains("old-default-model"));
         assert!(home_text.contains("http://127.0.0.1:16001/v1"));
         assert!(!home_text.contains("https://updated.example.com/v1"));
         let catalog = fs::read_to_string(
@@ -5955,6 +6006,90 @@ mod codex_route_manager {
             .settings_config
             .to_string()
             .contains("https://updated.example.com/v1"));
+        assert_eq!(runtime.swaps.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 0);
+
+        manager.disable("profile-enabled").await?;
+
+        let disabled_home =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取关闭后的直连配置");
+        assert!(disabled_home.contains("model = \"new-default-model\""));
+        assert!(disabled_home.contains("model_reasoning_effort = \"high\""));
+        assert!(disabled_home.contains("user_unknown_setting = \"keep-me\""));
+        assert!(disabled_home.contains("followUpQueueMode = \"queue\""));
+        let disabled_document = disabled_home
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析关闭后的直连配置");
+        assert_eq!(
+            disabled_document["plugins"]["example"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert!(disabled_home.contains("https://example.com/v1"));
+        assert!(!disabled_home.contains("http://127.0.0.1:16001/v1"));
+        assert_eq!(runtime.rejects.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.stops.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// 已启用 Profile 保存无模型供应商时必须删除旧模型族并保持监听器运行。
+    #[tokio::test]
+    async fn shared_provider_save_removes_enabled_primary_model_family_without_restarting(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("临时启用态无模型 Profile Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
+        new_provider.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        let direct_plan = home_config.build_direct_provider_plan(home.path(), &old_provider)?;
+        home_config.apply_direct_provider_plan(&direct_plan)?;
+        prepare_enabled_catalog_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-enabled-empty-model",
+            16_001,
+            &old_provider,
+        )?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+        let runtime = snapshot_tracking_runtime(old_provider, Vec::new());
+        manager.runtimes.lock()?.insert(
+            "profile-enabled-empty-model".to_string(),
+            runtime.clone() as Arc<dyn CodexRouteRuntime>,
+        );
+
+        manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await?;
+
+        let config =
+            fs::read_to_string(crate::codex_config::codex_config_path_for_home(home.path()))
+                .expect("读取无模型路由配置");
+        let document = config
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析无模型路由配置");
+        assert!(document.get("model").is_none());
+        assert!(document.get("model_reasoning_effort").is_none());
+        assert!(document.get("model_reasoning_summary").is_none());
+        assert!(config.contains("http://127.0.0.1:16001/v1"));
         assert_eq!(runtime.swaps.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.starts.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.rejects.load(Ordering::SeqCst), 0);
@@ -6102,11 +6237,14 @@ mod codex_route_manager {
         let enabled_primary_home = tempfile::tempdir().expect("临时开启态主引用 Home");
         let enabled_failover_home = tempfile::tempdir().expect("临时开启态故障转移 Home");
         let home_config = Arc::new(CodexHomeConfigService::system());
-        let old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-default-model\"\nmodel_reasoning_effort = \"low\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
         let primary_other = provider_with_route_catalog("provider-primary-other", "other-model");
         let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
         new_provider.settings_config["config"] = json!(
-            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-new-token\"\n"
+            "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-new-token\"\n"
         );
         for provider in [&old_provider, &primary_other] {
             db.save_provider(AppType::Codex.as_str(), provider)?;
@@ -6294,6 +6432,83 @@ mod codex_route_manager {
             .settings_config
             .to_string()
             .contains("https://example.com/v1"));
+        Ok(())
+    }
+
+    /// 计划完成后 Home 被外部修改时，供应商保存必须拒绝覆盖并保留旧数据库状态。
+    #[tokio::test]
+    async fn shared_provider_save_rejects_concurrent_home_change_without_sensitive_detail(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = AppState::new(db.clone());
+        let home = tempfile::tempdir().expect("临时并发修改 Profile Home");
+        let setup_home_config = CodexHomeConfigService::system();
+        let mut old_provider = provider_with_route_catalog("provider-shared", "old-model");
+        old_provider.settings_config["config"] = json!(
+            "model = \"old-default-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        let mut new_provider = provider_with_route_catalog("provider-shared", "new-model");
+        new_provider.settings_config["config"] = json!(
+            "model = \"new-default-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-provider-token\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            &setup_home_config,
+            home.path(),
+            "profile-concurrent-save",
+            16_001,
+            &old_provider,
+        )?;
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let catalog_path = home
+            .path()
+            .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let catalog_before = fs::read(&catalog_path).expect("读取并发修改前模型目录");
+        let external_content = b"model = \"external-model\"\nuser_external_edit = true\n".to_vec();
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::new(Arc::new(
+                ConcurrentChangeBeforeProviderApplyOps {
+                    config_path: config_path.clone(),
+                    config_reads: AtomicUsize::new(0),
+                    external_content: external_content.clone(),
+                },
+            ))),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let error = manager
+            .update_shared_provider(&state, new_provider, Some("provider-shared"))
+            .await
+            .expect_err("并发修改时供应商保存必须失败");
+
+        let message = error.to_string();
+        assert!(message.contains("profile-concurrent-save"));
+        assert!(!message.contains("private-provider-token"));
+        assert_eq!(
+            fs::read(&config_path).expect("读取外部修改结果"),
+            external_content
+        );
+        assert_eq!(
+            fs::read(&catalog_path).expect("读取补偿后模型目录"),
+            catalog_before
+        );
+        let stored = db
+            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .expect("旧供应商仍存在");
+        assert!(stored
+            .settings_config
+            .to_string()
+            .contains("old-default-model"));
+        assert!(!stored
+            .settings_config
+            .to_string()
+            .contains("new-default-model"));
         Ok(())
     }
 
