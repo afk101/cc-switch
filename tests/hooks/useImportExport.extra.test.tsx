@@ -115,7 +115,7 @@ describe("useImportExport Hook (edge cases)", () => {
           profileId: "profile-a",
           profileName: "工作 Profile",
           homePath: "/private/profile-a",
-          reason: "Profile Home 同步失败，请检查文件权限",
+          reasonCode: "apply_failed",
         },
       ],
     });
@@ -133,7 +133,8 @@ describe("useImportExport Hook (edge cases)", () => {
     expect(toastWarningMock).toHaveBeenCalledWith(
       expect.any(String),
       expect.objectContaining({
-        description: "工作 Profile: Profile Home 同步失败，请检查文件权限",
+        description:
+          "工作 Profile: settings.profileSyncWarnings.reasons.applyFailed",
       }),
     );
   });

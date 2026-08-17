@@ -269,3 +269,13 @@
 - GREEN：disabled 显式切换不再对同 provider 短路，统一使用 Issue 01 的 authoritative direct projection；enabled 显式切换在 listener/目录路由目标上重新施加同一 authoritative model-family projection。Provider + Common Config 的有效终值权威覆盖/删除模型族，Profile 扩展、listener、备份、runtime 和 disable 合同保持。
 - 回归验证：两条新用例各 `1/1`；`switching_` 路由切换集 `15/15`；model-family 原语集 `3/3`；direct-provider 相关集 `2/2`；原始用户反馈环 `shared_provider_save_updates_disabled_primary_profile_model` `1/1`。
 - 静态验证：`cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` 通过；系统 Clang 环境下 `cargo check --manifest-path src-tauri/Cargo.toml --all-targets` 通过。本修复不触及已记录的 Review Base 既有全量测试/Clippy 失败。
+
+## 防复发结论与最终收口
+
+- 采用推荐方案：保存、切换、手动 Sync、数据库导入与云恢复这些明确动作，统一复用同一条 authoritative model-family 投影原语；业务编排不得自行复制 `model` 或 `model_reasoning_*` 的覆盖、删除与 Common Config 合并规则。
+- 防复发测试门禁分为三层：Home 配置服务验证字段级覆盖/删除与扩展保留；Route Manager 验证 disabled、enabled、同供应商重选、listener/runtime/补偿；命令与前端验证保存、恢复及本地化 warning 的用户可观察结果。
+- 上述回归均位于仓库现有 Rust/前端测试套件中，GitHub CI 的 `cargo test` 与 `pnpm test:unit` 会自动执行，不依赖一次性脚本或人工切换供应商复现。
+- Code Review 的 Standards P2 与 Spec P1 已分别修复，并由原审查者只读复核为 `resolved`；主流程再次验证原始反馈环 `1/1` 与 `switching_` 集合 `16/16` 通过。
+- 当前终态完整验证：Rust lib 共运行 `2656` 个测试，其中 `2651 passed, 5 ignored`；跳过 Review Base 已确认失配的两个旧 Codex command 用例后，全部 Rust 集成测试通过，其中 `provider_commands` 为 `8/8`；前端 Vitest（排除应由 Node TAP 执行的 `scripts/upgrade.test.js`）为 `757/757`，对应 Node TAP 为 `1/1`。
+- 完整前端首轮曾暴露 `useImportExport.extra.test.tsx` 仍构造旧 `reason` 并期待展示后端原文；该测试夹具已改用公开 `reasonCode`，断言本地化 key 的传递，精确文件 `5/5` 后再跑全量 `757/757`。这保留了生产代码“不展示后端原文”的安全合同。
+- 项目根目录不存在 `docs-spec/`，因此按 `$implement` 合同跳过 `$oms-spec-sync-docs`，不为本任务自动初始化新的 docs-spec 体系。

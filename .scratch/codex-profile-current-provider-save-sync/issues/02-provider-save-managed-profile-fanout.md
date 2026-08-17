@@ -14,15 +14,15 @@ Status: resolved
 
 ## Acceptance Criteria
 
-- [ ] disabled Managed 主引用在保存后立即更新 model family、Base URL、MCP 与模型目录，无需切换 provider。
-- [ ] 即使本次只改 Base URL，也重新应用供应商有效 model family。
-- [ ] enabled Managed 主引用保持 listener 严格字段和运行时不中断，同时 Home、catalog 与新请求 runtime 使用新配置。
-- [ ] 在途请求继续使用进入时快照；保存后新请求使用新快照。
-- [ ] enabled 保存后关闭路由，新 model family 与所有 Profile 扩展保留。
-- [ ] 多 Managed 主引用全部同步；External/failover-only Home 不变，运行中 failover snapshot 按既有合同更新。
-- [ ] 任一受影响 Profile 失败时，Home/catalog/route backup/DB 按现有全引用合同补偿。
-- [ ] 错误不泄露 token、API Key 或配置正文，provider key rename 仍拒绝。
-- [ ] 诊断测试 `shared_provider_save_updates_disabled_primary_profile_model` 从 RED 变 GREEN，原始反馈环不再复现。
+- [x] disabled Managed 主引用在保存后立即更新 model family、Base URL、MCP 与模型目录，无需切换 provider。
+- [x] 即使本次只改 Base URL，也重新应用供应商有效 model family。
+- [x] enabled Managed 主引用保持 listener 严格字段和运行时不中断，同时 Home、catalog 与新请求 runtime 使用新配置。
+- [x] 在途请求继续使用进入时快照；保存后新请求使用新快照。
+- [x] enabled 保存后关闭路由，新 model family 与所有 Profile 扩展保留。
+- [x] 多 Managed 主引用全部同步；External/failover-only Home 不变，运行中 failover snapshot 按既有合同更新。
+- [x] 任一受影响 Profile 失败时，Home/catalog/route backup/DB 按现有全引用合同补偿。
+- [x] 错误不泄露 token、API Key 或配置正文，provider key rename 仍拒绝。
+- [x] 诊断测试 `shared_provider_save_updates_disabled_primary_profile_model` 从 RED 变 GREEN，原始反馈环不再复现。
 
 ## 验证方式
 

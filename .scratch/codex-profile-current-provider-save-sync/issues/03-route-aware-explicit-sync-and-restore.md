@@ -14,14 +14,14 @@ Status: resolved
 
 ## Acceptance Criteria
 
-- [ ] 手动 Sync 遍历所有 Managed Profile，并按各自的有效主供应商同步 model family。
-- [ ] Import 与云恢复在 DB 成功后触发同一 route-aware Profile 同步。
-- [ ] External 跳过；没有主供应商或单个 Home 失败时记录该 Profile 结果并继续。
-- [ ] 已成功 Profile 不因后续失败回滚；Import/Restore 的 DB 成功不回滚。
-- [ ] 全成功返回成功；部分失败返回完成状态与逐 Profile 脱敏 warnings。
-- [ ] warning 不包含 token、API Key 或配置正文，并能让用户识别需要修复的 Profile。
-- [ ] 普通 startup 继续保留 model family；下一次明确 Sync 可以修复上次失败或崩溃残留。
-- [ ] 先在 route-aware explicit sync public seam 观察 RED，再完成 GREEN；命令层只测试委托和公开结果。
+- [x] 手动 Sync 遍历所有 Managed Profile，并按各自的有效主供应商同步 model family。
+- [x] Import 与云恢复在 DB 成功后触发同一 route-aware Profile 同步。
+- [x] External 跳过；没有主供应商或单个 Home 失败时记录该 Profile 结果并继续。
+- [x] 已成功 Profile 不因后续失败回滚；Import/Restore 的 DB 成功不回滚。
+- [x] 全成功返回成功；部分失败返回完成状态与逐 Profile 脱敏 warnings。
+- [x] warning 不包含 token、API Key 或配置正文，并能让用户识别需要修复的 Profile。
+- [x] 普通 startup 继续保留 model family；下一次明确 Sync 可以修复上次失败或崩溃残留。
+- [x] 先在 route-aware explicit sync public seam 观察 RED，再完成 GREEN；命令层只测试委托和公开结果。
 
 ## 验证方式
 
@@ -47,8 +47,8 @@ Status: resolved
 - 若现有云恢复入口有多个调用方，所有 post-import 路径必须汇入同一显式同步 contract。
 - RED：`explicit_sync_uses_each_managed_profile_primary_provider_and_skips_external` 首次因 `CodexRouteManager::sync_managed_profiles_explicit` 不存在而编译失败，证明 route-aware public seam 尚未建立。
 - GREEN：新增逐 Profile 显式同步结果与 manager seam；多主供应商分别应用有效 model family，External 以结构化 outcome 跳过。
-- RED：`explicit_sync_continues_after_profile_failure_and_returns_sanitized_warning` 首次因 warning 缺少独立 `reason` 字段失败。
-- GREEN：新增专用 `CodexProfileSyncWarning`；单 Profile Home 失败与缺少主供应商均继续后续 Profile，warning 只含 Profile 标识、名称、Home 路径和固定脱敏原因。
+- RED：`explicit_sync_continues_after_profile_failure_and_returns_sanitized_warning` 首次因 warning 缺少独立的结构化原因字段失败；Code Review 后的 payload contract 测试又先因缺少 `reasonCode` 编译失败。
+- GREEN：专用 `CodexProfileSyncWarning` 现在只公开稳定 `reasonCode`；单 Profile Home 失败与缺少主供应商均继续后续 Profile。前端按原因码本地化，未知码与旧 `reason` payload 使用固定脱敏兜底，不展示后端原文或 Home 路径。
 - RED/GREEN：命令 payload 测试先因 `attach_profile_sync_result` 不存在而编译失败；实现后保持 Import/Restore 成功字段并附加 `profileSync`、`warnings` 结构。
 - 调用方：手动 Sync、SQL Import、数据库备份恢复、WebDAV download、S3 download 全部汇入 `run_post_import_sync`；Import 前端移除重复 Sync，所有恢复界面展示逐 Profile 名称与脱敏原因。
 - 验证通过：3 个 route-aware manager 测试、2 个 sync payload 测试、26 个 `import_export_sync` 回归、provider-save 原子补偿回归、startup 保留用户 model-family 回归、7 个相关前端测试、`pnpm typecheck`、Rust `cargo check --tests`、`cargo fmt --check`、`git diff --check`。

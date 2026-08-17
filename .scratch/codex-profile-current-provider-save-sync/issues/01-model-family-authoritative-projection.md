@@ -14,12 +14,12 @@ Status: resolved
 
 ## Acceptance Criteria
 
-- [ ] 有效配置声明的 `model` 和任意顶层 `model_reasoning_*` 覆盖 Home 旧值。
-- [ ] 有效配置缺失的旧 model-family 字段从 Home 删除，`model = ""` 按缺失处理。
-- [ ] Common Config 冲突时，投影采用合并后的最终值。
-- [ ] Desktop、插件、未知扩展及非 model-family 用户字段保持不变。
-- [ ] Official 与 Custom Provider 的无模型配置均可投影。
-- [ ] 先在已确认的 Home 配置服务 public seam 观察 RED，再完成 GREEN。
+- [x] 有效配置声明的 `model` 和任意顶层 `model_reasoning_*` 覆盖 Home 旧值。
+- [x] 有效配置缺失的旧 model-family 字段从 Home 删除，`model = ""` 按缺失处理。
+- [x] Common Config 冲突时，投影采用合并后的最终值。
+- [x] Desktop、插件、未知扩展及非 model-family 用户字段保持不变。
+- [x] Official 与 Custom Provider 的无模型配置均可投影。
+- [x] 先在已确认的 Home 配置服务 public seam 观察 RED，再完成 GREEN。
 
 ## 验证方式
 
