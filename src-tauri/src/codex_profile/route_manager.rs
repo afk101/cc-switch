@@ -8268,6 +8268,109 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 启动对账必须清理关闭态 Managed Home 的自有目录指针并保留用户模型族与扩展。
+    #[tokio::test]
+    async fn disabled_managed_startup_reconcile_clears_owned_catalog_pointer_and_preserves_user_state(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
+        };
+        use crate::codex_profile::CODEX_MODEL_CATALOG_FIELD;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("创建关闭态托管 Home");
+        let mut official = Provider::with_id(
+            "official-startup".to_string(),
+            "OpenAI Official".to_string(),
+            json!({
+                "auth": {},
+                "config": "model = \"provider-default\"\nmodel_reasoning_effort = \"low\"\n"
+            }),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider(AppType::Codex.as_str(), &official)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-startup-catalog-cleanup".to_string(),
+            name: "Profile Startup Catalog Cleanup".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_201,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-startup-catalog-cleanup".to_string(),
+            current_provider_id: Some(official.id.clone()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        let original_catalog = b"stale third-party catalog";
+        fs::write(
+            &config_path,
+            format!(
+                "model = \"user-selected-model\"\nmodel_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\nmodel_catalog_json = \"{CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME}\"\nprofile_extension = \"keep\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+            ),
+        )
+        .expect("写入启动前 Home 配置");
+        let catalog_path = home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&catalog_path, original_catalog).expect("写入旧模型目录");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .reconcile_all_profile_derived_state(db.as_ref())
+            .await?;
+
+        let reconciled = fs::read_to_string(config_path)
+            .expect("读取启动对账后 Home")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析启动对账后 Home");
+        assert!(reconciled.get(CODEX_MODEL_CATALOG_FIELD).is_none());
+        assert_eq!(
+            reconciled.get("model").and_then(toml_edit::Item::as_str),
+            Some("user-selected-model")
+        );
+        assert_eq!(
+            reconciled
+                .get("model_reasoning_effort")
+                .and_then(toml_edit::Item::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            reconciled
+                .get("model_reasoning_summary")
+                .and_then(toml_edit::Item::as_str),
+            Some("detailed")
+        );
+        assert_eq!(
+            reconciled
+                .get("profile_extension")
+                .and_then(toml_edit::Item::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            reconciled["desktop"]["followUpQueueMode"].as_str(),
+            Some("queue")
+        );
+        assert_eq!(
+            fs::read(catalog_path).expect("重读旧模型目录"),
+            original_catalog
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn reconcile_all_profile_derived_state_repairs_disabled_homes_idempotently_and_isolates_failure(
     ) -> Result<(), AppError> {
@@ -8782,6 +8885,122 @@ codex_unknown = true
         Ok(())
     }
 
+    /// 关闭态 Profile 从带目录第三方切回无目录官方时不得残留第三方目录指针。
+    #[tokio::test]
+    async fn disabled_profile_catalog_provider_to_official_round_trip_clears_pointer(
+    ) -> Result<(), AppError> {
+        use crate::codex_config::{
+            codex_config_path_for_home, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
+        };
+        use crate::codex_profile::CODEX_MODEL_CATALOG_FIELD;
+
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let third_party = provider_with_route_catalog("third-party", "third-party-model");
+        let mut official = Provider::with_id(
+            "official-round-trip".to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth": {}, "config": ""}),
+            None,
+        );
+        official.category = Some("official".to_string());
+        for provider in [&third_party, &official] {
+            db.save_provider(AppType::Codex.as_str(), provider)?;
+        }
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-catalog-round-trip".to_string(),
+            name: "Profile Catalog Round Trip".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_203,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-catalog-round-trip".to_string(),
+            current_provider_id: Some(official.id.clone()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"official-before\"\nprofile_extension = \"keep\"\n",
+        )
+        .expect("写入官方基线配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .switch_provider_with_effective_settings_preserving_failovers(
+                "profile-catalog-round-trip",
+                third_party.clone(),
+            )
+            .await?;
+
+        let third_party_config = fs::read_to_string(&config_path)
+            .expect("读取第三方阶段配置")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析第三方阶段配置");
+        assert_eq!(
+            third_party_config
+                .get(CODEX_MODEL_CATALOG_FIELD)
+                .and_then(toml_edit::Item::as_str),
+            Some(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)
+        );
+        assert_eq!(
+            db.get_codex_profile_route("profile-catalog-round-trip")?
+                .expect("第三方阶段路由存在")
+                .current_provider_id
+                .as_deref(),
+            Some("third-party")
+        );
+        let catalog_path = home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let third_party_catalog = fs::read(&catalog_path).expect("读取第三方模型目录");
+        assert!(String::from_utf8_lossy(&third_party_catalog).contains("third-party-model"));
+
+        manager
+            .switch_provider_with_effective_settings_preserving_failovers(
+                "profile-catalog-round-trip",
+                official.clone(),
+            )
+            .await?;
+
+        let official_config = fs::read_to_string(config_path)
+            .expect("读取官方阶段配置")
+            .parse::<toml_edit::DocumentMut>()
+            .expect("解析官方阶段配置");
+        assert!(official_config.get(CODEX_MODEL_CATALOG_FIELD).is_none());
+        assert_eq!(
+            official_config
+                .get("profile_extension")
+                .and_then(toml_edit::Item::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            db.get_codex_profile_route("profile-catalog-round-trip")?
+                .expect("官方阶段路由存在")
+                .current_provider_id
+                .as_deref(),
+            Some("official-round-trip")
+        );
+        assert_eq!(
+            fs::read(catalog_path).expect("重读官方阶段旧目录"),
+            third_party_catalog
+        );
+        Ok(())
+    }
+
     /// 关闭态 Profile 切换到任意无目录供应商都必须移除 CC Switch 自有指针。
     #[tokio::test]
     async fn switching_disabled_profile_to_non_official_without_catalog_clears_pointer(
@@ -8909,7 +9128,11 @@ codex_unknown = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Profile Home");
         let config_path = crate::codex_config::codex_config_path_for_home(home.path());
-        fs::write(&config_path, "model = \"before\"\n").expect("写入原配置");
+        let original = format!(
+            "model = \"before\"\nmodel_reasoning_effort = \"high\"\nmodel_catalog_json = \"{}\"\nprofile_extension = \"keep\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n",
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME
+        );
+        fs::write(&config_path, &original).expect("写入原配置");
         db.save_provider(
             AppType::Codex.as_str(),
             &Provider::with_id(
@@ -8959,9 +9182,88 @@ codex_unknown = true
 
         assert_eq!(
             fs::read_to_string(config_path).expect("重读原配置"),
-            "model = \"before\"\n"
+            original
         );
         let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert!(!route.enabled);
+        assert!(route.current_provider_id.is_none());
+        Ok(())
+    }
+
+    /// 关闭态切换持久化失败后的补偿不得覆盖并发外部 Home 修改。
+    #[tokio::test]
+    async fn switching_disabled_profile_save_failure_preserves_concurrent_home_change(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        let original = format!(
+            "model = \"before\"\nmodel_catalog_json = \"{}\"\nprofile_extension = \"keep\"\n",
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME
+        );
+        let external = b"model = \"external\"\nprofile_extension = \"external-change\"\n".to_vec();
+        fs::write(&config_path, original).expect("写入原配置");
+        db.save_provider(
+            AppType::Codex.as_str(),
+            &Provider::with_id(
+                "provider-new".to_string(),
+                "Provider New".to_string(),
+                json!({"auth": {}, "config": "model = \"after\"\n"}),
+                None,
+            ),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-concurrent-restore".to_string(),
+            name: "Profile Concurrent Restore".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16_202,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-concurrent-restore".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            Arc::new(SaveFailingPersistence {
+                db: db.clone(),
+                save_count: AtomicUsize::new(0),
+                fail_on_save: 1,
+                fail_replace: false,
+            }),
+            Arc::new(CodexHomeConfigService::new(Arc::new(
+                ExternalAfterRestoreReadOps {
+                    config_path: config_path.clone(),
+                    external_content: external.clone(),
+                    writes: AtomicUsize::new(0),
+                    injected: AtomicBool::new(false),
+                },
+            ))),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .switch_provider("profile-concurrent-restore", "provider-new", vec![])
+            .await
+            .expect_err("路由保存失败必须返回错误");
+
+        assert_eq!(
+            fs::read(&config_path).expect("重读并发修改后 Home"),
+            external
+        );
+        let route = db
+            .get_codex_profile_route("profile-concurrent-restore")?
+            .expect("路由记录");
         assert!(!route.enabled);
         assert!(route.current_provider_id.is_none());
         Ok(())

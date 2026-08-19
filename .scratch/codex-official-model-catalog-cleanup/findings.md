@@ -231,6 +231,19 @@
 - 编译失败已通过显式映射测试文件读取错误修复；随后显式 Sync 测试组 4 项通过，共享供应商保存测试组 16 项通过，Import/Restore 统一结果测试 2 项通过，Route Manager 全部 146 项通过。
 - 供应商保存补偿 fixture 已改为“旧供应商有目录、待保存供应商无目录”：批量第二个 Home 写失败会恢复第一个 Home，数据库提交失败测试在 commit 闭包内确认指针已经清理后再注入失败，并验证所有 Home、目录文件、供应商记录和 runtime snapshot 恢复且错误不泄露 token。
 
+## Issue 03 执行审计
+
+- Blocker 01 已完成，findings 中只有一个 Review Base `d6e13d43b64a16930dfaed9cda4890dd05b192e2`，且它是执行时 HEAD 的祖先；issue 03 没有新增生产分支，只补齐启动、失败安全和原始往返的 public-seam 回归。
+- TS-05 启动测试在临时恢复 Review Base direct-plan 行为后实际运行 1 项并因 owned 目录指针残留失败；恢复 issue 01 的共享投影后同一测试通过，并保留用户 `model`、`model_reasoning_effort`、`model_reasoning_summary`、Profile/Desktop 扩展和旧目录文件。
+- 启动失败隔离与 External ownership 继续由既有 `reconcile_all_profile_derived_state_repairs_disabled_homes_idempotently_and_isolates_failure` 和 `external_takeover_skips_later_disabled_derived_state_projection` 覆盖，两项均包含在 Route Manager 149 项绿色回归中。
+- TS-01 持久化失败测试在临时移除 `persist_disabled_provider_selection_locked` 的 Home 补偿后实际运行 1 项并因 Home 停留在投影后状态失败；恢复补偿后同一测试通过，切换前包含旧目录指针的完整 Home 逐字恢复。
+- TS-02 条件恢复测试在临时移除 target fingerprint 检查后实际运行 1 项并因外部 Home 被旧快照覆盖而失败；恢复 CAS 检查后同一测试通过，补偿冲突返回错误且并发外部内容保持不变。
+- Stage 5 完整关闭态往返测试在临时恢复 Review Base direct-plan 行为后实际运行 1 项并因官方阶段仍残留第三方目录指针失败；恢复共享投影后同一测试通过，第三方阶段相对指针和目录文件存在，官方阶段指针消失、主引用更新且旧目录文件保留。
+- Stage 6 已让 `src-tauri/tests/provider_service.rs` 恢复到 HEAD，删除 diagnosing 阶段旧单 Home 绿色对照及扩展断言；搜索未发现 `[DEBUG-` 和旧对照测试名，未创建 prototype、临时 worktree 或依赖软链。
+- 回归矩阵：issue 01/02/03 七项代表性 focused tests 全部通过；Route Manager 149 项、Home Config 47 项、Codex Config 81 项、Sync Support 2 项、ProviderService 36 项全部通过。
+- 首次完整并发 Rust lib 运行 2662 passed、1 failed、5 ignored；唯一失败的数据库同步导入测试隔离运行通过，且本任务未修改对应文件，因此分类为并发基线噪声。改用串行线程后 lib 为 2663 passed、0 failed、5 ignored。
+- 串行 workspace suite 随后停在既有 `provider_commands`：两个 Codex 测试仍调用当前明确禁止的通用 `switch_provider` 并稳定收到“必须指定 Codex Profile”，另外两个因测试互斥锁中毒级联失败的项目隔离运行通过。Review Base 至当前 HEAD 与 issue 03 均未修改该文件，本 issue 不扩展范围修复旧 seam。
+
 ---
 
 *每完成两次重要查看、搜索、实验或浏览后更新本文件。*
