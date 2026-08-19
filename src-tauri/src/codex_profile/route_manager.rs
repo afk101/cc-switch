@@ -8527,6 +8527,141 @@ codex_unknown = true
         Ok(())
     }
 
+    /// 关闭态 Profile 切回官方供应商必须移除 CC Switch 自有模型目录指针。
+    #[tokio::test]
+    async fn switching_disabled_profile_to_official_clears_catalog_pointer() -> Result<(), AppError>
+    {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            format!(
+                "model_catalog_json = \"{}\"\n",
+                crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME
+            ),
+        )
+        .expect("写入第三方模型目录指针");
+        let mut provider = Provider::with_id(
+            "official".to_string(),
+            "OpenAI Official".to_string(),
+            json!({"auth": {}, "config": ""}),
+            None,
+        );
+        provider.category = Some("official".to_string());
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .switch_provider_with_effective_settings_preserving_failovers("profile-a", provider)
+            .await?;
+
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert_eq!(route.current_provider_id.as_deref(), Some("official"));
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        assert!(
+            !config.contains("model_catalog_json"),
+            "切回官方供应商必须移除 CC Switch 模型目录指针，实际配置：\n{config}"
+        );
+        Ok(())
+    }
+
+    /// 关闭态 Profile 切换到任意无目录供应商都必须移除 CC Switch 自有指针。
+    #[tokio::test]
+    async fn switching_disabled_profile_to_non_official_without_catalog_clears_pointer(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home = tempfile::tempdir().expect("临时 Profile Home");
+        let config_path = crate::codex_config::codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            format!(
+                "model_catalog_json = \"{}\"\n",
+                crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME
+            ),
+        )
+        .expect("写入第三方模型目录指针");
+        let provider = Provider::with_id(
+            "without-catalog".to_string(),
+            "Without Catalog".to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": "upstream-token"},
+                "config": "model = \"third-party-model\"\n"
+            }),
+            None,
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-a".to_string(),
+            name: "Profile A".to_string(),
+            canonical_home_path: home.path().display().to_string(),
+            listen_port: 16001,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-a".to_string(),
+            current_provider_id: None,
+            enabled: false,
+            home_ownership: crate::codex_profile::CodexHomeOwnership::Managed,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            Arc::new(CodexHomeConfigService::system()),
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .switch_provider_with_effective_settings_preserving_failovers("profile-a", provider)
+            .await?;
+
+        let route = db.get_codex_profile_route("profile-a")?.expect("路由记录");
+        assert_eq!(
+            route.current_provider_id.as_deref(),
+            Some("without-catalog")
+        );
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        assert!(
+            !config.contains("model_catalog_json"),
+            "无目录供应商不得依赖 official 类别清理指针，实际配置：\n{config}"
+        );
+        Ok(())
+    }
+
     /// 即使 runtime 尚未恢复，持久化启用态也必须阻止 Profile 元数据修改。
     #[tokio::test]
     async fn profile_metadata_lock_treats_enabled_route_as_active_without_runtime(

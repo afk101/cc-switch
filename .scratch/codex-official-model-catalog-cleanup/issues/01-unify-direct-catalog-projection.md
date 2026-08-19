@@ -1,6 +1,6 @@
 # 01 — 统一直连切换的模型目录投影
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 关闭态 Managed Profile 通过真实 provider 切换入口选择无模型目录的官方或第三方主供应商后，cc-switch 自有目录指针会被清理；选择带目录的供应商时，目标 Home 会得到正确目录文件和相对指针。该行为由共享 direct plan 提供，而不是由 official 特判实现。
 
@@ -46,3 +46,9 @@ Status: ready-for-agent
 ## Comments
 
 - 诊断阶段已存在一个未提交的最小 red test；它属于本 issue，应由 worker 保留、验证并随本 issue 提交。
+- Review Base `d6e13d43b64a16930dfaed9cda4890dd05b192e2` 是执行时 HEAD 的祖先，本 issue 无 blocker。
+- Red 证据：`cargo test --lib switching_disabled_profile_to_official_clears_catalog_pointer -- --nocapture` 实际运行 1 个测试并失败；route 已更新，但最终 Home 仍包含 `model_catalog_json = "cc-switch-model-catalog.json"`。
+- Green 证据：在 shared direct plan 内基于同一 Home 快照先完成 ownership-aware 目录指针投影，再合并 provider 投影；同一 focused test 结果为 1 passed。
+- 回归证据：关闭态 official 与非 official 无目录切换 2 passed；direct-provider focused 测试 7 passed；Home Config Service 模块 47 passed；底层空目录 ownership 测试 2 passed。
+- 覆盖边界：authoritative/automatic 两种模式、用户自定义 pointer、Profile 扩展、旧目录文件、目标 Home 隔离、外部并发编辑与辅助文件补偿、恢复到投影前原始快照。
+- 静态验证：`cargo fmt --all --check` 与 `git diff --check` 均通过。

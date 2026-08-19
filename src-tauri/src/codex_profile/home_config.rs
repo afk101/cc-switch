@@ -936,13 +936,33 @@ impl CodexHomeConfigService {
             catalog_profile,
         )?;
         let current = self.inspect(home)?;
+        let current_config = current
+            .content
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
+            .unwrap_or("");
+        let catalog_projected_config = crate::codex_config::set_codex_model_catalog_json_field(
+            current_config,
+            prepared
+                .model_catalog
+                .as_ref()
+                .map(|_| Path::new(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)),
+        )?;
         let target_config = match mode {
             CodexDirectProviderProjectionMode::ApplyProviderModel => prepared.config_text,
             CodexDirectProviderProjectionMode::ApplyAuthoritativeModelFamily => {
-                merge_authoritative_direct_provider_projection(&current, &prepared.config_text)?
+                merge_authoritative_direct_provider_projection(
+                    &catalog_projected_config,
+                    &prepared.config_text,
+                )?
             }
             CodexDirectProviderProjectionMode::PreserveUserModel => {
-                merge_automatic_direct_provider_projection(&current, &prepared.config_text)?
+                merge_automatic_direct_provider_projection(
+                    &catalog_projected_config,
+                    &prepared.config_text,
+                )?
             }
         };
         let config = self.build_route_plan_from_snapshot(home, current, &target_config)?;
@@ -1749,13 +1769,10 @@ impl CodexHomeConfigService {
 
 /// 将自动直连派生字段合并到当前 Home，用户模型、推理设置与未被目标声明的字段保持不变。
 fn merge_automatic_direct_provider_projection(
-    current: &CodexLiveConfigSnapshot,
+    current_config: &str,
     projected_config: &str,
 ) -> Result<String, AppError> {
-    let mut current_document = match current.content.as_deref() {
-        Some(content) => parse_codex_document(content, "当前")?,
-        None => DocumentMut::default(),
-    };
+    let mut current_document = parse_codex_document(current_config.as_bytes(), "当前")?;
     let projected_document = projected_config.parse::<DocumentMut>().map_err(|error| {
         AppError::Config(format!("自动直连投影 Codex config.toml 无效: {error}"))
     })?;
@@ -1773,10 +1790,10 @@ fn merge_automatic_direct_provider_projection(
 
 /// 在自动直连派生字段基础上权威同步模型族，保留其余 Profile 扩展。
 fn merge_authoritative_direct_provider_projection(
-    current: &CodexLiveConfigSnapshot,
+    current_config: &str,
     projected_config: &str,
 ) -> Result<String, AppError> {
-    let merged = merge_automatic_direct_provider_projection(current, projected_config)?;
+    let merged = merge_automatic_direct_provider_projection(current_config, projected_config)?;
     let mut merged_document = parse_codex_document(merged.as_bytes(), "自动直连投影")?;
     let projected_document = projected_config.parse::<DocumentMut>().map_err(|error| {
         AppError::Config(format!("显式直连投影 Codex config.toml 无效: {error}"))
@@ -3558,6 +3575,122 @@ model_reasoning_extension = "keep-nested-extension"
         Ok(())
     }
 
+    /// 显式直连投影必须清理 CC Switch 自有指针，但不删除旧目录文件和 Profile 扩展。
+    #[test]
+    fn authoritative_direct_provider_without_catalog_keeps_owned_home_state() -> Result<(), AppError>
+    {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let catalog_path = home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(
+            &config_path,
+            "model = \"old-model\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\nprofile_extension = \"keep\"\n",
+        )
+        .expect("写入原始直连配置");
+        fs::write(&catalog_path, b"old catalog").expect("写入旧模型目录");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_authoritative_direct_provider_plan(
+            home.path(),
+            &provider_without_catalog("without-catalog"),
+        )?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        let document = config.parse::<DocumentMut>().expect("解析直连配置");
+        assert!(document.get(CODEX_MODEL_CATALOG_FIELD).is_none());
+        assert_eq!(
+            document.get(CODEX_MODEL_FIELD).and_then(Item::as_str),
+            Some("gpt-official")
+        );
+        assert_eq!(
+            document.get("profile_extension").and_then(Item::as_str),
+            Some("keep")
+        );
+        assert_eq!(
+            fs::read(catalog_path).expect("读取旧模型目录"),
+            b"old catalog"
+        );
+        Ok(())
+    }
+
+    /// 自动直连投影清理自有目录指针时必须保留 Home 当前模型族。
+    #[test]
+    fn automatic_direct_provider_without_catalog_preserves_home_model_family(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"home-model\"\nmodel_reasoning_effort = \"low\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\nprofile_extension = \"keep\"\n",
+        )
+        .expect("写入原始直连配置");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_automatic_direct_provider_plan(
+            home.path(),
+            &provider_without_catalog("without-catalog"),
+        )?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        let document = config.parse::<DocumentMut>().expect("解析直连配置");
+        assert!(document.get(CODEX_MODEL_CATALOG_FIELD).is_none());
+        assert_eq!(
+            document.get(CODEX_MODEL_FIELD).and_then(Item::as_str),
+            Some("home-model")
+        );
+        assert_eq!(
+            document
+                .get("model_reasoning_effort")
+                .and_then(Item::as_str),
+            Some("low")
+        );
+        assert_eq!(
+            document.get("profile_extension").and_then(Item::as_str),
+            Some("keep")
+        );
+        Ok(())
+    }
+
+    /// 无目录直连投影不得删除用户管理的模型目录指针。
+    #[test]
+    fn authoritative_direct_provider_preserves_user_managed_catalog_pointer() -> Result<(), AppError>
+    {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            "model = \"old-model\"\nmodel_catalog_json = \"/Users/me/custom-models.json\"\nprofile_extension = \"keep\"\n",
+        )
+        .expect("写入用户目录指针");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_authoritative_direct_provider_plan(
+            home.path(),
+            &provider_without_catalog("without-catalog"),
+        )?;
+        service.apply_direct_provider_plan(&plan)?;
+
+        let config = fs::read_to_string(config_path).expect("读取直连配置");
+        let document = config.parse::<DocumentMut>().expect("解析直连配置");
+        assert_eq!(
+            document
+                .get(CODEX_MODEL_CATALOG_FIELD)
+                .and_then(Item::as_str),
+            Some("/Users/me/custom-models.json")
+        );
+        assert_eq!(
+            document.get(CODEX_MODEL_FIELD).and_then(Item::as_str),
+            Some("gpt-official")
+        );
+        assert_eq!(
+            document.get("profile_extension").and_then(Item::as_str),
+            Some("keep")
+        );
+        Ok(())
+    }
+
     /// 直连模型目录必须写入目标 Profile Home，不得写入其他 Home。
     #[test]
     fn direct_provider_model_catalog_is_scoped_to_profile_home() -> Result<(), AppError> {
@@ -3579,7 +3712,8 @@ model_reasoning_extension = "keep-nested-extension"
         });
         let service = CodexHomeConfigService::system();
 
-        let plan = service.build_direct_provider_plan(target_home.path(), &provider)?;
+        let plan =
+            service.build_authoritative_direct_provider_plan(target_home.path(), &provider)?;
         service.apply_direct_provider_plan(&plan)?;
 
         let catalog_path = target_home
@@ -3593,6 +3727,60 @@ model_reasoning_extension = "keep-nested-extension"
         let config = fs::read_to_string(codex_config_path_for_home(target_home.path()))
             .expect("读取目标 Home 配置");
         assert!(config.contains("model_catalog_json = \"cc-switch-model-catalog.json\""));
+        Ok(())
+    }
+
+    /// 直连计划构建后的外部 Home 修改必须阻止旧计划，并补偿已写入的目录文件。
+    #[test]
+    fn direct_provider_plan_rejects_external_config_change_and_restores_catalog(
+    ) -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let catalog_path = home.path().join(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        fs::write(&config_path, "profile_extension = \"before\"\n").expect("写入原始直连配置");
+        let service = CodexHomeConfigService::system();
+        let plan = service.build_authoritative_direct_provider_plan(
+            home.path(),
+            &provider_with_catalog("shared", "new-model"),
+        )?;
+        fs::write(&config_path, "profile_extension = \"external\"\n").expect("模拟外部修改");
+
+        let error = service
+            .apply_direct_provider_plan(&plan)
+            .expect_err("外部修改必须拒绝覆盖");
+
+        assert!(matches!(error, AppError::CodexLiveConfigConflict { .. }));
+        assert_eq!(
+            fs::read_to_string(config_path).expect("重读外部配置"),
+            "profile_extension = \"external\"\n"
+        );
+        assert!(!catalog_path.exists());
+        Ok(())
+    }
+
+    /// 直连计划恢复必须回到目录投影前的同一份 Home 原始快照。
+    #[test]
+    fn direct_provider_plan_restores_original_home_snapshot() -> Result<(), AppError> {
+        let home = tempfile::tempdir().expect("创建临时 Home");
+        let config_path = codex_config_path_for_home(home.path());
+        let original = "model = \"old-model\"\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\nprofile_extension = \"keep\"\n";
+        fs::write(&config_path, original).expect("写入原始直连配置");
+        let service = CodexHomeConfigService::system();
+
+        let plan = service.build_authoritative_direct_provider_plan(
+            home.path(),
+            &provider_without_catalog("without-catalog"),
+        )?;
+        service.apply_direct_provider_plan(&plan)?;
+        let applied = fs::read_to_string(&config_path).expect("读取投影后配置");
+        assert!(!applied.contains(CODEX_MODEL_CATALOG_FIELD));
+
+        service.restore_direct_provider_plan(&plan)?;
+
+        assert_eq!(
+            fs::read_to_string(config_path).expect("读取恢复后配置"),
+            original
+        );
         Ok(())
     }
 

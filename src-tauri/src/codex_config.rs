@@ -1261,7 +1261,7 @@ fn codex_model_catalog_from_settings(
     )))
 }
 
-fn set_codex_model_catalog_json_field(
+pub(crate) fn set_codex_model_catalog_json_field(
     config_text: &str,
     catalog_path: Option<&Path>,
 ) -> Result<String, AppError> {
