@@ -14,12 +14,12 @@ Status: resolved
 
 ## Acceptance Criteria
 
-- [ ] 诊断阶段的关闭态官方切换 regression test 在生产修复前稳定失败，修复后通过，且仍同时证明主供应商引用已更新、最终配置已清理指针。
-- [ ] 非 official 的无目录供应商遵循相同清理行为，不依赖 category 分支。
-- [ ] direct plan 对带有效目录的供应商仍在目标 Profile Home 写入相对指针和目录文件，不污染其他 Home。
-- [ ] 无目录供应商只清理 cc-switch 自有指针；用户自定义目录指针、Profile 自有扩展和旧目录文件保持不变。
-- [ ] authoritative 与 automatic direct plan 都从同一原始 Home 快照组合目录投影和 provider 投影，最终配置只对应一个 target。
-- [ ] 计划构造后的外部 Home 编辑会触发现有冲突保护，不被陈旧计划覆盖；辅助文件不留下不安全的部分写入。
+- [x] 诊断阶段的关闭态官方切换 regression test 在生产修复前稳定失败，修复后通过，且仍同时证明主供应商引用已更新、最终配置已清理指针。
+- [x] 非 official 的无目录供应商遵循相同清理行为，不依赖 category 分支。
+- [x] direct plan 对带有效目录的供应商仍在目标 Profile Home 写入相对指针和目录文件，不污染其他 Home。
+- [x] 无目录供应商只清理 cc-switch 自有指针；用户自定义目录指针、Profile 自有扩展和旧目录文件保持不变。
+- [x] authoritative 与 automatic direct plan 都从同一原始 Home 快照组合目录投影和 provider 投影，最终配置只对应一个 target。
+- [x] 计划构造后的外部 Home 编辑会触发现有冲突保护，不被陈旧计划覆盖；辅助文件不留下不安全的部分写入。
 
 ## 验证方式
 
