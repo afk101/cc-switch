@@ -218,6 +218,19 @@
 
 - Review Base Commit: `d6e13d43b64a16930dfaed9cda4890dd05b192e2`
 
+## Issue 02 执行审计
+
+- Blocker 01 已由提交 `01153d8f0a255a9283b211221983be15ea1a8d2b` 完成；该提交把目录 ownership 投影并入 authoritative/automatic 共享 direct plan。当前 HEAD 是其后续文档提交，findings 中只存在一个 Review Base，且 `d6e13d43b64a16930dfaed9cda4890dd05b192e2` 是当前 HEAD 的祖先。
+- TS-03 的公开 seam 是 `CodexRouteManager::sync_managed_profiles_explicit`；关闭态 Managed 分支经 `sync_disabled_profile_explicit` 直接消费 `build_authoritative_direct_provider_plan`，因此无需新增目录清理生产分支。
+- TS-04 的公开 seam 是 `CodexRouteManager::update_shared_provider`；其关闭态 Managed 主引用同样消费 `build_authoritative_direct_provider_plan`，External 主引用被跳过，纯故障转移引用不产生 Home plan。
+- Import、数据库 Restore、S3 Restore 与 WebDAV Restore 都调用 `commands::sync_support::run_post_import_sync`；该函数最后调用同一个 `sync_managed_profiles_explicit`。因此这些入口以明确调用关系复用 TS-03，不应复制目录清理逻辑或新增平行测试 seam。
+- Issue 02 的保留测试将从两个 public Route Manager seam 观察最终 Home、结构化同步结果和供应商保存结果；既有 best-effort warning、External、故障转移、批量写失败、数据库提交失败和敏感信息脱敏测试继续作为回归证据。
+- Issue 02 首次组合回归编译在数据库失败注入闭包处停止：`fs::read_to_string` 的 `std::io::Error` 不能通过 `?` 自动转换为 `AppError`，测试数为 0。下一步改为在该测试系统边界显式映射为不含配置正文的 `AppError::Config`，不会重复未经修正的命令。
+- Issue 02 的显式 Sync 新测试在 Review Base 负控上实际运行 1 项并因旧 `model_catalog_json` 残留失败；当前共享修复上实际运行 1 项并通过，同时证明有效模型族更新、Profile 扩展保留且 warning 为空。
+- Issue 02 的共享供应商保存新测试在 Review Base 负控上实际运行 1 项并因 Managed 主 Home 的旧指针残留失败；当前共享修复上实际运行 1 项并通过，同时证明两个 Managed 主引用均收敛、External Home 与纯故障转移引用 Home 完全不变。
+- 编译失败已通过显式映射测试文件读取错误修复；随后显式 Sync 测试组 4 项通过，共享供应商保存测试组 16 项通过，Import/Restore 统一结果测试 2 项通过，Route Manager 全部 146 项通过。
+- 供应商保存补偿 fixture 已改为“旧供应商有目录、待保存供应商无目录”：批量第二个 Home 写失败会恢复第一个 Home，数据库提交失败测试在 commit 闭包内确认指针已经清理后再注入失败，并验证所有 Home、目录文件、供应商记录和 runtime snapshot 恢复且错误不泄露 token。
+
 ---
 
 *每完成两次重要查看、搜索、实验或浏览后更新本文件。*

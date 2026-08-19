@@ -5996,6 +5996,61 @@ mod codex_route_manager {
         Ok(())
     }
 
+    /// 显式同步无目录主供应商时必须清理自有目录指针并保留 Profile 扩展。
+    #[tokio::test]
+    async fn explicit_sync_clears_disabled_managed_catalog_pointer_and_preserves_extensions(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let home = tempfile::tempdir().expect("创建无目录显式同步 Home");
+        let mut provider = provider_with_route_catalog("provider-sync-without-catalog", "unused");
+        provider
+            .settings_config
+            .as_object_mut()
+            .expect("供应商设置必须是对象")
+            .remove("modelCatalog");
+        provider.settings_config["config"] = json!(
+            "model = \"provider-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://sync.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            home.path(),
+            "profile-sync-without-catalog",
+            16_104,
+            &provider,
+        )?;
+        let config_path = codex_config_path_for_home(home.path());
+        fs::write(
+            &config_path,
+            format!(
+                "model = \"temporary-model\"\nmodel_catalog_json = \"{}\"\nprofile_extension = \"keep\"\n",
+                crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME
+            ),
+        )
+        .expect("写入无目录显式同步前配置");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        let result = manager.sync_managed_profiles_explicit(db.as_ref()).await?;
+
+        let config = fs::read_to_string(config_path).expect("读取无目录显式同步配置");
+        assert!(config.contains("model = \"provider-model\""));
+        assert!(config.contains("profile_extension = \"keep\""));
+        assert!(!config.contains("model_catalog_json"));
+        assert_eq!(result.synchronized_count, 1);
+        assert!(result.warnings.is_empty());
+        Ok(())
+    }
+
     /// 单个 Home 失败不得阻止后续 Profile，结构化 warning 必须在错误源附近脱敏。
     #[tokio::test]
     async fn explicit_sync_continues_after_profile_failure_and_returns_sanitized_warning(
@@ -6177,6 +6232,11 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
         );
+        new_provider
+            .settings_config
+            .as_object_mut()
+            .expect("供应商设置必须是对象")
+            .remove("modelCatalog");
         db.save_provider(AppType::Codex.as_str(), &old_provider)?;
         for (profile_id, home, port) in [
             ("profile-a", home_a.path(), 16_001),
@@ -6407,6 +6467,122 @@ mod codex_route_manager {
             .settings_config
             .to_string()
             .contains("new.example.com"));
+        Ok(())
+    }
+
+    /// 共享供应商删除目录时只收敛全部关闭态 Managed 主引用 Home。
+    #[tokio::test]
+    async fn shared_provider_save_without_catalog_clears_all_disabled_managed_primary_homes_only(
+    ) -> Result<(), AppError> {
+        let db = Arc::new(Database::memory()?);
+        let state = AppState::new(db.clone());
+        let managed_home_a = tempfile::tempdir().expect("创建托管主引用 Home A");
+        let managed_home_b = tempfile::tempdir().expect("创建托管主引用 Home B");
+        let external_home = tempfile::tempdir().expect("创建外部主引用 Home");
+        let failover_home = tempfile::tempdir().expect("创建故障转移引用 Home");
+        let home_config = Arc::new(CodexHomeConfigService::system());
+        let old_shared = provider_with_route_catalog("provider-shared", "old-shared-model");
+        let other_primary = provider_with_route_catalog("provider-other", "other-model");
+        let mut new_shared = provider_with_route_catalog("provider-shared", "unused");
+        new_shared
+            .settings_config
+            .as_object_mut()
+            .expect("供应商设置必须是对象")
+            .remove("modelCatalog");
+        new_shared.settings_config["config"] = json!(
+            "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://without-catalog.example.com/v1\"\nwire_api = \"responses\"\n"
+        );
+        for provider in [&old_shared, &other_primary] {
+            db.save_provider(AppType::Codex.as_str(), provider)?;
+        }
+        for (profile_id, home, port) in [
+            ("profile-managed-a", managed_home_a.path(), 16_201),
+            ("profile-managed-b", managed_home_b.path(), 16_202),
+        ] {
+            prepare_disabled_profile(
+                db.as_ref(),
+                home_config.as_ref(),
+                home,
+                profile_id,
+                port,
+                &old_shared,
+            )?;
+        }
+        prepare_disabled_profile(
+            db.as_ref(),
+            home_config.as_ref(),
+            failover_home.path(),
+            "profile-failover-only",
+            16_203,
+            &other_primary,
+        )?;
+        db.replace_codex_profile_failovers(
+            "profile-failover-only",
+            std::slice::from_ref(&old_shared.id),
+        )?;
+        db.insert_codex_profile(&CodexProfile {
+            id: "profile-external-primary".to_string(),
+            name: "Profile External Primary".to_string(),
+            canonical_home_path: external_home.path().display().to_string(),
+            listen_port: 16_204,
+            created_at: 1,
+            updated_at: 1,
+        })?;
+        db.save_codex_profile_route(&CodexProfileRoute {
+            profile_id: "profile-external-primary".to_string(),
+            current_provider_id: Some(old_shared.id.clone()),
+            enabled: false,
+            home_ownership: CodexHomeOwnership::External,
+            live_backup_json: None,
+            last_error: None,
+            recovery_json: None,
+            updated_at: 1,
+        })?;
+        let external_config_path = codex_config_path_for_home(external_home.path());
+        let external_config = b"external catalog config that need not parse as TOML\n";
+        fs::write(&external_config_path, external_config).expect("写入外部主引用配置");
+        let failover_config_path = codex_config_path_for_home(failover_home.path());
+        let failover_catalog_path = failover_home
+            .path()
+            .join(crate::codex_config::CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME);
+        let failover_config_before = fs::read(&failover_config_path).expect("读取故障转移原配置");
+        let failover_catalog_before = fs::read(&failover_catalog_path).expect("读取故障转移原目录");
+        let manager = CodexRouteManager::new(
+            db.clone(),
+            home_config,
+            Arc::new(TrackingTokenStore {
+                ensured: AtomicUsize::new(0),
+                deleted: AtomicUsize::new(0),
+            }),
+            Arc::new(FakeFactory),
+        );
+
+        manager
+            .update_shared_provider(&state, new_shared, Some("provider-shared"))
+            .await?;
+
+        for home in [managed_home_a.path(), managed_home_b.path()] {
+            let config =
+                fs::read_to_string(codex_config_path_for_home(home)).expect("读取托管主引用配置");
+            assert!(!config.contains("model_catalog_json"));
+            assert!(config.contains("https://without-catalog.example.com/v1"));
+        }
+        assert_eq!(
+            fs::read(&external_config_path).expect("读取外部主引用配置"),
+            external_config
+        );
+        assert_eq!(
+            fs::read(&failover_config_path).expect("读取故障转移引用配置"),
+            failover_config_before
+        );
+        assert_eq!(
+            fs::read(&failover_catalog_path).expect("读取故障转移引用目录"),
+            failover_catalog_before
+        );
+        let stored = db
+            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .expect("无目录共享供应商已提交");
+        assert!(stored.settings_config.get("modelCatalog").is_none());
         Ok(())
     }
 
@@ -6730,6 +6906,11 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-new-token\"\n"
         );
+        new_provider
+            .settings_config
+            .as_object_mut()
+            .expect("供应商设置必须是对象")
+            .remove("modelCatalog");
         for provider in [&old_provider, &primary_other] {
             db.save_provider(AppType::Codex.as_str(), provider)?;
         }
@@ -6819,6 +7000,15 @@ mod codex_route_manager {
 
         let result: Result<bool, AppError> = manager
             .with_provider_home_update(db.as_ref(), &new_provider, || {
+                let projected_disabled =
+                    fs::read_to_string(&observed_paths[0]).map_err(|error| {
+                        AppError::Config(format!("读取数据库提交前关闭态配置失败: {error}"))
+                    })?;
+                if projected_disabled.contains("model_catalog_json") {
+                    return Err(AppError::Message(
+                        "数据库提交前关闭态主引用仍含模型目录指针".to_string(),
+                    ));
+                }
                 db.save_provider(AppType::Codex.as_str(), &new_for_commit)?;
                 Err(AppError::Database("模拟数据库提交失败".to_string()))
             })

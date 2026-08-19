@@ -1,6 +1,6 @@
 # 02 — 覆盖明确同步与供应商保存的目录收敛
 
-Status: ready-for-agent
+Status: resolved
 
 **构建内容：** 当关闭态 Managed Profile 的当前主供应商不再提供模型目录时，手动 Sync、数据库导入或云恢复使用的后置同步，以及共享供应商保存，都会清理旧的 cc-switch 目录指针，并继续遵守各自既有的 best-effort 或整体补偿语义。
 
@@ -14,12 +14,12 @@ Status: ready-for-agent
 
 ## Acceptance Criteria
 
-- [ ] 明确 Profile Sync 对无目录主供应商清理关闭态 Managed Home 的 cc-switch 指针，并保留 Profile 自有扩展和既有 best-effort warning 语义。
-- [ ] Import/Restore 继续复用同一明确同步 seam，不新增独立目录清理分支。
-- [ ] 共享供应商保存从有目录变为无目录时，所有关闭态 Managed 主引用 Home 在保存成功前解除 cc-switch 指针。
-- [ ] 共享供应商保存仍跳过 External Home，故障转移引用仍不决定 Home 模型目录。
-- [ ] 批量 Home 写入或供应商数据库提交失败时，已经变化的 Home 按现有全量补偿语义恢复，错误信息不泄露敏感配置正文。
-- [ ] 目标供应商仍有有效目录时，明确同步和供应商保存继续更新正确目标 Home 的目录内容。
+- [x] 明确 Profile Sync 对无目录主供应商清理关闭态 Managed Home 的 cc-switch 指针，并保留 Profile 自有扩展和既有 best-effort warning 语义。
+- [x] Import/Restore 继续复用同一明确同步 seam，不新增独立目录清理分支。
+- [x] 共享供应商保存从有目录变为无目录时，所有关闭态 Managed 主引用 Home 在保存成功前解除 cc-switch 指针。
+- [x] 共享供应商保存仍跳过 External Home，故障转移引用仍不决定 Home 模型目录。
+- [x] 批量 Home 写入或供应商数据库提交失败时，已经变化的 Home 按现有全量补偿语义恢复，错误信息不泄露敏感配置正文。
+- [x] 目标供应商仍有有效目录时，明确同步和供应商保存继续更新正确目标 Home 的目录内容。
 
 ## 验证方式
 
@@ -44,3 +44,9 @@ Status: ready-for-agent
 ## Comments
 
 - 数据库导入与云恢复通过现有后置明确同步入口获得覆盖；若 code audit 发现它们绕过该 seam，必须停止并更新 findings，而不是自行扩展架构。
+- Blocker 01 已由提交 `01153d8f0a255a9283b211221983be15ea1a8d2b` 完成；Issue 02 没有新增生产分支，只验证其共享 direct-plan contract 在高层 lifecycle 中生效。
+- 显式 Sync red 负控：把新增 public-seam 测试应用到 Review Base 后，`explicit_sync_clears_disabled_managed_catalog_pointer_and_preserves_extensions` 因残留 `model_catalog_json` 失败；当前实现同一测试通过。
+- 共享供应商保存 red 负控：把新增 public-seam 测试应用到 Review Base 后，`shared_provider_save_without_catalog_clears_all_disabled_managed_primary_homes_only` 因两个 Managed 主 Home 仍残留指针而失败；当前实现同一测试通过。
+- Import、数据库 Restore、S3 Restore 和 WebDAV Restore 的静态调用链均为 `run_post_import_sync` → `sync_managed_profiles_explicit`，未发现绕过 TS-03 的平行目录清理路径。
+- 高层边界覆盖：显式 Sync 4 项通过；共享供应商保存 16 项通过，包含有目录更新、External 跳过、纯故障转移 Home 不变、批量写失败补偿、数据库提交失败全量恢复、并发拒绝与敏感信息脱敏。
+- Route Manager 全部 146 项测试通过；`commands::sync_support::tests` 2 项通过；`cargo fmt --all --check` 与 `git diff --check` 通过。
