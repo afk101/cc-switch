@@ -54,7 +54,10 @@ use crate::codex_profile::{
 use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::services::provider::{build_effective_settings_with_common_config, ProviderService};
+use crate::services::provider::{
+    build_effective_provider_for_live_with_codex_oauth_manager,
+    build_effective_settings_with_common_config, ProviderService,
+};
 use crate::services::McpService;
 use crate::store::AppState;
 use chrono::Utc;
@@ -827,11 +830,11 @@ impl CodexRouteManager {
     ) -> Result<bool, AppError> {
         let prepared_provider =
             ProviderService::prepare_codex_provider_update(state, original_id, provider)?;
-        let mut effective_provider = prepared_provider.clone();
-        effective_provider.settings_config = build_effective_settings_with_common_config(
+        let effective_provider = build_effective_provider_for_live_with_codex_oauth_manager(
             state.db.as_ref(),
             &AppType::Codex,
             &prepared_provider,
+            &state.codex_oauth_manager,
         )?;
         self.with_provider_home_update(state.db.as_ref(), &effective_provider, || {
             ProviderService::commit_prepared_codex_provider_update(state, &prepared_provider)

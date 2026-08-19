@@ -76,6 +76,7 @@ const createDefaultProviders = (): ProvidersByApp => ({
   opencode: {},
   openclaw: {},
   hermes: {},
+  pi: {},
 });
 
 const createDefaultCurrent = (): CurrentProviderState => ({
@@ -87,6 +88,7 @@ const createDefaultCurrent = (): CurrentProviderState => ({
   opencode: "",
   openclaw: "",
   hermes: "",
+  pi: "",
 });
 
 /** 创建 App 集成测试使用的默认 Codex Profile 状态。 */
@@ -231,6 +233,7 @@ let mcpConfigs: McpConfigState = {
   opencode: {},
   openclaw: {},
   hermes: {},
+  pi: {},
 };
 
 const cloneProviders = (value: ProvidersByApp) =>
@@ -302,6 +305,7 @@ export const resetProviderState = () => {
     opencode: {},
     openclaw: {},
     hermes: {},
+    pi: {},
   };
 };
 

@@ -1,10 +1,11 @@
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+use cc_switch_lib::codex_profile::{CodexProfile, DEFAULT_CODEX_PROFILE_ID};
 use cc_switch_lib::{
     get_codex_auth_path, get_codex_config_path, import_default_config_test_hook, read_json_file,
-    switch_provider_test_hook, write_codex_live_atomic, AppError, AppType, McpApps, McpServer,
-    MultiAppConfig, Provider, ProviderService,
+    switch_codex_profile_provider_test_hook, switch_provider_test_hook, write_codex_live_atomic,
+    AppError, AppState, AppType, McpApps, McpServer, MultiAppConfig, Provider, ProviderService,
 };
 
 #[path = "support.rs"]
@@ -33,6 +34,16 @@ api_backend = "responses"
 context_window = 500000
 "#
     )
+}
+
+/// 为集成测试创建绑定到隔离 `CODEX_HOME` 的默认 Profile 与空路由。
+fn create_default_codex_profile(state: &AppState, home: &Path) -> CodexProfile {
+    let profile = CodexProfile::default_profile(home.join(".codex").display().to_string(), 1);
+    state
+        .db
+        .create_codex_profile_with_empty_route(&profile)
+        .expect("create default Codex Profile");
+    profile
 }
 
 #[test]
@@ -310,12 +321,12 @@ fn codex_startup_import_skips_when_only_official_seed_exists() {
     );
 }
 
-#[test]
-fn switch_provider_updates_codex_live_and_state() {
+#[tokio::test]
+async fn switch_provider_updates_codex_live_and_state() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     enable_codex_official_auth_preservation();
-    let _home = ensure_test_home();
+    let home = ensure_test_home();
 
     let legacy_auth = json!({"OPENAI_API_KEY": "legacy-key"});
     let legacy_config = r#"[mcp_servers.legacy]
@@ -387,8 +398,10 @@ command = "say"
     );
 
     let app_state = create_test_state_with_config(&config).expect("create test state");
+    let profile = create_default_codex_profile(&app_state, home);
 
-    switch_provider_test_hook(&app_state, AppType::Codex, "new-provider")
+    switch_codex_profile_provider_test_hook(&app_state, &profile.id, "new-provider", None)
+        .await
         .expect("switch provider should succeed");
 
     let auth_value: serde_json::Value =
@@ -404,8 +417,8 @@ command = "say"
 
     let config_text = std::fs::read_to_string(get_codex_config_path()).expect("read config.toml");
     assert!(
-        config_text.contains("mcp_servers.echo-server"),
-        "config.toml should contain synced MCP servers"
+        !config_text.contains("mcp_servers.echo-server"),
+        "Profile provider switching must leave MCP projection to its explicit sync flow"
     );
     assert!(
         config_text.contains("experimental_bearer_token"),
@@ -418,9 +431,15 @@ command = "say"
         .expect("get current provider");
     assert_eq!(
         current_id.as_deref(),
-        Some("new-provider"),
-        "current provider updated"
+        Some("old-provider"),
+        "Profile 切换不应改写旧单例 current provider"
     );
+    let route = app_state
+        .db
+        .get_codex_profile_route(DEFAULT_CODEX_PROFILE_ID)
+        .expect("get default Profile route")
+        .expect("default Profile route exists");
+    assert_eq!(route.current_provider_id.as_deref(), Some("new-provider"));
 
     let providers = app_state
         .db
@@ -433,8 +452,9 @@ command = "say"
         .get("config")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    // 供应商配置应该包含在 live 文件中
-    // 注意：live 文件还会包含 MCP 同步后的内容
+    // 旧单例链路中，供应商配置应该包含在 live 文件中。
+    // 注意：旧单例 live 文件还会包含 MCP 同步后的内容。
+    // Profile 链路只负责供应商投影，MCP 必须由独立显式同步动作写入。
     assert!(
         config_text.contains("mcp_servers.latest"),
         "live file should contain provider's original config"
@@ -453,11 +473,12 @@ command = "say"
         .and_then(|v| v.get("OPENAI_API_KEY"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // 回填机制：切换前会将 live 配置回填到当前供应商
-    // 这保护了用户在 live 文件中的手动修改
+    // 旧单例回填机制：切换前会将 live 配置回填到当前供应商。
+    // 这保护了用户在 live 文件中的手动修改。
+    // Profile 架构改由各自 Home 与路由关系保存状态，不能再污染全局旧供应商快照。
     assert_eq!(
-        legacy_auth_value, "legacy-key",
-        "previous provider should be backfilled with live auth"
+        legacy_auth_value, "stale",
+        "Profile switch should not backfill the legacy global provider"
     );
 }
 
@@ -616,11 +637,11 @@ fn switch_provider_updates_claude_live_and_state() {
     );
 }
 
-#[test]
-fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
+#[tokio::test]
+async fn switch_provider_codex_invalid_config_returns_error_and_keeps_state() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
-    let _home = ensure_test_home();
+    let home = ensure_test_home();
 
     let mut config = MultiAppConfig::default();
     {
@@ -633,7 +654,7 @@ fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
                 "invalid".to_string(),
                 "Broken Codex".to_string(),
                 json!({
-                    "config": "[mcp_servers.test]\ncommand = \"noop\""
+                    "config": "[mcp_servers.test]\ncommand = ["
                 }),
                 None,
             ),
@@ -641,13 +662,15 @@ fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
     }
 
     let app_state = create_test_state_with_config(&config).expect("create test state");
+    let profile = create_default_codex_profile(&app_state, home);
 
-    let err = switch_provider_test_hook(&app_state, AppType::Codex, "invalid")
-        .expect_err("switching should fail when auth missing");
+    let err = switch_codex_profile_provider_test_hook(&app_state, &profile.id, "invalid", None)
+        .await
+        .expect_err("switching should fail when provider config is invalid");
     match err {
-        AppError::Config(msg) => assert!(
-            msg.contains("auth"),
-            "expected auth missing error message, got {msg}"
+        AppError::Config(msg) | AppError::Message(msg) => assert!(
+            msg.contains("TOML") || msg.contains("toml") || msg.contains("配置"),
+            "expected invalid config error message, got {msg}"
         ),
         other => panic!("expected config error, got {other:?}"),
     }
@@ -656,13 +679,20 @@ fn switch_provider_codex_missing_auth_returns_error_and_keeps_state() {
         .db
         .get_current_provider(AppType::Codex.as_str())
         .expect("get current provider");
-    // 切换失败后，由于数据库操作是先设置再验证，current 可能已被设为 "invalid"
-    // 但由于 live 配置写入失败，状态应该回滚
-    // 注意：这个行为取决于 switch_provider 的具体实现
+    // 旧单例切换失败后，由于数据库操作是先设置再验证，current 可能已被设为 "invalid"。
+    // 但由于 live 配置写入失败，状态应该回滚。
+    // 注意：这个行为取决于 switch_provider 的具体实现。
+    // Profile 路由在预检失败时必须保持空引用，不再允许上述中间状态泄漏。
     assert!(
-        current_id.is_none() || current_id.as_deref() == Some("invalid"),
-        "current provider should remain empty or be the attempted id on failure, got: {current_id:?}"
+        current_id.is_none(),
+        "legacy current provider should remain empty on Profile failure, got: {current_id:?}"
     );
+    let route = app_state
+        .db
+        .get_codex_profile_route(DEFAULT_CODEX_PROFILE_ID)
+        .expect("get default Profile route")
+        .expect("default Profile route exists");
+    assert!(route.current_provider_id.is_none());
 }
 
 #[test]

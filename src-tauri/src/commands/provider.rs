@@ -51,28 +51,51 @@ pub fn get_current_provider(state: State<'_, AppState>, app: String) -> Result<S
 }
 
 #[tauri::command]
-pub fn add_provider(
-    state: State<'_, AppState>,
+pub async fn add_provider(
+    app_handle: tauri::AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] addToLive: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    ProviderService::add(state.inner(), app_type, provider, addToLive.unwrap_or(true))
-        .map_err(|e| e.to_string())
+    let add_to_live = addToLive.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProviderService::add(state.inner(), app_type, provider, add_to_live)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商添加任务执行失败: {e}"))?
 }
 
 #[tauri::command]
 pub async fn update_provider(
-    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     app: String,
     provider: Provider,
     #[allow(non_snake_case)] originalId: Option<String>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
-    update_provider_for_app(state.inner(), app_type, provider, originalId.as_deref())
-        .await
-        .map_err(|error| error.to_string())
+    if app_type == AppType::Codex {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        return update_provider_for_app(state.inner(), app_type, provider, originalId.as_deref())
+            .await
+            .map_err(|error| error.to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app_handle
+            .try_state::<AppState>()
+            .ok_or_else(|| "应用状态不可用".to_string())?;
+        ProviderService::update(state.inner(), app_type, originalId.as_deref(), provider)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("供应商更新任务执行失败: {e}"))?
 }
 
 /// 按应用类型执行供应商更新，Codex 更新委托给 Profile 路由模块统一编排。

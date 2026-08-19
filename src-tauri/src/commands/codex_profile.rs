@@ -209,6 +209,50 @@ pub async fn enable_codex_profile_route(
     result.map(|_| true).map_err(|error| error.to_string())
 }
 
+/// 为指定 Profile 构造有效供应商快照并执行切换。
+async fn switch_codex_profile_provider_internal(
+    state: &AppState,
+    profile_id: &str,
+    provider_id: &str,
+    failover_ids: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    let mut provider = state
+        .db
+        .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+        .ok_or_else(|| AppError::InvalidInput("Codex 供应商不存在".to_string()))?;
+    provider.settings_config =
+        crate::services::provider::build_effective_settings_with_common_config(
+            state.db.as_ref(),
+            &AppType::Codex,
+            &provider,
+        )?;
+    match failover_ids {
+        Some(failover_ids) => {
+            state
+                .codex_route_manager
+                .switch_provider_with_effective_settings(profile_id, provider, failover_ids)
+                .await
+        }
+        None => {
+            state
+                .codex_route_manager
+                .switch_provider_with_effective_settings_preserving_failovers(profile_id, provider)
+                .await
+        }
+    }
+}
+
+/// 测试用入口：覆盖与生产命令相同的 Profile 供应商切换链路。
+#[cfg_attr(not(feature = "test-hooks"), doc(hidden))]
+pub async fn switch_codex_profile_provider_test_hook(
+    state: &AppState,
+    profile_id: &str,
+    provider_id: &str,
+    failover_ids: Option<Vec<String>>,
+) -> Result<(), AppError> {
+    switch_codex_profile_provider_internal(state, profile_id, provider_id, failover_ids).await
+}
+
 /// 为指定运行中 Profile 切换供应商快照。
 #[tauri::command]
 pub async fn switch_codex_profile_provider(
@@ -217,33 +261,10 @@ pub async fn switch_codex_profile_provider(
     #[allow(non_snake_case)] providerId: String,
     #[allow(non_snake_case)] failoverIds: Option<Vec<String>>,
 ) -> Result<bool, String> {
-    let mut provider = state
-        .db
-        .get_provider_by_id(&providerId, AppType::Codex.as_str())
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "Codex 供应商不存在".to_string())?;
-    provider.settings_config =
-        crate::services::provider::build_effective_settings_with_common_config(
-            state.db.as_ref(),
-            &AppType::Codex,
-            &provider,
-        )
-        .map_err(|error| error.to_string())?;
-    let result = match failoverIds {
-        Some(failover_ids) => {
-            state
-                .codex_route_manager
-                .switch_provider_with_effective_settings(&profileId, provider, failover_ids)
-                .await
-        }
-        None => {
-            state
-                .codex_route_manager
-                .switch_provider_with_effective_settings_preserving_failovers(&profileId, provider)
-                .await
-        }
-    };
-    result.map(|_| true).map_err(|error| error.to_string())
+    switch_codex_profile_provider_internal(&state, &profileId, &providerId, failoverIds)
+        .await
+        .map(|_| true)
+        .map_err(|error| error.to_string())
 }
 
 /// 关闭指定 Profile 路由并恢复其 Home 配置。

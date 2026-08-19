@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::error::AppError;
-use crate::services::provider::ProviderService;
+use crate::services::{model_pricing, PromptService, ProviderService};
 use crate::settings;
 use crate::store::AppState;
 
@@ -13,27 +13,59 @@ pub(crate) struct PostOperationSyncResult {
     pub warning: Option<String>,
 }
 
+/// 在阻塞线程中同步依赖文件系统和数据库的派生状态。
+fn run_blocking_post_import_sync(app_state: &AppState) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    if let Err(error) = ProviderService::sync_current_to_live(app_state) {
+        failures.push(format!("live configuration: {error}"));
+    }
+    if let Err(error) = PromptService::sync_all_to_live(app_state) {
+        failures.push(format!("prompts: {error}"));
+    }
+    if let Err(error) = model_pricing::sync_local_model_pricing(&app_state.db) {
+        failures.push(format!("model pricing: {error}"));
+    }
+    failures
+}
+
 /// 执行手动 Sync、Import 与云恢复共用的后置同步合同。
 pub(crate) async fn run_post_import_sync(state: &AppState) -> PostOperationSyncResult {
-    let db = state.db.clone();
-    let live_sync = tauri::async_runtime::spawn_blocking(move || {
-        let app_state = AppState::new(db);
-        ProviderService::sync_current_to_live(&app_state)
+    let blocking_state = state.clone();
+    let mut failures = match tauri::async_runtime::spawn_blocking(move || {
+        run_blocking_post_import_sync(&blocking_state)
     })
-    .await;
+    .await
+    {
+        Ok(failures) => failures,
+        Err(error) => vec![format!("blocking synchronization task: {error}")],
+    };
+
     // Profile 投影最后执行，确保旧 global Live 同步不会覆盖默认 Profile 自己的主供应商。
     let profile_sync = state
         .codex_route_manager
         .sync_managed_profiles_explicit(state.db.as_ref())
         .await
         .ok();
-    let settings_sync = settings::reload_settings();
-    let warning =
-        if profile_sync.is_none() || !matches!(live_sync, Ok(Ok(()))) || settings_sync.is_err() {
-            Some(post_sync_warning())
-        } else {
-            None
-        };
+    if profile_sync.is_none() {
+        failures.push("Codex Profile projection".to_string());
+    }
+    if let Err(error) = settings::reload_settings() {
+        failures.push(format!("settings cache: {error}"));
+    }
+    match state.db.get_log_config() {
+        Ok(log_config) => log::set_max_level(log_config.to_level_filter()),
+        Err(error) => {
+            log::set_max_level(log::LevelFilter::Info);
+            failures.push(format!("runtime log level: {error}"));
+        }
+    }
+    state.usage_cache.invalidate_all();
+
+    if !failures.is_empty() {
+        log::warn!("后置同步未完全完成: {}", failures.join("; "));
+    }
+    let warning = (!failures.is_empty()).then(post_sync_warning);
     PostOperationSyncResult {
         profile_sync,
         warning,
