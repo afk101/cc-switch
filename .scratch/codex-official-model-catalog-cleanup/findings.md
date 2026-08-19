@@ -251,6 +251,7 @@
 - 重构前护栏：`switching_disabled_profile_to_official_clears_catalog_pointer` 1 passed，`direct_provider` 过滤集 7 passed。重构后同样为 1 passed 与 7 passed，完整 `catalog` 过滤集 75 passed。
 - 静态验证：`cargo fmt --all --check` 与 `git diff --check` 通过；`cargo clippy --lib` 退出 0，仅报告 `migration.rs`、`proxy/body_dump.rs` 与 `proxy/forwarder.rs` 中共 8 个既有 warning，本次修改文件无 Clippy 报告。
 - 第一次静态命令在仓库根目录运行 `cargo fmt` 时因无 `Cargo.toml` 退出 1；未重复原命令，改为在 `src-tauri` crate 目录执行后通过。
+- 第二轮 code review 指出新增 helper 注释中的英文表达不符合仓库“新增注释必须使用中文”的标准；已替换为“遵循所有权规则的模型目录投影”，只修正注释。
 
 ---
 

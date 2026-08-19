@@ -687,7 +687,7 @@ impl CodexHomeConfigService {
         Ok((catalog_plan, route_plan))
     }
 
-    /// 从调用方提供的 Home 快照准备 ownership-aware 模型目录投影。
+    /// 从调用方提供的 Home 快照准备遵循所有权规则的模型目录投影。
     fn prepare_model_catalog_projection_from_snapshot(
         settings: &serde_json::Value,
         source_config: &str,
