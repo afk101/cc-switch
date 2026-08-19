@@ -214,6 +214,10 @@
 
 - OpenAI Codex 配置参考：`https://developers.openai.com/codex/config-reference/`（当前会重定向到 Learn ChatGPT 文档；已核对 `config.toml` 与 `model_catalog_json` 的字段语义）。
 
+## Execution Context
+
+- Review Base Commit: `d6e13d43b64a16930dfaed9cda4890dd05b192e2`
+
 ---
 
 *每完成两次重要查看、搜索、实验或浏览后更新本文件。*
