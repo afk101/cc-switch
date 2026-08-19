@@ -1,5 +1,6 @@
 use crate::codex_config::{
-    codex_config_path_for_home, CodexCatalogToolProfile, CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
+    codex_config_path_for_home, CodexCatalogToolProfile, PreparedCodexConfigWithModelCatalog,
+    CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME,
 };
 use crate::codex_profile::{
     CODEX_AUTHORITATIVE_MODEL_PROVIDER_FIELDS, CODEX_AUTHORITATIVE_TOP_LEVEL_PROVIDER_FIELDS,
@@ -686,6 +687,28 @@ impl CodexHomeConfigService {
         Ok((catalog_plan, route_plan))
     }
 
+    /// 从调用方提供的 Home 快照准备 ownership-aware 模型目录投影。
+    fn prepare_model_catalog_projection_from_snapshot(
+        settings: &serde_json::Value,
+        source_config: &str,
+        current: &CodexLiveConfigSnapshot,
+        catalog_profile: CodexCatalogToolProfile,
+    ) -> Result<PreparedCodexConfigWithModelCatalog, AppError> {
+        let home_config = current
+            .content
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
+            .unwrap_or("");
+        crate::codex_config::prepare_codex_model_catalog_projection(
+            settings,
+            source_config,
+            home_config,
+            catalog_profile,
+        )
+    }
+
     /// 使用调用方提供的原始快照构造模型目录投影，保证组合计划共享同一基线。
     fn build_model_catalog_projection_plan_from_snapshot(
         &self,
@@ -702,18 +725,11 @@ impl CodexHomeConfigService {
             .get("config")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let home_config = current
-            .content
-            .as_deref()
-            .map(std::str::from_utf8)
-            .transpose()
-            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
-            .unwrap_or("");
         let catalog_profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
-        let prepared = crate::codex_config::prepare_codex_model_catalog_projection(
+        let prepared = Self::prepare_model_catalog_projection_from_snapshot(
             &settings,
             source_config,
-            home_config,
+            &current,
             catalog_profile,
         )?;
         let config_unchanged = current.content.as_deref() == Some(prepared.config_text.as_bytes())
@@ -930,43 +946,38 @@ impl CodexHomeConfigService {
                 .as_ref()
                 .and_then(|meta| meta.api_format.as_deref()),
         );
-        let prepared = crate::codex_config::prepare_codex_config_with_model_catalog(
+        let provider_projection = crate::codex_config::prepare_codex_config_with_model_catalog(
             &settings,
             &direct_config,
             catalog_profile,
         )?;
         let current = self.inspect(home)?;
-        let current_config = current
-            .content
-            .as_deref()
-            .map(std::str::from_utf8)
-            .transpose()
-            .map_err(|error| AppError::Config(format!("Codex config.toml 不是 UTF-8: {error}")))?
-            .unwrap_or("");
-        let catalog_projected_config = crate::codex_config::set_codex_model_catalog_json_field(
-            current_config,
-            prepared
-                .model_catalog
-                .as_ref()
-                .map(|_| Path::new(CC_SWITCH_CODEX_MODEL_CATALOG_FILENAME)),
+        let catalog_projection = Self::prepare_model_catalog_projection_from_snapshot(
+            &settings,
+            &direct_config,
+            &current,
+            catalog_profile,
         )?;
         let target_config = match mode {
-            CodexDirectProviderProjectionMode::ApplyProviderModel => prepared.config_text,
+            CodexDirectProviderProjectionMode::ApplyProviderModel => {
+                provider_projection.config_text
+            }
             CodexDirectProviderProjectionMode::ApplyAuthoritativeModelFamily => {
                 merge_authoritative_direct_provider_projection(
-                    &catalog_projected_config,
-                    &prepared.config_text,
+                    &catalog_projection.config_text,
+                    &provider_projection.config_text,
                 )?
             }
             CodexDirectProviderProjectionMode::PreserveUserModel => {
                 merge_automatic_direct_provider_projection(
-                    &catalog_projected_config,
-                    &prepared.config_text,
+                    &catalog_projection.config_text,
+                    &provider_projection.config_text,
                 )?
             }
         };
         let config = self.build_route_plan_from_snapshot(home, current, &target_config)?;
-        let model_catalog = self.build_model_catalog_file_plan(home, prepared.model_catalog)?;
+        let model_catalog =
+            self.build_model_catalog_file_plan(home, catalog_projection.model_catalog)?;
         Ok(CodexDirectProviderConfigPlan {
             config,
             model_catalog,

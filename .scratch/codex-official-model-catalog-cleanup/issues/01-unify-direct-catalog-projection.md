@@ -52,3 +52,5 @@ Status: resolved
 - 回归证据：关闭态 official 与非 official 无目录切换 2 passed；direct-provider focused 测试 7 passed；Home Config Service 模块 47 passed；底层空目录 ownership 测试 2 passed。
 - 覆盖边界：authoritative/automatic 两种模式、用户自定义 pointer、Profile 扩展、旧目录文件、目标 Home 隔离、外部并发编辑与辅助文件补偿、恢复到投影前原始快照。
 - 静态验证：`cargo fmt --all --check` 与 `git diff --check` 均通过。
+- Review follow-up：Code review 指出 direct builder 重复了从 Home snapshot 解码并准备 catalog projection 的编排，还使低层 setter 扩大到 `pub(crate)`。已提取私有 `prepare_model_catalog_projection_from_snapshot` 供 catalog plan 与 direct plan 共用，并恢复 setter 私有可见性。
+- Review follow-up 验证：重构前原始 public-seam 回归 1 passed、direct-provider 7 passed；重构后同样为 1 passed 与 7 passed，`catalog` 集合 75 passed。`cargo fmt --all --check` 与 `git diff --check` 通过，`cargo clippy --lib` 通过且仅报告未修改文件中的 8 个既有 warning。

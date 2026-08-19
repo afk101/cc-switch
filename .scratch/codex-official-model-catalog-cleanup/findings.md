@@ -244,6 +244,14 @@
 - 首次完整并发 Rust lib 运行 2662 passed、1 failed、5 ignored；唯一失败的数据库同步导入测试隔离运行通过，且本任务未修改对应文件，因此分类为并发基线噪声。改用串行线程后 lib 为 2663 passed、0 failed、5 ignored。
 - 串行 workspace suite 随后停在既有 `provider_commands`：两个 Codex 测试仍调用当前明确禁止的通用 `switch_provider` 并稳定收到“必须指定 Codex Profile”，另外两个因测试互斥锁中毒级联失败的项目隔离运行通过。Review Base 至当前 HEAD 与 issue 03 均未修改该文件，本 issue 不扩展范围修复旧 seam。
 
+## Issue 01 Review Follow-up
+
+- Code review 发现 1 个 P3 Standards 问题：`build_direct_provider_plan_with_mode` 重复了 `build_model_catalog_projection_plan_from_snapshot` 已有的 Home snapshot UTF-8 解码与 ownership-aware catalog projection 编排，并为此将 `set_codex_model_catalog_json_field` 扩大为 `pub(crate)`。
+- 处理方式：在 `CodexHomeConfigService` 内提取私有无落盘准备 helper `prepare_model_catalog_projection_from_snapshot`，仅负责从调用方已读取的 snapshot 解码 Home 并调用现有 `prepare_codex_model_catalog_projection`。catalog plan 与 direct plan 共用该 helper，低层 setter 恢复为 `codex_config.rs` 私有函数；未新增生产分支或改变公开 seam。
+- 重构前护栏：`switching_disabled_profile_to_official_clears_catalog_pointer` 1 passed，`direct_provider` 过滤集 7 passed。重构后同样为 1 passed 与 7 passed，完整 `catalog` 过滤集 75 passed。
+- 静态验证：`cargo fmt --all --check` 与 `git diff --check` 通过；`cargo clippy --lib` 退出 0，仅报告 `migration.rs`、`proxy/body_dump.rs` 与 `proxy/forwarder.rs` 中共 8 个既有 warning，本次修改文件无 Clippy 报告。
+- 第一次静态命令在仓库根目录运行 `cargo fmt` 时因无 `Cargo.toml` 退出 1；未重复原命令，改为在 `src-tauri` crate 目录执行后通过。
+
 ---
 
 *每完成两次重要查看、搜索、实验或浏览后更新本文件。*
