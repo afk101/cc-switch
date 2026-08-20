@@ -8,6 +8,7 @@
     "build": "pnpm run clean:dmg && pnpm tauri build",
     "dev:dump": "CC_SWITCH_DUMP_BODY=1 pnpm tauri dev",
     "build:dump": "pnpm run clean:dmg && CC_SWITCH_DUMP_BODY=1 pnpm tauri build",
+    "clean": "cargo clean --manifest-path src-tauri/Cargo.toml",
     "clean:dmg": "node scripts/clean-dmg.js",
     "tauri": "tauri",
     "dev:renderer": "vite",
