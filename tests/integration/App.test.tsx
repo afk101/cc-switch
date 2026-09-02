@@ -225,19 +225,25 @@ describe("App integration with MSW", () => {
     const { default: App } = await import("@/App");
     renderApp(App);
 
+    // 等待 App 完成异步初始化，避免初始化结果覆盖随后触发的 Codex 页面切换。
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list").textContent).toContain(
+        "claude-1",
+      ),
+    );
     fireEvent.click(screen.getByText("switch-codex"));
 
+    // App DOM 较大，直接按 Switch 的稳定语义属性定位，避免可访问性树全量扫描拖慢测试。
     await waitFor(() =>
       expect(
-        screen.getByRole("switch", {
-          name: "切换 默认 Codex 路由",
-          hidden: true,
-        }),
+        document.querySelector(
+          '[role="switch"][aria-label="切换 默认 Codex 路由"]',
+        ),
       ).toBeInTheDocument(),
     );
-    expect(screen.getAllByRole("switch", { hidden: true })).toHaveLength(1);
+    expect(document.querySelectorAll('[role="switch"]')).toHaveLength(1);
     expect(screen.queryByTitle(/接管 Codex/)).not.toBeInTheDocument();
-  });
+  }, 20_000); // 首次动态导入完整 App 会触发较重的转换与初始化，仅放宽这一条冷启动测试。
 
   it("covers basic provider flows via real hooks", async () => {
     const { default: App } = await import("@/App");

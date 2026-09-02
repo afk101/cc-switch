@@ -138,7 +138,7 @@ impl CodexProfileMigrationService {
         Ok(CodexProfileMigrationResult {
             selected_profile_id: plan.selected_profile_id.clone(),
             migrated_enabled_profile: (plan.should_apply_legacy_state && snapshot.route_enabled)
-                .then(|| MigratedEnabledCodexProfile {
+                .then_some(MigratedEnabledCodexProfile {
                     profile_id: plan.selected_profile_id,
                 }),
         })

@@ -299,13 +299,21 @@ impl Database {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // 18. Session Log Sync 表 (会话日志同步状态)
+        //
+        // last_byte_offset：Claude 路径的字节游标（seek 增量读）；NULL 表示
+        // 尚无字节游标（旧行号游标或非 Claude 路径行），此时回退全量读。
+        // last_tail_fingerprint：游标边界前尾部字节的指纹，用于识别文件被
+        // 外部重写（同尺寸/更大的替换无法靠 size 检测）；NULL 表示无指纹
+        // 可校验，按纯追加处理。
         conn.execute(
             "CREATE TABLE IF NOT EXISTS session_log_sync (
                 file_path TEXT PRIMARY KEY,
                 last_modified INTEGER NOT NULL,
                 last_line_offset INTEGER NOT NULL DEFAULT 0,
                 last_synced_at INTEGER NOT NULL,
-                profile_id TEXT
+                profile_id TEXT,
+                last_byte_offset INTEGER,
+                last_tail_fingerprint INTEGER
             )",
             [],
         )
@@ -502,10 +510,17 @@ impl Database {
                     }
                     17 => {
                         log::info!(
-                            "迁移数据库从 v17 到 v18（汇合 v17 分支并增加 Codex Profile Home 所有权状态）"
+                            "迁移数据库从 v17 到 v18（汇合 Profile Home 所有权与会话日志字节游标分支）"
                         );
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
+                    }
+                    18 => {
+                        log::info!(
+                            "迁移数据库从 v18 到 v19（幂等汇合 Profile Home 所有权与会话日志字节游标分支）"
+                        );
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -1746,7 +1761,38 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_session_usage_dedup_semantic
              ON session_usage_dedup(data_source, semantic_id, has_entry_id);",
         )
-        .map_err(|error| AppError::Database(format!("创建会话用量去重账本失败: {error}")))?;
+        .map_err(|error| AppError::Database(format!("创建会话用量去重账本失败: {error}")))
+    }
+
+    /// 幂等汇合两个曾共同占用 v18 版本号的 Schema 分支。
+    ///
+    /// 本地分支的 v18 增加了 Profile Home 所有权，上游 v18 增加了 Claude
+    /// 会话日志的字节游标与尾部指纹。数据库只记录数字版本，无法识别它
+    /// 曾执行哪一侧迁移，因此这里必须同时检查并补齐两侧字段。
+    fn ensure_v18_branch_convergence(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_grokbuild_skill_mcp_schema(conn)?;
+        Self::ensure_session_usage_dedup_schema(conn)?;
+
+        // 异常库或精简测试夹具可能没有该表；完整建表流程会直接创建最新结构。
+        if Self::table_exists(conn, "session_log_sync")? {
+            Self::add_column_if_missing(conn, "session_log_sync", "last_byte_offset", "INTEGER")?;
+            Self::add_column_if_missing(
+                conn,
+                "session_log_sync",
+                "last_tail_fingerprint",
+                "INTEGER",
+            )?;
+        }
+
+        // 保留本地 v18 的 Home 所有权语义，并让只执行过上游 v18 的数据库补齐该列。
+        if Self::table_exists(conn, "codex_profile_routes")? {
+            Self::add_column_if_missing(
+                conn,
+                "codex_profile_routes",
+                "home_ownership",
+                "TEXT NOT NULL DEFAULT 'managed' CHECK (home_ownership IN ('managed', 'external'))",
+            )?;
+        }
         Ok(())
     }
 
@@ -1778,19 +1824,14 @@ impl Database {
         Self::ensure_session_usage_dedup_schema(conn)
     }
 
-    /// v17 -> v18：补齐两个 v17 分支并增加 Codex Profile Home 所有权状态。
+    /// v17 -> v18：对尚未进入冲突版本号的数据库一次补齐两侧结构。
     fn migrate_v17_to_v18(conn: &Connection) -> Result<(), AppError> {
-        Self::ensure_grokbuild_skill_mcp_schema(conn)?;
-        Self::ensure_session_usage_dedup_schema(conn)?;
-        if Self::table_exists(conn, "codex_profile_routes")? {
-            Self::add_column_if_missing(
-                conn,
-                "codex_profile_routes",
-                "home_ownership",
-                "TEXT NOT NULL DEFAULT 'managed' CHECK (home_ownership IN ('managed', 'external'))",
-            )?;
-        }
-        Ok(())
+        Self::ensure_v18_branch_convergence(conn)
+    }
+
+    /// v18 -> v19：修复同一版本号被两侧分支用于不同迁移造成的结构分叉。
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        Self::ensure_v18_branch_convergence(conn)
     }
 
     /// 插入默认模型定价数据
@@ -3711,6 +3752,116 @@ mod tests {
              VALUES ('pi_session', 'request', 'semantic', 1)",
             [],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v17_to_v18_adds_byte_cursor_to_existing_sync_table() -> Result<(), AppError> {
+        // 真实升级路径：v17 库带旧 DDL 的 session_log_sync（无字节游标列，
+        // 字节游标曾短暂搭 v17 车、已执行过 v17 的开发库正是这个形状）
+        // 与存量游标行，迁移后列补上、存量行保持 NULL（首轮按行号转换）
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL
+             );
+             INSERT INTO session_log_sync VALUES ('/tmp/a.jsonl', 5, 3, 1);",
+        )?;
+        Database::set_user_version(&conn, 17)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_byte_offset"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_tail_fingerprint"
+        )?);
+        let (byte_offset, fingerprint): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT last_byte_offset, last_tail_fingerprint
+             FROM session_log_sync WHERE file_path = '/tmp/a.jsonl'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
+        assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    /// 本地与上游曾把不同迁移都标为 v18；v19 必须在无法判断来源时幂等补齐两侧字段。
+    #[test]
+    fn migrate_v18_to_v19_converges_both_v18_branch_shapes() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE codex_profile_routes (
+                profile_id TEXT PRIMARY KEY,
+                current_provider_id TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT 0,
+                live_backup_json TEXT,
+                last_error TEXT,
+                recovery_json TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO codex_profile_routes
+                (profile_id, current_provider_id, enabled, updated_at)
+             VALUES ('profile-a', 'provider-a', 1, 42);
+             CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL,
+                profile_id TEXT
+             );
+             INSERT INTO session_log_sync
+                (file_path, last_modified, last_line_offset, last_synced_at, profile_id)
+             VALUES ('/tmp/a.jsonl', 5, 3, 1, 'profile-a');",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, 19);
+        assert!(Database::has_column(
+            &conn,
+            "codex_profile_routes",
+            "home_ownership"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_byte_offset"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_tail_fingerprint"
+        )?);
+
+        // 迁移只补结构；已有路由状态、Profile 归属和旧行号游标都必须原样保留。
+        let route: (String, i64, i64, String) = conn.query_row(
+            "SELECT current_provider_id, enabled, updated_at, home_ownership
+             FROM codex_profile_routes WHERE profile_id = 'profile-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            route,
+            ("provider-a".to_string(), 1, 42, "managed".to_string())
+        );
+        let sync: (i64, Option<i64>, Option<i64>, String) = conn.query_row(
+            "SELECT last_line_offset, last_byte_offset, last_tail_fingerprint, profile_id
+             FROM session_log_sync WHERE file_path = '/tmp/a.jsonl'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(sync, (3, None, None, "profile-a".to_string()));
         Ok(())
     }
 }

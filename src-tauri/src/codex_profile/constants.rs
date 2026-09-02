@@ -26,6 +26,8 @@ pub const CODEX_MCP_SERVERS_TABLE: &str = "mcp_servers";
 pub const CODEX_MODEL_CATALOG_FIELD: &str = "model_catalog_json";
 /// Codex Profile 路由接管的服务地址字段。
 pub const CODEX_ROUTE_FIELD_BASE_URL: &str = "base_url";
+/// Codex 内置 OpenAI provider 使用的顶层服务地址字段。
+pub const CODEX_ROUTE_FIELD_OPENAI_BASE_URL: &str = "openai_base_url";
 /// Codex Profile 路由接管的协议字段。
 pub const CODEX_ROUTE_FIELD_WIRE_API: &str = "wire_api";
 /// Codex Profile 路由接管的本地凭证字段。

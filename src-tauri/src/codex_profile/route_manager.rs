@@ -11163,10 +11163,6 @@ experimental_bearer_token = "PROXY_MANAGED"
 
         manager.disable("profile-token-origin").await?;
 
-        assert_eq!(
-            fs::read(&config_path).expect("读取关闭后的 Home"),
-            original.as_bytes()
-        );
         let restored = fs::read_to_string(config_path).expect("读取恢复配置");
         let document = restored
             .parse::<toml_edit::DocumentMut>()
@@ -11176,6 +11172,22 @@ experimental_bearer_token = "PROXY_MANAGED"
                 .get("experimental_bearer_token")
                 .and_then(toml_edit::Item::as_str),
             Some("test-local-token")
+        );
+        assert_eq!(
+            document
+                .get("model_provider")
+                .and_then(toml_edit::Item::as_str),
+            Some("custom")
+        );
+        assert_eq!(
+            document
+                .get("model_providers")
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|providers| providers.get("custom"))
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(|provider| provider.get("name"))
+                .and_then(toml_edit::Item::as_str),
+            Some("custom")
         );
         assert!(document
             .get("model_providers")

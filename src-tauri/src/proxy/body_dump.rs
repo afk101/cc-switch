@@ -57,11 +57,11 @@ const DUMP_ENABLED: bool = {
         if b.len() != 5 {
             return false;
         }
-        b[0].to_ascii_lowercase() == b'f'
-            && b[1].to_ascii_lowercase() == b'a'
-            && b[2].to_ascii_lowercase() == b'l'
-            && b[3].to_ascii_lowercase() == b's'
-            && b[4].to_ascii_lowercase() == b'e'
+        matches!(b[0], b'f' | b'F')
+            && matches!(b[1], b'a' | b'A')
+            && matches!(b[2], b'l' | b'L')
+            && matches!(b[3], b's' | b'S')
+            && matches!(b[4], b'e' | b'E')
     }
 
     !val.is_empty() && !is_zero(val) && !is_false_ignore_case(val)
@@ -540,10 +540,7 @@ impl Default for SseSampler {
 /// 返回值为完整事件的文本列表；剩余不完整的字节保留在 `buffer` 里等待下一次调用。
 pub fn drain_sse_events(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut events = Vec::new();
-    loop {
-        let Some(pos) = find_event_boundary(buffer) else {
-            break;
-        };
+    while let Some(pos) = find_event_boundary(buffer) {
         // pos 是 "\n\n" 起点；把事件文本取出（不含分隔符），并把分隔符从 buffer 头部剥掉。
         let block: Vec<u8> = buffer.drain(..pos).collect();
         // 剥掉紧随其后的 "\n\n"（长度固定 2）。
