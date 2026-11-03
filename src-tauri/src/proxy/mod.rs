@@ -4,8 +4,10 @@
 
 pub mod body_dump;
 pub mod body_filter;
+mod browser_guard;
 pub mod cache_injector;
 pub mod circuit_breaker;
+pub(crate) mod codex_quota_protection;
 pub(crate) mod content_encoding;
 pub mod copilot_optimizer;
 pub mod error;
@@ -22,6 +24,7 @@ pub(crate) mod json_canonical;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
+pub mod opaque_state_rectifier;
 pub mod provider_router;
 pub mod providers;
 pub mod response_processor;
@@ -34,7 +37,11 @@ pub mod thinking_optimizer;
 pub mod thinking_rectifier;
 pub(crate) mod tool_media;
 pub(crate) mod types;
+mod upstream_guard;
 pub mod usage;
+
+#[cfg(test)]
+mod tests_issue_7271;
 
 // 公开导出给外部使用（commands, services等模块需要）
 #[allow(unused_imports)]

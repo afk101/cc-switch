@@ -29,8 +29,12 @@ impl LegacyCodexProfileSnapshot {
         override_home: Option<PathBuf>,
         current_provider_id: Option<String>,
     ) -> Result<Self, AppError> {
-        let current_provider_id =
-            current_provider_id.or(db.get_current_provider(AppType::Codex.as_str())?);
+        // 一次性迁移读取的是旧直连指针，经过统一入口明确用途，避免误取上游代理模式的路由卡。
+        let current_provider_id = current_provider_id.or(crate::mode::current::provider_for(
+            db,
+            &AppType::Codex,
+            crate::mode::current::Purpose::Direct,
+        )?);
         let route_enabled =
             futures::executor::block_on(db.get_proxy_config_for_app(AppType::Codex.as_str()))?
                 .enabled;
