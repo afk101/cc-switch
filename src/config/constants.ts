@@ -38,6 +38,9 @@ export type TemplateType = (typeof TEMPLATE_TYPES)[keyof typeof TEMPLATE_TYPES];
 // 默认 Codex Profile 的稳定标识
 export const CODEX_DEFAULT_PROFILE_ID = "codex-default";
 
+/** 菜单栏 WisGPT 余额统一使用百万 Token（M），不混用积分或其他单位。 */
+export const WISGPT_TOKENS_PER_MILLION = 1_000_000;
+
 // Codex Profile 可使用的监听端口范围
 export const CODEX_PROFILE_MIN_PORT = 1;
 export const CODEX_PROFILE_MAX_PORT = 65_535;

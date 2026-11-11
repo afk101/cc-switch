@@ -1137,6 +1137,14 @@ mod platform {
 
 // ─── 命令 ──────────────────────────────────────────────────────────────────────
 
+/// 每次弹出时独立查询 WisGPT 额度，不在常规面板状态重读中重复联网。
+/// 不跟随重定向，避免登录凭据离开配置中的服务；失败统一返回空值以隐藏额度条。
+#[tauri::command]
+pub async fn tray_panel_wisgpt_quota() -> Option<crate::services::wisgpt_quota::WisGptQuota> {
+    let client = crate::proxy::http_client::no_redirect().ok()?;
+    crate::services::wisgpt_quota::fetch_daily_quota(&crate::config::get_home_dir(), &client).await
+}
+
 /// 收集要读库和设备文件，一次几十毫秒。同步命令跑在主线程上，弹出后那一串额度刷新
 /// 会接连卡住主线程，悬停、展开子面板都跟着掉帧；挪到阻塞线程池上做。
 /// 启动期的会话用量导入会按文件整事务占着库，这里一等就是好几秒到一分钟：前端不会一直

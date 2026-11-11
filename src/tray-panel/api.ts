@@ -89,6 +89,12 @@ export interface TrayPanelState {
   quitHint: string | null;
 }
 
+/** 后端已校验的 WisGPT 每日 Token 额度，不包含身份或认证信息。 */
+export interface WisGptQuota {
+  remaining: number;
+  total: number;
+}
+
 /** 这次弹出的方位和文案（后端 `tray_panel::PanelPlacement`），坐标为逻辑像素。 */
 export interface PanelPlacement {
   seq: number;
@@ -130,6 +136,7 @@ export const CHANGED_EVENT = "tray-panel-changed";
 
 export const trayPanelApi = {
   state: () => invoke<TrayPanelState>("tray_panel_state"),
+  wisGptQuota: () => invoke<WisGptQuota | null>("tray_panel_wisgpt_quota"),
   placement: () => invoke<PanelPlacement | null>("tray_panel_placement"),
   layout: (layout: PanelLayout) =>
     invoke<void>("tray_panel_layout", { layout }),

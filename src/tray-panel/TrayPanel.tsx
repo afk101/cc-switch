@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { AppGlyph } from "@/components/shell/AppGlyph";
 import { ProviderIcon } from "@/components/ProviderIcon";
+import { WISGPT_TOKENS_PER_MILLION } from "@/config/constants";
 import { cn } from "@/lib/utils";
 import type { AppMode } from "@/types/proxy";
 import {
@@ -38,6 +39,7 @@ import {
   type PanelRow,
   type PanelTexts,
   type TrayPanelState,
+  type WisGptQuota,
 } from "./api";
 import { aimingAt, type Point } from "./menuAim";
 import { usePanelTheme } from "./usePanelTheme";
@@ -68,6 +70,39 @@ const OTHER_ITEM = "";
 const ROW_HOVER = "hover:bg-black/[0.06] dark:hover:bg-white/[0.08]";
 const FOCUS_RING =
   "outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60";
+
+/**
+ * 公共底栏只显示剩余比例和 M 余额，不增加说明文字。
+ * 真正用尽才显示零；很小的正数保留「小于」提示，避免四舍五入后误报用尽。
+ */
+function WisGptQuotaBar({ quota }: { quota: WisGptQuota }) {
+  const percent = (quota.remaining / quota.total) * 100;
+  const millions = quota.remaining / WISGPT_TOKENS_PER_MILLION;
+  return (
+    <div
+      role="progressbar"
+      aria-label="WisGPT"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent}
+      className="flex items-center gap-2 px-2.5 pb-1.5 pt-1 text-[11px] tabular-nums text-muted-foreground"
+    >
+      <span className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
+        <span
+          className="block h-full rounded-full bg-green-500 dark:bg-green-400"
+          style={{ width: `${percent}%` }}
+        />
+      </span>
+      <span>{percent > 0 && percent < 1 ? "<1" : Math.round(percent)}%</span>
+      <span className="shrink-0 text-foreground">
+        {millions > 0 && millions < 0.1
+          ? "<0.1"
+          : millions.toFixed(1).replace(/\.0$/, "")}
+        M
+      </span>
+    </div>
+  );
+}
 
 function readTab(): Tab {
   try {
@@ -544,6 +579,7 @@ export function TrayPanel() {
     [nativePlacement, coordinateScale],
   );
   const [state, setState] = useState<TrayPanelState | null>(null);
+  const [wisGptQuota, setWisGptQuota] = useState<WisGptQuota | null>(null);
   const [tab, setTab] = useState<Tab>(readTab);
   const [openApp, setOpenApp] = useState<string | null>(null);
   /** 子面板是从另一个应用换过来的（不是刚展开）：内容做一次很短的淡入 */
@@ -609,6 +645,16 @@ export function TrayPanel() {
       // 否则按旧 seq 回报的尺寸会被后端丢掉，Windows 上面板就不显示了。
       if (next.seq <= shownSeq.current) return;
       shownSeq.current = next.seq;
+      // 每次真正弹出只查询一次，不沿用旧余额；慢请求不阻塞排版，也不能覆盖后来弹出的结果。
+      setWisGptQuota(null);
+      void trayPanelApi
+        .wisGptQuota()
+        .then((quota) => {
+          if (shownSeq.current === next.seq) setWisGptQuota(quota);
+        })
+        .catch(() => {
+          // 查询失败隐藏这一行即可；不弹错误框，也不影响面板其他功能。
+        });
       syncLanguage();
       setOpenApp(null);
       setQuery("");
@@ -1125,6 +1171,7 @@ export function TrayPanel() {
           data-other-item
           className="shrink-0 border-t border-black/[0.08] px-1.5 py-1.5 dark:border-white/[0.08]"
         >
+          {wisGptQuota && <WisGptQuotaBar quota={wisGptQuota} />}
           {/* 开关要显示当前是否开着，数据到了再出 */}
           {state && (
             <button

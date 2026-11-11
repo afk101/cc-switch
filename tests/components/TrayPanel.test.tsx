@@ -24,6 +24,7 @@ vi.mock("@/tray-panel/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/tray-panel/api")>()),
   trayPanelApi: {
     state: vi.fn(),
+    wisGptQuota: vi.fn().mockResolvedValue(null),
     placement: vi.fn(),
     layout: vi.fn().mockResolvedValue(undefined),
     action: vi.fn().mockResolvedValue(undefined),
@@ -142,6 +143,7 @@ describe("TrayPanel window layout", () => {
     });
     window.localStorage.removeItem("cc-switch-tray-tab");
     vi.mocked(trayPanelApi.state).mockResolvedValue(state);
+    vi.mocked(trayPanelApi.wisGptQuota).mockResolvedValue(null);
     vi.mocked(trayPanelApi.layout).mockResolvedValue(undefined);
     // jsdom 不排版；分别提供主卡片和较高子卡片的实测高度。
     vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
@@ -166,6 +168,96 @@ describe("TrayPanel window layout", () => {
     delete document.documentElement.dataset.glass;
     delete document.documentElement.dataset.layout;
   });
+
+  it("shows the remaining WisGPT quota in one row above lightweight mode", async () => {
+    vi.mocked(trayPanelApi.wisGptQuota).mockResolvedValue({
+      remaining: 76_000_000,
+      total: 100_000_000,
+    });
+    await openPanel(windows);
+
+    const meter = await screen.findByRole("progressbar", { name: "WisGPT" });
+    expect(meter).toHaveAttribute("aria-valuenow", "76");
+    expect(meter).toHaveTextContent("76%");
+    expect(meter).toHaveTextContent("76M");
+    expect(meter).not.toHaveTextContent(/今日|剩余|Token/);
+    expect(
+      meter.compareDocumentPosition(
+        screen.getByRole("switch", { name: "Lightweight mode" }),
+      ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("refreshes on a new opening and ignores the previous opening's late result", async () => {
+    let finishFirst: (value: {
+      remaining: number;
+      total: number;
+    }) => void = () => {};
+    vi.mocked(trayPanelApi.wisGptQuota)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({ remaining: 28_000_000, total: 100_000_000 });
+    await openPanel(windows);
+    expect(screen.queryByRole("progressbar", { name: "WisGPT" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Quit" })).toBeEnabled();
+
+    await act(async () => emitTauriEvent(SHOW_EVENT, { ...windows, seq: 2 }));
+    expect(await screen.findByText("28M")).toBeInTheDocument();
+    await act(async () =>
+      finishFirst({ remaining: 90_000_000, total: 100_000_000 }),
+    );
+    expect(screen.getByText("28M")).toBeInTheDocument();
+    expect(screen.queryByText("90M")).toBeNull();
+
+    await act(async () => emitTauriEvent(SHOW_EVENT, { ...windows, seq: 2 }));
+    fireEvent.click(screen.getByRole("tab", { name: "Usage" }));
+    await act(async () => emitTauriEvent(CHANGED_EVENT, {}));
+    expect(screen.getByText("28M")).toBeInTheDocument();
+    expect(trayPanelApi.wisGptQuota).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the old balance when the next opening has no usable WisCode quota", async () => {
+    vi.mocked(trayPanelApi.wisGptQuota)
+      .mockResolvedValueOnce({ remaining: 76_000_000, total: 100_000_000 })
+      .mockResolvedValueOnce(null);
+    await openPanel(windows);
+    expect(await screen.findByText("76M")).toBeInTheDocument();
+    await act(async () => emitTauriEvent(SHOW_EVENT, { ...windows, seq: 2 }));
+    expect(screen.queryByRole("progressbar", { name: "WisGPT" })).toBeNull();
+  });
+
+  it("keeps the panel usable when the quota command fails", async () => {
+    vi.mocked(trayPanelApi.wisGptQuota).mockRejectedValueOnce(
+      new Error("offline"),
+    );
+    await openPanel(windows);
+    expect(screen.queryByRole("progressbar", { name: "WisGPT" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Open main window" }),
+    ).toBeEnabled();
+  });
+
+  it.each([
+    [0, "0%", "0M", "0%"],
+    [50_000, "<1%", "<0.1M", "0.05%"],
+    [500_000, "<1%", "0.5M", "0.5%"],
+  ])(
+    "formats a remaining balance of %d without pretending a positive balance is zero",
+    async (remaining, percent, amount, width) => {
+      vi.mocked(trayPanelApi.wisGptQuota).mockResolvedValue({
+        remaining,
+        total: 100_000_000,
+      });
+      await openPanel(windows);
+      const meter = await screen.findByRole("progressbar", { name: "WisGPT" });
+      expect(meter).toHaveTextContent(percent);
+      expect(meter).toHaveTextContent(amount);
+      expect(meter.querySelector("[style]")).toHaveStyle({ width });
+    },
+  );
 
   it("colors only the balance amount green, like the provider card", async () => {
     vi.mocked(trayPanelApi.state).mockResolvedValue({
