@@ -465,27 +465,33 @@ mod tests {
 
         runtime_a
             .codex_chat_history()
-            .record_response(&json!({
-                "id": "response-shared",
-                "output": [{
-                    "type": "function_call",
-                    "call_id": "call-shared",
-                    "name": "only-a",
-                    "arguments": "{}"
-                }]
-            }))
+            .record_response(
+                &json!({
+                    "id": "response-shared",
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-shared",
+                        "name": "only-a",
+                        "arguments": "{}"
+                    }]
+                }),
+                None,
+            )
             .await;
         runtime_b
             .codex_chat_history()
-            .record_response(&json!({
-                "id": "response-shared",
-                "output": [{
-                    "type": "function_call",
-                    "call_id": "call-shared",
-                    "name": "only-b",
-                    "arguments": "{}"
-                }]
-            }))
+            .record_response(
+                &json!({
+                    "id": "response-shared",
+                    "output": [{
+                        "type": "function_call",
+                        "call_id": "call-shared",
+                        "name": "only-b",
+                        "arguments": "{}"
+                    }]
+                }),
+                None,
+            )
             .await;
 
         let mut request_a = json!({
@@ -496,14 +502,14 @@ mod tests {
         assert_eq!(
             runtime_a
                 .codex_chat_history()
-                .enrich_request(&mut request_a)
+                .enrich_request(&mut request_a, None)
                 .await,
             1
         );
         assert_eq!(
             runtime_b
                 .codex_chat_history()
-                .enrich_request(&mut request_b)
+                .enrich_request(&mut request_b, None)
                 .await,
             1
         );

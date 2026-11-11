@@ -15,6 +15,7 @@ mod codex_state_db;
 mod commands;
 mod config;
 mod constants;
+mod copilot_config;
 mod database;
 mod deeplink;
 mod dsh_config;
@@ -377,9 +378,12 @@ fn runtime_log_level_allows(level: log::Level, max_level: log::LevelFilter) -> b
 }
 
 /// 执行一次应用级周期维护；单项失败不得阻断其它维护能力。
-async fn run_periodic_maintenance_tick(db: &database::Database) {
-    if let Err(error) = db.periodic_backup_if_needed() {
-        log::warn!("Periodic database backup failed: {error}");
+async fn run_periodic_maintenance_tick(db: std::sync::Arc<database::Database>) {
+    // 备份和数据库清理可能长时间持锁，沿用上游的阻塞线程池隔离，避免阻塞异步工作线程。
+    match tauri::async_runtime::spawn_blocking(move || db.periodic_backup_if_needed()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::warn!("Periodic database backup failed: {error}"),
+        Err(error) => log::warn!("Periodic maintenance task failed: {error}"),
     }
     crate::proxy::body_dump::run_body_dump_maintenance().await;
 }
@@ -393,6 +397,8 @@ where
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
         crate::constants::PERIODIC_MAINTENANCE_INTERVAL_SECS,
     ));
+    // 电脑休眠跨过多个周期后只运行当前维护，不补跑所有错过的周期。
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
     run_tick().await;
     tokio::spawn(async move {
@@ -594,6 +600,17 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
 
+    // WebView settings are per-view: apply this to initial and recreated windows,
+    // including the lightweight tray panel (#9216), before they are shown.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.plugin(
+            tauri::plugin::Builder::<_, ()>::new("linux-webview-rendering")
+                .on_webview_ready(|webview| linux_fix::configure_webview(&webview))
+                .build(),
+        );
+    }
+
     #[cfg(target_os = "windows")]
     {
         builder = builder.plugin(
@@ -630,7 +647,10 @@ pub fn run() {
                 && !startup_page_handled.swap(true, Ordering::Relaxed)
                 && !crate::settings::get_settings().silent_startup
             {
-                let _ = webview.window().show();
+                let window = webview.window();
+                if window.show().is_ok() {
+                    let _ = window.emit("main-window-visibility-changed", ());
+                }
                 log::info!("主页面加载完成，主窗口已显示");
             }
         });
@@ -661,7 +681,10 @@ pub fn run() {
 
                 if settings.minimize_to_tray_on_close {
                     api.prevent_close();
-                    let _ = window.hide();
+                    if window.hide().is_ok() {
+                        // An already-unfocused window may emit no blur/resize.
+                        let _ = window.emit("main-window-visibility-changed", ());
+                    }
                     log::info!("关闭请求已处理：最小化到托盘");
                     #[cfg(target_os = "windows")]
                     {
@@ -980,7 +1003,8 @@ pub fn run() {
                 app_state.db.is_providers_empty().unwrap_or(false);
 
             for app_type in
-                crate::app_config::AppType::all().filter(|t| !t.is_additive_mode())
+                crate::app_config::AppType::all()
+                    .filter(crate::services::provider::imports_default_config)
             {
                 if !crate::services::provider::should_import_default_config_on_startup(
                     &app_state,
@@ -1086,8 +1110,9 @@ pub fn run() {
                         }
                     }
 
-                    // 统一会话开关的官方历史迁移：开关开启但上次未完成（如文件被占用
-                    // 中途失败）时在启动期重试；函数内部自门控，开关关闭时直接跳过。
+                    // 统一会话开关的官方历史迁移：开关开着且勾选了迁入既有会话时，每次启动
+                    // 都把留在 openai 桶的会话迁进 custom（新版 Codex 会把它们锁成只读）；
+                    // 函数内部自门控，state DB 里没有 openai 线程时直接跳过。
                     match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
                         Ok(outcome) => {
                             if let Some(reason) = outcome.skipped_reason {
@@ -1587,20 +1612,22 @@ pub fn run() {
                     state.inner().clone(),
                 );
 
-                // Periodic backup check (on startup)
-                if let Err(e) = state.db.periodic_backup_if_needed() {
-                    log::warn!("Periodic backup failed on startup: {e}");
-                }
-
                 // 应用启动时立即维护一次，之后在应用运行期间每天维护一次。
+                // Backup and log maintenance can hold the database lock for a
+                // long time. Keep disk work off both the UI and async workers.
+                // The first interval tick runs startup maintenance; later ticks
+                // run daily, without a catch-up burst after sleep.
                 let db_for_timer = state.db.clone();
-                start_periodic_maintenance(move || {
-                    let db = db_for_timer.clone();
-                    async move {
-                        run_periodic_maintenance_tick(db.as_ref()).await;
-                    }
-                })
-                .await;
+                // 独立后台任务承接首轮维护，不阻塞下方会话用量同步等启动工作。
+                tauri::async_runtime::spawn(async move {
+                    start_periodic_maintenance(move || {
+                        let db = db_for_timer.clone();
+                        async move {
+                            run_periodic_maintenance_tick(db).await;
+                        }
+                    })
+                    .await;
+                });
 
                 // Session log usage sync: 启动时同步一次，之后每 10 分钟兜底一次（防 CLI 清理旧会话
                 // 文件前漏导入）；用量页打开时由前端按所选间隔加扫
@@ -1656,21 +1683,6 @@ pub fn run() {
                 });
             });
 
-            // Linux: 禁用 WebKitGTK 硬件加速，防止 EGL 初始化失败导致白屏
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.with_webview(|webview| {
-                        use webkit2gtk::{WebViewExt, SettingsExt, HardwareAccelerationPolicy};
-                        let wk_webview = webview.inner();
-                        if let Some(settings) = WebViewExt::settings(&wk_webview) {
-                            SettingsExt::set_hardware_acceleration_policy(&settings, HardwareAccelerationPolicy::Never);
-                            log::info!("已禁用 WebKitGTK 硬件加速");
-                        }
-                    });
-                }
-            }
-
             // 静默启动：根据设置决定是否显示主窗口
             let settings = crate::settings::get_settings();
             if let Some(window) = app.get_webview_window("main") {
@@ -1693,7 +1705,9 @@ pub fn run() {
                     }
                 } else if settings.silent_startup {
                     // 静默启动模式：保持窗口隐藏
-                    let _ = window.hide();
+                    if window.hide().is_ok() {
+                        let _ = window.emit("main-window-visibility-changed", ());
+                    }
                     #[cfg(target_os = "windows")]
                     let _ = window.set_skip_taskbar(true);
                     #[cfg(target_os = "macos")]
@@ -1702,7 +1716,9 @@ pub fn run() {
                 } else {
                     // 正常启动模式：显示窗口
                     #[cfg(not(target_os = "windows"))]
-                    let _ = window.show();
+                    if window.show().is_ok() {
+                        let _ = window.emit("main-window-visibility-changed", ());
+                    }
                     #[cfg(target_os = "windows")]
                     log::info!("正常启动模式：等待主页面加载完成后显示主窗口");
                     #[cfg(not(target_os = "windows"))]
@@ -2026,6 +2042,9 @@ pub fn run() {
             commands::stream_check_provider,
             // Session manager
             commands::list_sessions,
+            commands::sync_session_index,
+            commands::search_session_content,
+            commands::clear_session_index,
             commands::get_session_messages,
             commands::stream_session_messages,
             commands::get_session_block_content,
@@ -2136,6 +2155,7 @@ pub fn run() {
             commands::copilot_get_models_for_account,
             commands::copilot_get_usage,
             commands::copilot_get_usage_for_account,
+            commands::copilot_cli_signed_in_account,
             // OMO commands
             commands::read_omo_local_file,
             commands::get_current_omo_provider_id,
@@ -2415,7 +2435,11 @@ fn is_chinese_locale() -> bool {
     std::env::var("LANG")
         .or_else(|_| std::env::var("LC_ALL"))
         .or_else(|_| std::env::var("LC_MESSAGES"))
-        .map(|lang| lang.starts_with("zh"))
+        .map(|lang| {
+            lang.split(['-', '_', '.', '@'])
+                .next()
+                .is_some_and(|language| language.eq_ignore_ascii_case("zh"))
+        })
         .unwrap_or(false)
 }
 

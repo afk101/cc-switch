@@ -8,7 +8,7 @@ use cc_switch_lib::{
     AppError, AppState, AppType, McpApps, McpServer, MultiAppConfig, Provider, ProviderService,
 };
 
-#[path = "support.rs"]
+#[path = "support/mod.rs"]
 mod support;
 use std::collections::HashMap;
 use support::{
@@ -556,6 +556,7 @@ command = "say"
                 hermes: false,
                 mcode: false,
                 kimi: false,
+                copilot: false,
                 dsh: false,
                 pi: false,
                 omp: false,
