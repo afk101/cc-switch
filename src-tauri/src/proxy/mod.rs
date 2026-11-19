@@ -28,6 +28,7 @@ pub(crate) mod loopback_probe;
 pub mod media_sanitizer;
 pub mod model_mapper;
 pub mod opaque_state_rectifier;
+pub mod privacy_filter;
 pub mod provider_router;
 pub mod providers;
 pub mod response_processor;
@@ -48,9 +49,7 @@ mod tests_issue_7271;
 
 // 公开导出给外部使用（commands, services等模块需要）
 #[allow(unused_imports)]
-pub use circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
-};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 #[allow(unused_imports)]
 pub use error::ProxyError;
 #[allow(unused_imports)]

@@ -3695,7 +3695,7 @@ model_reasoning_extension = "keep-nested-extension"
     fn model_family_projection_uses_common_config_final_value() -> Result<(), AppError> {
         let db = Database::memory().expect("创建内存数据库");
         db.set_config_snippet(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             Some("model = \"common-model\"\nmodel_reasoning_effort = \"high\"\n".to_string()),
         )?;
         let mut provider = Provider::with_id(

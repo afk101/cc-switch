@@ -7,16 +7,15 @@ use crate::config::get_app_config_dir;
 use crate::error::AppError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// 同一 Profile 的 token 创建与轮换必须串行，避免并发调用返回不同凭证。
-static PROFILE_TOKEN_LOCKS: Lazy<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static PROFILE_TOKEN_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 仅存放在 CC Switch 私有目录中的 Profile 本地监听凭证。
 pub struct CodexProfileSecretStore {

@@ -1,7 +1,6 @@
 import type { AppId } from "@/lib/api/types";
 import { CODEX_DEFAULT_PROFILE_ID } from "@/config/constants";
 import type {
-  McpServer,
   Provider,
   SessionContentHit,
   SessionMessage,
@@ -17,7 +16,6 @@ import {
 
 type ProvidersByApp = Record<AppId, Record<string, Provider>>;
 type CurrentProviderState = Record<AppId, string>;
-type McpConfigState = Record<AppId, Record<string, McpServer>>;
 type CodexProfileStateById = Record<string, CodexProfileState>;
 type LiveProviderIdsByApp = Record<
   "opencode" | "openclaw" | "hermes",
@@ -88,6 +86,7 @@ const createDefaultProviders = (): ProvidersByApp => ({
   agy: {},
   omp: {},
   copilot: {},
+  workbuddy: {},
 });
 
 const createDefaultCurrent = (): CurrentProviderState => ({
@@ -106,6 +105,7 @@ const createDefaultCurrent = (): CurrentProviderState => ({
   agy: "",
   omp: "",
   copilot: "",
+  workbuddy: "",
 });
 
 /** 创建 App 集成测试使用的默认 Codex Profile 状态。 */
@@ -205,59 +205,6 @@ const createDefaultSessionMessages = (): Record<string, SessionMessage[]> => ({
 let sessionsState = createDefaultSessions();
 let sessionMessagesState = createDefaultSessionMessages();
 let codexProfileStates = createDefaultCodexProfileStates();
-let mcpConfigs: McpConfigState = {
-  claude: {
-    sample: {
-      id: "sample",
-      name: "Sample Claude Server",
-      enabled: true,
-      apps: {
-        claude: true,
-        codex: false,
-        gemini: false,
-        opencode: false,
-        openclaw: false,
-        hermes: false,
-      },
-      server: {
-        type: "stdio",
-        command: "claude-server",
-      },
-    },
-  },
-  "claude-desktop": {},
-  codex: {
-    httpServer: {
-      id: "httpServer",
-      name: "HTTP Codex Server",
-      enabled: false,
-      apps: {
-        claude: false,
-        codex: true,
-        gemini: false,
-        opencode: false,
-        openclaw: false,
-        hermes: false,
-      },
-      server: {
-        type: "http",
-        url: "http://localhost:3000",
-      },
-    },
-  },
-  gemini: {},
-  grokbuild: {},
-  opencode: {},
-  openclaw: {},
-  hermes: {},
-  pi: {},
-  mcode: {},
-  kimi: {},
-  dsh: {},
-  agy: {},
-  omp: {},
-  copilot: {},
-};
 
 const cloneProviders = (value: ProvidersByApp) =>
   deepClone(value) as ProvidersByApp;
@@ -284,6 +231,21 @@ export interface CustomIconFixture {
 }
 
 let customIconsState: CustomIconFixture[] = [];
+
+export interface WorkBuddyModelOwnerFixture {
+  id: string;
+  owner: string | null;
+}
+let workbuddyModelOwnersState: WorkBuddyModelOwnerFixture[] = [];
+
+export const getWorkBuddyModelOwners = () =>
+  deepClone(workbuddyModelOwnersState);
+
+export const setWorkBuddyModelOwners = (
+  owners: WorkBuddyModelOwnerFixture[],
+) => {
+  workbuddyModelOwnersState = deepClone(owners);
+};
 
 export const listCustomIcons = () => deepClone(customIconsState);
 
@@ -319,6 +281,7 @@ export const deleteCustomIcon = (id: string) => {
 export const resetProviderState = () => {
   pendingDeepLink = null;
   customIconsState = [];
+  workbuddyModelOwnersState = [];
   providers = createDefaultProviders();
   current = createDefaultCurrent();
   liveProviderIds = {
@@ -339,59 +302,6 @@ export const resetProviderState = () => {
     language: "zh",
   };
   appConfigDirOverride = null;
-  mcpConfigs = {
-    claude: {
-      sample: {
-        id: "sample",
-        name: "Sample Claude Server",
-        enabled: true,
-        apps: {
-          claude: true,
-          codex: false,
-          gemini: false,
-          opencode: false,
-          openclaw: false,
-          hermes: false,
-        },
-        server: {
-          type: "stdio",
-          command: "claude-server",
-        },
-      },
-    },
-    "claude-desktop": {},
-    codex: {
-      httpServer: {
-        id: "httpServer",
-        name: "HTTP Codex Server",
-        enabled: false,
-        apps: {
-          claude: false,
-          codex: true,
-          gemini: false,
-          opencode: false,
-          openclaw: false,
-          hermes: false,
-        },
-        server: {
-          type: "http",
-          url: "http://localhost:3000",
-        },
-      },
-    },
-    gemini: {},
-    grokbuild: {},
-    opencode: {},
-    openclaw: {},
-    hermes: {},
-    pi: {},
-    mcode: {},
-    kimi: {},
-    dsh: {},
-    agy: {},
-    omp: {},
-    copilot: {},
-  };
 };
 
 /** 返回全部 Codex Profile 的隔离副本。 */
@@ -452,15 +362,6 @@ export const setCurrentProviderId = (appType: AppId, providerId: string) => {
   current[appType] = providerId;
 };
 
-export const updateProviders = (
-  appType: AppId,
-  data: Record<string, Provider>,
-) => {
-  providers[appType] = cloneProviders({ [appType]: data } as ProvidersByApp)[
-    appType
-  ];
-};
-
 export const setProviders = (
   appType: AppId,
   data: Record<string, Provider>,
@@ -516,52 +417,6 @@ export const getAppConfigDirOverride = () => appConfigDirOverride;
 
 export const setAppConfigDirOverrideState = (value: string | null) => {
   appConfigDirOverride = value;
-};
-
-export const getMcpConfig = (appType: AppId) => {
-  const servers = deepClone(mcpConfigs[appType] ?? {}) as Record<
-    string,
-    McpServer
-  >;
-  return {
-    configPath: `/mock/${appType}.mcp.json`,
-    servers,
-  };
-};
-
-export const setMcpConfig = (
-  appType: AppId,
-  value: Record<string, McpServer>,
-) => {
-  mcpConfigs[appType] = deepClone(value) as Record<string, McpServer>;
-};
-
-export const setMcpServerEnabled = (
-  appType: AppId,
-  id: string,
-  enabled: boolean,
-) => {
-  if (!mcpConfigs[appType]?.[id]) return;
-  mcpConfigs[appType][id] = {
-    ...mcpConfigs[appType][id],
-    enabled,
-  };
-};
-
-export const upsertMcpServer = (
-  appType: AppId,
-  id: string,
-  server: McpServer,
-) => {
-  if (!mcpConfigs[appType]) {
-    mcpConfigs[appType] = {};
-  }
-  mcpConfigs[appType][id] = deepClone(server) as McpServer;
-};
-
-export const deleteMcpServer = (appType: AppId, id: string) => {
-  if (!mcpConfigs[appType]) return;
-  delete mcpConfigs[appType][id];
 };
 
 export const listSessions = () => deepClone(sessionsState) as SessionMeta[];

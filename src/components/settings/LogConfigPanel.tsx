@@ -150,7 +150,7 @@ export function LogConfigPanel() {
       {/* 日志级别说明 */}
       <div className="rounded-lg bg-muted/50 p-4 text-xs space-y-1.5">
         <p className="font-medium text-muted-foreground mb-2">
-          {t("settings.advanced.logConfig.levelHint")}
+          {t("settings.advanced.logConfig.level")}
         </p>
         <div className="grid gap-1 text-muted-foreground">
           <p>

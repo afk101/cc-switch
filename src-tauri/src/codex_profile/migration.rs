@@ -36,16 +36,14 @@ impl LegacyCodexProfileSnapshot {
             crate::mode::current::Purpose::Direct,
         )?);
         let route_enabled =
-            futures::executor::block_on(db.get_proxy_config_for_app(AppType::Codex.as_str()))?
-                .enabled;
+            futures::executor::block_on(db.get_proxy_config_for_app(&AppType::Codex))?.enabled;
         let failover_provider_ids = db
-            .get_failover_queue(AppType::Codex.as_str())?
+            .get_failover_queue(&AppType::Codex)?
             .into_iter()
             .map(|item| item.provider_id)
             .collect();
-        let live_backup_json =
-            futures::executor::block_on(db.get_live_backup(AppType::Codex.as_str()))?
-                .map(|backup| backup.original_config);
+        let live_backup_json = futures::executor::block_on(db.get_live_backup(&AppType::Codex))?
+            .map(|backup| backup.original_config);
 
         Ok(Self {
             override_home,
@@ -492,6 +490,7 @@ fn backfill_legacy_session_sync_in_transaction(
 #[cfg(test)]
 mod tests {
     use super::{CodexProfileMigrationService, LegacyCodexProfileSnapshot};
+    use crate::app_config::AppType;
     use crate::codex_profile::{
         CodexProfileRepository, HomePathCanonicalizer, SystemHomePathCanonicalizer,
         SystemPortAvailability, DEFAULT_CODEX_PROFILE_ID, LEGACY_CODEX_ROUTE_PORT,
@@ -641,7 +640,9 @@ mod tests {
             )
             .expect("写入旧供应商");
         }
-        futures::executor::block_on(db.save_live_backup("codex", "{\"config\":\"legacy\"}"))?;
+        futures::executor::block_on(
+            db.save_live_backup(&AppType::Codex, "{\"config\":\"legacy\"}"),
+        )?;
         let service = migration_service(db.clone(), &default_home);
         let snapshot = LegacyCodexProfileSnapshot {
             override_home: Some(override_home.clone()),
@@ -674,7 +675,7 @@ mod tests {
             migrated_route.live_backup_json.as_deref(),
             Some("{\"config\":\"legacy\"}")
         );
-        assert!(futures::executor::block_on(db.get_live_backup("codex"))?.is_none());
+        assert!(futures::executor::block_on(db.get_live_backup(&AppType::Codex))?.is_none());
         assert_eq!(
             db.list_codex_profile_failovers(&selected_profile_id)?,
             vec!["failover-provider".to_string()]
@@ -720,7 +721,9 @@ mod tests {
             )
             .expect("写入故障转移供应商");
         }
-        futures::executor::block_on(db.save_live_backup("codex", "{\"config\":\"legacy\"}"))?;
+        futures::executor::block_on(
+            db.save_live_backup(&AppType::Codex, "{\"config\":\"legacy\"}"),
+        )?;
         let snapshot = LegacyCodexProfileSnapshot {
             override_home: Some(override_home),
             current_provider_id: Some("missing-provider".to_string()),
@@ -735,7 +738,7 @@ mod tests {
             db.list_codex_profiles()?.is_empty(),
             "失败迁移不得残留半成品 Profile"
         );
-        assert!(futures::executor::block_on(db.get_live_backup("codex"))?.is_some());
+        assert!(futures::executor::block_on(db.get_live_backup(&AppType::Codex))?.is_some());
 
         {
             let conn = db.conn.lock().expect("获取数据库锁");
@@ -763,7 +766,7 @@ mod tests {
             db.list_codex_profile_failovers(&selected_profile_id)?,
             vec!["failover-provider".to_string()]
         );
-        assert!(futures::executor::block_on(db.get_live_backup("codex"))?.is_none());
+        assert!(futures::executor::block_on(db.get_live_backup(&AppType::Codex))?.is_none());
         Ok(())
     }
 

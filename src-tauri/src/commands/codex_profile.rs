@@ -218,7 +218,7 @@ async fn switch_codex_profile_provider_internal(
 ) -> Result<(), AppError> {
     let mut provider = state
         .db
-        .get_provider_by_id(provider_id, AppType::Codex.as_str())?
+        .get_provider_by_id(provider_id, &AppType::Codex)?
         .ok_or_else(|| AppError::InvalidInput("Codex 供应商不存在".to_string()))?;
     provider.settings_config =
         crate::services::provider::build_effective_settings_with_common_config(

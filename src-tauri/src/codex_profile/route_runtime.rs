@@ -261,7 +261,13 @@ impl RouteRuntime {
             let _ = self
                 .server
                 .provider_router()
-                .record_result(provider_id, "codex", false, false, None)
+                .record_result(
+                    provider_id,
+                    &crate::app_config::AppType::Codex,
+                    false,
+                    false,
+                    None,
+                )
                 .await;
         }
     }
@@ -271,7 +277,7 @@ impl RouteRuntime {
     async fn select_provider_ids(&self) -> Vec<String> {
         self.server
             .provider_router()
-            .select_providers("codex")
+            .select_providers(&crate::app_config::AppType::Codex)
             .await
             .expect("Profile 路由器应有可用供应商")
             .into_iter()
@@ -434,7 +440,7 @@ mod tests {
         let error = runtime
             .server
             .provider_router()
-            .select_providers("codex")
+            .select_providers(&crate::app_config::AppType::Codex)
             .await
             .expect_err("所有候选 Open 时应返回熔断错误");
 

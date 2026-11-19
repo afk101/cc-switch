@@ -42,6 +42,7 @@ import {
   detectCodingPlanProvider,
 } from "@/config/codingPlanProviders";
 import { formatUsageDataSummary } from "@/utils/usageDisplay";
+import { appHas } from "@/config/appSpecs";
 
 /**
  * 火山引擎账号级 AccessKey 的密钥管理页（IAM）。
@@ -205,8 +206,7 @@ function detectBalanceProvider(baseUrl: string | undefined): boolean {
 }
 
 function isOfficialSubscriptionProvider(provider: Provider, appId: AppId) {
-  if (!["claude", "codex", "gemini", "grokbuild", "agy"].includes(appId))
-    return false;
+  if (!appHas(appId, "officialSubscription")) return false;
   if (provider.category === "official") return true;
 
   const config = provider.settingsConfig as Record<string, any>;
@@ -337,7 +337,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
             apiKey: kimiProvider.api_key,
             baseUrl: kimiProvider.base_url,
           };
-        } else if (appId === "pi" || appId === "omp") {
+        } else if (appHas(appId, "piFamily")) {
           // Pi / Oh My Pi: provider values are camelCase; a model may override baseUrl.
           const root = config as any;
           const firstModel = Array.isArray(root.models)
@@ -346,6 +346,20 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
           return {
             apiKey: root.apiKey,
             baseUrl: firstModel?.baseUrl || root.baseUrl,
+          };
+        } else if (appId === "workbuddy") {
+          // WorkBuddy models.json: shared url / apiKey, or the first model's overrides.
+          // url is the full chat/completions endpoint, same trim as the backend resolver.
+          const root = config as any;
+          const firstModel = Array.isArray(root.models)
+            ? root.models[0]
+            : undefined;
+          const url: string | undefined = root.url || firstModel?.url;
+          return {
+            apiKey: root.apiKey || firstModel?.apiKey,
+            baseUrl: url
+              ?.replace(/\/+$/, "")
+              .replace(/\/chat\/completions$/, ""),
           };
         } else if (appId === "openclaw") {
           // OpenClaw: settingsConfig 顶层扁平（camelCase，对应 openclaw.json）

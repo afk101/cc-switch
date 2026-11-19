@@ -93,6 +93,7 @@ import {
 } from "@/lib/navigation";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { useUpdate } from "@/contexts/UpdateContext";
+import { AutoUpdatePrompt } from "@/components/AutoUpdatePrompt";
 import { NewLayoutDialog } from "@/components/shell/NewLayoutDialog";
 import {
   AppPageHeader,
@@ -118,7 +119,6 @@ import { EnvWarningBanner } from "@/components/env/EnvWarningBanner";
 import { SwitchModePanel } from "@/components/providers/mode/SwitchModePanel";
 import { proxyApi } from "@/lib/api/proxy";
 import type { AppMode, StartupAttachFailure } from "@/types/proxy";
-import { PROMPT_APP_IDS } from "@/lib/query/prompts";
 import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
 import { WhatsNewNotice } from "@/components/WhatsNewDialog";
@@ -140,25 +140,24 @@ import {
 } from "@/lib/query/omo";
 import { invalidatePiProviderCaches, usePiCurrentState } from "@/lib/query/pi";
 import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
+import { DEFAULT_VISIBLE_APPS, orderAppIds } from "@/config/appConfig";
+import { EditProviderHost } from "@/components/providers/EditProviderHost";
+import { preloadOnIdle } from "@/lib/preloadOnIdle";
+import { useCreateEditProviderStore } from "@/components/providers/editProviderStore";
 import {
   APP_IDS,
-  DEFAULT_VISIBLE_APPS,
-  isModeAppId,
-  isPiFamilyApp,
-  orderAppIds,
-} from "@/config/appConfig";
-import type { PiFamilyAppId } from "@/lib/api/pi";
+  APP_IDS_WITH,
+  type AppIdWith,
+  appHas,
+} from "@/config/appSpecs";
 
 // Keep the provider page and event listeners ready at startup. Editors, charts
 // and secondary pages are loaded when the user first opens them.
+const loadAddProviderDialog = () =>
+  import("@/components/providers/AddProviderDialog");
 const AddProviderDialog = lazy(() =>
-  import("@/components/providers/AddProviderDialog").then((m) => ({
+  loadAddProviderDialog().then((m) => ({
     default: m.AddProviderDialog,
-  })),
-);
-const EditProviderDialog = lazy(() =>
-  import("@/components/providers/EditProviderDialog").then((m) => ({
-    default: m.EditProviderDialog,
   })),
 );
 const SettingsPage = lazy(() =>
@@ -251,7 +250,7 @@ function App() {
   const [openclawConfigTab, setOpenclawConfigTab] =
     useState<OpenClawConfigTab>("env");
   const [promptsApp, setPromptsApp] = useState<AppId>(() =>
-    PROMPT_APP_IDS.includes(sharedFeatureApp) ? sharedFeatureApp : "claude",
+    appHas(sharedFeatureApp, "prompts") ? sharedFeatureApp : "claude",
   );
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [hasOpenedAdd, setHasOpenedAdd] = useState(false);
@@ -266,7 +265,8 @@ function App() {
     setProviderSearchOpen(false);
   }, [activeApp, currentView]);
   // 供应商页顶部正在看的那格（直连 / 路由 / 聚合），由 SwitchModePanel 报上来。打开新增、
-  // 编辑时记下当时那格，表单按它选布局：在聚合那格打开就是聚合的简化表单。
+  // 编辑时记下当时那格（新增记在 formModeView，编辑随供应商记进 editProviderStore），
+  // 表单按它选布局：在聚合那格打开就是聚合的简化表单。
   const [providerModeView, setProviderModeView] = useState<{
     app: AppId;
     view: AppMode;
@@ -404,11 +404,10 @@ function App() {
     }
   }, [activeApp, currentView]);
 
-  const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
-  const [hasOpenedEdit, setHasOpenedEdit] = useState(false);
-  useEffect(() => {
-    if (editingProvider) setHasOpenedEdit(true);
-  }, [editingProvider]);
+  // 正在编辑的供应商不放 App 的 state：开关编辑页时不让整个 App 和列表重渲染
+  const editProviderStore = useCreateEditProviderStore();
+  // 新增页和编辑页共用的表单很大，启动后空闲时先拉好（编辑页在 EditProviderHost 里预取）
+  useEffect(() => preloadOnIdle(loadAddProviderDialog), []);
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
   const [confirmAction, setConfirmAction] = useState<{
     provider: Provider;
@@ -420,7 +419,6 @@ function App() {
   const [envConflicts, setEnvConflicts] = useState<EnvConflict[]>([]);
   const [showEnvBanner, setShowEnvBanner] = useState(false);
 
-  const effectiveEditingProvider = useLastValidValue(editingProvider);
   const effectiveUsageProvider = useLastValidValue(usageProvider);
   const mainScrollRef = useRef<HTMLElement>(null);
   const providerScrollContainerRef = useRef<HTMLDivElement>(null);
@@ -444,7 +442,7 @@ function App() {
   const { isRunning: isProxyRunning, takeoverStatus } = useProxyStatus();
   const usesCodexProfile = activeApp === "codex" && codexProfiles.length > 0;
   const modeAppId =
-    isModeAppId(activeApp) && !usesCodexProfile ? activeApp : null;
+    appHas(activeApp, "routeMode") && !usesCodexProfile ? activeApp : null;
   // 换了应用、新面板还没报上来时为 undefined：表单按应用实际生效的模式
   const currentModeView =
     providerModeView?.app === activeApp ? providerModeView.view : undefined;
@@ -502,7 +500,7 @@ function App() {
   };
   const handleEnablePiProvider = async (
     provider: Provider,
-    app: PiFamilyAppId,
+    app: AppIdWith<"piFamily">,
   ) => {
     try {
       await providersApi.switch(provider.id, app);
@@ -966,7 +964,8 @@ function App() {
           activeApp === "dsh" ||
           activeApp === "kimi" ||
           activeApp === "agy" ||
-          activeApp === "copilot"
+          activeApp === "copilot" ||
+          activeApp === "workbuddy"
         )
           return;
         const conflicts = await checkEnvConflicts(activeApp);
@@ -1014,7 +1013,7 @@ function App() {
   // 面板的 appId 跟着 activeApp 走，开着切应用会把 A 应用的供应商保存进 B 应用
   const closeProviderPanels = () => {
     setIsAddOpen(false);
-    setEditingProvider(null);
+    editProviderStore.close();
     setUsageProvider(null);
   };
 
@@ -1067,7 +1066,7 @@ function App() {
     if (page === "prompts" && currentViewRef.current !== "prompts") {
       // 提示词页默认选中侧栏里最后选的那个应用
       setPromptsApp(
-        PROMPT_APP_IDS.includes(sharedFeatureApp) ? sharedFeatureApp : "claude",
+        appHas(sharedFeatureApp, "prompts") ? sharedFeatureApp : "claude",
       );
     }
     setCurrentView(page);
@@ -1186,12 +1185,12 @@ function App() {
     editorSave?: ProviderEditorSave;
   }) => {
     await updateProvider(provider, originalId, editorSave);
-    setEditingProvider(null);
+    editProviderStore.close();
   };
 
   // 累加式应用的「已添加」和「默认」都现读客户端文件，移除前后重读一遍
   const refreshAdditiveLiveState = async (app: AppId) => {
-    if (isPiFamilyApp(app)) {
+    if (appHas(app, "piFamily")) {
       await invalidatePiProviderCaches(queryClient, app);
     } else if (app === "opencode") {
       await Promise.all([
@@ -1217,7 +1216,8 @@ function App() {
       app === "mcode" ||
       app === "dsh" ||
       app === "kimi" ||
-      app === "copilot"
+      app === "copilot" ||
+      app === "workbuddy"
     ) {
       await queryClient.invalidateQueries({ queryKey: ["providers", app] });
     }
@@ -1235,7 +1235,7 @@ function App() {
       } catch (error) {
         const detail = extractErrorMessage(error);
         const description =
-          (isPiFamilyApp(activeApp)
+          (appHas(activeApp, "piFamily")
             ? translatePiProviderMutationError(detail, t)
             : activeApp === "kimi"
               ? translateKimiProviderMutationError(detail, t)
@@ -1250,7 +1250,7 @@ function App() {
       }
       await refreshAdditiveLiveState(activeApp);
       toast.success(
-        isPiFamilyApp(activeApp)
+        appHas(activeApp, "piFamily")
           ? t(`${activeApp}.provider.removed`, {
               defaultValue: "已从 Pi 移除",
             })
@@ -1411,6 +1411,14 @@ function App() {
         );
         duplicatedProvider.addToLive = false;
       }
+    } else if (activeApp === "workbuddy") {
+      // WorkBuddy model IDs are unique across models.json, so a copy that kept
+      // the same models would collide; keep it out of the file until edited.
+      duplicatedProvider.providerKey = generateUniqueProviderCopyKey(
+        provider.id,
+        Object.keys(providers),
+      );
+      duplicatedProvider.addToLive = false;
     } else if (activeApp === "copilot") {
       // 自带模型卡的 id 就是 providers.json 里的供应商名，副本另起一个；官方卡仍用随机 id。
       // 副本都先不写进 providers.json（官方卡本来就不写）
@@ -1620,6 +1628,7 @@ function App() {
             activeApp !== "mcode" &&
             activeApp !== "dsh" &&
             activeApp !== "kimi" &&
+            activeApp !== "workbuddy" &&
             (settingsData?.showProfileSwitcher ?? false) && (
               <ProfileSwitcher activeApp={activeApp} />
             )}
@@ -1713,10 +1722,8 @@ function App() {
   };
 
   const listCallbacks = {
-    onEdit: (provider: Provider) => {
-      setFormModeView(currentModeView);
-      setEditingProvider(provider);
-    },
+    onEdit: (provider: Provider) =>
+      editProviderStore.open(provider, currentModeView),
     onDelete: (provider: Provider) =>
       setConfirmAction({ provider, action: "delete" }),
     onDuplicate: handleDuplicateProvider,
@@ -1781,7 +1788,7 @@ function App() {
             appId={activeApp}
             isLoading={isLoading}
             onSwitch={(provider) =>
-              void (isPiFamilyApp(activeApp)
+              void (appHas(activeApp, "piFamily")
                 ? handleEnablePiProvider(provider, activeApp)
                 : activeApp === "kimi" || activeApp === "copilot"
                   ? handleAddNativeProvider(provider, activeApp)
@@ -1796,15 +1803,7 @@ function App() {
                 : undefined
             }
             onRemoveFromConfig={
-              activeApp === "opencode" ||
-              activeApp === "openclaw" ||
-              activeApp === "hermes" ||
-              activeApp === "pi" ||
-              activeApp === "mcode" ||
-              activeApp === "kimi" ||
-              activeApp === "dsh" ||
-              activeApp === "omp" ||
-              activeApp === "copilot"
+              appHas(activeApp, "additive")
                 ? (provider) => setConfirmAction({ provider, action: "remove" })
                 : undefined
             }
@@ -1968,7 +1967,7 @@ function App() {
           <div id="main-content" className="flex min-h-0 flex-1 flex-col">
             <PromptPanel
               appId={promptsApp}
-              apps={PROMPT_APP_IDS.filter(
+              apps={APP_IDS_WITH.prompts.filter(
                 (app) =>
                   visibleApps[app] ||
                   (app === "claude" && visibleApps["claude-desktop"]) ||
@@ -2073,6 +2072,7 @@ function App() {
           >
             <Suspense fallback={<PageLoading />}>{renderContent()}</Suspense>
           </div>
+          <AutoUpdatePrompt />
         </main>
       </div>
 
@@ -2087,22 +2087,13 @@ function App() {
           />
         )}
 
-        {(editingProvider || hasOpenedEdit) && (
-          <EditProviderDialog
-            open={Boolean(editingProvider)}
-            provider={effectiveEditingProvider}
-            onOpenChange={(open) => {
-              if (!open) {
-                setEditingProvider(null);
-              }
-            }}
-            onSubmit={handleEditProvider}
-            appId={activeApp}
-            isProxyTakeover={isCurrentAppTakeoverActive}
-            isCurrent={effectiveEditingProvider?.id === currentProviderId}
-            modeView={formModeView}
-          />
-        )}
+        <EditProviderHost
+          store={editProviderStore}
+          appId={activeApp}
+          onSubmit={handleEditProvider}
+          isProxyTakeover={isCurrentAppTakeoverActive}
+          currentProviderId={currentProviderId}
+        />
 
         {effectiveUsageProvider && (
           <UsageScriptModal

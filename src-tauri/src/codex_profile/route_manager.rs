@@ -104,10 +104,10 @@ impl CodexProfileRoutePersistence for Database {
         self.replace_codex_profile_failovers(profile_id, provider_ids)
     }
     fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-        self.get_provider_by_id(provider_id, AppType::Codex.as_str())
+        self.get_provider_by_id(provider_id, &AppType::Codex)
     }
     fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
-        self.save_provider(AppType::Codex.as_str(), provider)
+        self.save_provider(&AppType::Codex, provider)
     }
     fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
         self.delete_codex_profile(profile_id)
@@ -4470,12 +4470,11 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
-            self.db.save_provider(AppType::Codex.as_str(), provider)
+            self.db.save_provider(&AppType::Codex, provider)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -4855,12 +4854,11 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
-            self.db.save_provider(AppType::Codex.as_str(), provider)
+            self.db.save_provider(&AppType::Codex, provider)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -4912,8 +4910,7 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -4968,12 +4965,11 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn save_provider_snapshot(&self, provider: &Provider) -> Result<(), AppError> {
-            self.db.save_provider(AppType::Codex.as_str(), provider)
+            self.db.save_provider(&AppType::Codex, provider)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -5012,8 +5008,7 @@ mod codex_route_manager {
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
             self.db.delete_codex_profile(profile_id)
@@ -5051,8 +5046,7 @@ mod codex_route_manager {
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
             self.db.delete_codex_profile(profile_id)
@@ -5095,8 +5089,7 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -5145,8 +5138,7 @@ mod codex_route_manager {
         }
 
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
 
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
@@ -5184,8 +5176,7 @@ mod codex_route_manager {
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
         fn delete_profile(&self, _: &str) -> Result<(), AppError> {
             Err(AppError::Message("模拟数据库删除失败".to_string()))
@@ -5227,8 +5218,7 @@ mod codex_route_manager {
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
             self.db.delete_codex_profile(profile_id)
@@ -5567,7 +5557,7 @@ mod codex_route_manager {
 
         let provider_id = format!("provider-{profile_id}");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(provider_id.clone(), provider_id.clone(), json!({}), None),
         )?;
         db.insert_codex_profile(&CodexProfile {
@@ -5586,7 +5576,7 @@ mod codex_route_manager {
         )
         .expect("写入原始 Home 配置");
         let provider = db
-            .get_provider_by_id(&provider_id, AppType::Codex.as_str())?
+            .get_provider_by_id(&provider_id, &AppType::Codex)?
             .expect("供应商已写入");
         let plan = home_config.build_profile_route_plan(
             home,
@@ -5647,7 +5637,7 @@ mod codex_route_manager {
             &new_failover_id,
         ] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.clone(),
                     provider_id.clone(),
@@ -5704,10 +5694,10 @@ mod codex_route_manager {
         })?;
         db.replace_codex_profile_failovers(profile_id, std::slice::from_ref(&old_failover_id))?;
         let runtime = snapshot_tracking_runtime(
-            db.get_provider_by_id(&old_provider_id, AppType::Codex.as_str())?
+            db.get_provider_by_id(&old_provider_id, &AppType::Codex)?
                 .expect("External 尾窗旧供应商存在"),
             vec![db
-                .get_provider_by_id(&old_failover_id, AppType::Codex.as_str())?
+                .get_provider_by_id(&old_failover_id, &AppType::Codex)?
                 .expect("External 尾窗旧故障转移供应商存在")],
         );
         let token_store = Arc::new(ProfileTokenMapStore {
@@ -5924,7 +5914,7 @@ mod codex_route_manager {
             "model = \"model-b\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://b.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         for provider in [&provider_a, &provider_b] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         prepare_disabled_profile(
             db.as_ref(),
@@ -6015,7 +6005,7 @@ mod codex_route_manager {
         provider.settings_config["config"] = json!(
             "model = \"provider-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://sync.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -6067,7 +6057,7 @@ mod codex_route_manager {
         provider.settings_config["config"] = json!(
             "model = \"provider-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://best-effort.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-provider-token\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             &setup_home_config,
@@ -6165,7 +6155,7 @@ mod codex_route_manager {
         old_provider.settings_config["config"] = json!(
             "model = \"old-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://old.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_enabled_catalog_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -6178,7 +6168,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model = \"new-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &new_provider)?;
+        db.save_provider(&AppType::Codex, &new_provider)?;
         let manager = CodexRouteManager::new(
             db.clone(),
             home_config,
@@ -6240,7 +6230,7 @@ mod codex_route_manager {
             .as_object_mut()
             .expect("供应商设置必须是对象")
             .remove("modelCatalog");
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         for (profile_id, home, port) in [
             ("profile-a", home_a.path(), 16_001),
             ("profile-b", home_b.path(), 16_002),
@@ -6302,7 +6292,7 @@ mod codex_route_manager {
             config_b_before
         );
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("旧供应商仍存在");
         assert!(stored
             .settings_config
@@ -6333,7 +6323,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\nmodel = \"new-default-model\"\n[model_providers.custom]\nname = \"New Provider\"\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nhttp_headers = { x_new = \"fresh\" }\n"
         );
         new_provider.settings_config["auth"] = json!({});
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -6389,7 +6379,7 @@ mod codex_route_manager {
         .expect("读取共享供应商保存后的模型目录");
         assert!(catalog.contains("new-model"));
         let stored = db
-            .get_provider_by_id("provider-shared-model", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared-model", &AppType::Codex)?
             .expect("共享供应商已提交");
         assert!(stored
             .settings_config
@@ -6412,7 +6402,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -6464,7 +6454,7 @@ mod codex_route_manager {
             .expect("读取托管配置");
         assert!(managed_config.contains("https://new.example.com/v1"));
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("新供应商已提交");
         assert!(stored
             .settings_config
@@ -6496,7 +6486,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://without-catalog.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         for provider in [&old_shared, &other_primary] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         for (profile_id, home, port) in [
             ("profile-managed-a", managed_home_a.path(), 16_201),
@@ -6583,7 +6573,7 @@ mod codex_route_manager {
             failover_catalog_before
         );
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("无目录共享供应商已提交");
         assert!(stored.settings_config.get("modelCatalog").is_none());
         Ok(())
@@ -6604,7 +6594,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model = \"new-default-model\"\nmodel_reasoning_effort = \"high\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         let initial_plan = home_config.build_direct_provider_plan(home.path(), &old_provider)?;
         home_config.apply_direct_provider_plan(&initial_plan)?;
         let initial_path = crate::codex_config::codex_config_path_for_home(home.path());
@@ -6713,7 +6703,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         let direct_plan = home_config.build_direct_provider_plan(home.path(), &old_provider)?;
         home_config.apply_direct_provider_plan(&direct_plan)?;
         prepare_enabled_catalog_profile(
@@ -6778,7 +6768,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated-failover.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         for provider in [&primary, &unrelated, &old_failover] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         prepare_enabled_catalog_profile(
             db.as_ref(),
@@ -6915,7 +6905,7 @@ mod codex_route_manager {
             .expect("供应商设置必须是对象")
             .remove("modelCatalog");
         for provider in [&old_provider, &primary_other] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         db.insert_codex_profile(&CodexProfile {
             id: "profile-disabled-primary".to_string(),
@@ -7012,7 +7002,7 @@ mod codex_route_manager {
                         "数据库提交前关闭态主引用仍含模型目录指针".to_string(),
                     ));
                 }
-                db.save_provider(AppType::Codex.as_str(), &new_for_commit)?;
+                db.save_provider(&AppType::Codex, &new_for_commit)?;
                 Err(AppError::Database("模拟数据库提交失败".to_string()))
             })
             .await;
@@ -7024,7 +7014,7 @@ mod codex_route_manager {
             assert_eq!(fs::read(path).expect("读取补偿后文件"), expected);
         }
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("补偿后供应商存在");
         assert!(stored
             .settings_config
@@ -7056,7 +7046,7 @@ mod codex_route_manager {
         let setup_home_config = CodexHomeConfigService::system();
         let old_provider = provider_with_route_catalog("provider-shared", "old-model");
         let new_provider = provider_with_route_catalog("provider-shared", "new-model");
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-private-plan".to_string(),
             name: "Private Plan Profile".to_string(),
@@ -7103,7 +7093,7 @@ mod codex_route_manager {
         assert!(!message.contains("private-plan-error-body"));
         assert_eq!(fs::read(&config_path).expect("重读原配置"), config_before);
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("原供应商仍存在");
         assert!(stored
             .settings_config
@@ -7128,7 +7118,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model = \"new-default-model\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://new.example.com/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"private-provider-token\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             &setup_home_config,
@@ -7176,7 +7166,7 @@ mod codex_route_manager {
             catalog_before
         );
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("旧供应商仍存在");
         assert!(stored
             .settings_config
@@ -7204,7 +7194,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://next.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         for provider in [&old_provider, &next_provider] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         prepare_disabled_profile(
             db.as_ref(),
@@ -7238,7 +7228,7 @@ mod codex_route_manager {
                     move || -> Result<bool, AppError> {
                         commit_entered_tx.send(()).expect("发送保存已持锁信号");
                         resume_commit_rx.recv().expect("接收继续保存信号");
-                        commit_db.save_provider(AppType::Codex.as_str(), &provider_for_commit)?;
+                        commit_db.save_provider(&AppType::Codex, &provider_for_commit)?;
                         Ok(true)
                     },
                 )
@@ -7274,7 +7264,7 @@ mod codex_route_manager {
                 .expect("读取并发后 Home");
         assert!(config.contains("https://next.example.com/v1"));
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("读取保存后的共享供应商");
         assert!(stored
             .settings_config
@@ -7300,7 +7290,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://next.example.com/v1\"\nwire_api = \"responses\"\n"
         );
         for provider in [&old_provider, &next_provider] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         prepare_disabled_profile(
             db.as_ref(),
@@ -7390,7 +7380,7 @@ mod codex_route_manager {
         new_provider.settings_config["config"] = json!(
             "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://updated.example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_enabled_catalog_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -7433,7 +7423,7 @@ mod codex_route_manager {
             catalog_before
         );
         let stored = db
-            .get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-shared", &AppType::Codex)?
             .expect("旧供应商仍存在");
         assert!(stored
             .settings_config
@@ -7451,7 +7441,7 @@ mod codex_route_manager {
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("创建临时 Home");
         let provider = provider_with_route_catalog("provider-a", "model-a");
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -7503,7 +7493,7 @@ mod codex_route_manager {
         let home = tempfile::tempdir().expect("创建临时 Home");
         let profile_id = "profile-missing-config-catalog";
         let provider = provider_with_route_catalog("provider-a", "model-a");
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: profile_id.to_string(),
             name: "Profile Missing Config Catalog".to_string(),
@@ -7573,7 +7563,7 @@ mod codex_route_manager {
         let home = tempfile::tempdir().expect("创建临时 Home");
         let profile_id = "profile-catalog-write-failure";
         let provider = provider_with_route_catalog("provider-a", "model-a");
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: profile_id.to_string(),
             name: "Profile Catalog Write Failure".to_string(),
@@ -7650,7 +7640,7 @@ mod codex_route_manager {
             let home = tempfile::tempdir().expect("创建临时 Home");
             let profile_id = format!("profile-enable-crash-{phase}");
             let provider = provider_with_route_catalog("provider-a", "model-a");
-            db.save_provider(AppType::Codex.as_str(), &provider)?;
+            db.save_provider(&AppType::Codex, &provider)?;
             db.insert_codex_profile(&CodexProfile {
                 id: profile_id.clone(),
                 name: profile_id.clone(),
@@ -7735,8 +7725,8 @@ mod codex_route_manager {
         let home_config = Arc::new(CodexHomeConfigService::system());
         let provider_a = provider_with_route_catalog("provider-a", "model-a");
         let provider_b = provider_with_route_catalog("provider-b", "model-b");
-        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
-        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        db.save_provider(&AppType::Codex, &provider_a)?;
+        db.save_provider(&AppType::Codex, &provider_b)?;
         prepare_enabled_catalog_profile(
             &db,
             &home_config,
@@ -7803,8 +7793,8 @@ mod codex_route_manager {
         let home_config = Arc::new(CodexHomeConfigService::system());
         let provider_a = provider_with_route_catalog("provider-a", "model-a");
         let provider_b = provider_with_route_catalog("provider-b", "model-b");
-        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
-        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        db.save_provider(&AppType::Codex, &provider_a)?;
+        db.save_provider(&AppType::Codex, &provider_b)?;
         prepare_enabled_catalog_profile(
             &db,
             &home_config,
@@ -7860,8 +7850,8 @@ mod codex_route_manager {
         let setup = CodexHomeConfigService::system();
         let provider_a = provider_with_route_catalog("provider-a", "model-a");
         let provider_b = provider_with_route_catalog("provider-b", "model-b");
-        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
-        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        db.save_provider(&AppType::Codex, &provider_a)?;
+        db.save_provider(&AppType::Codex, &provider_b)?;
         prepare_enabled_catalog_profile(
             db.as_ref(),
             &setup,
@@ -7941,8 +7931,8 @@ mod codex_route_manager {
         provider_b.settings_config["config"] = json!(
             "model = \"provider-b-default\"\nmodel_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://example.com/v1\"\nwire_api = \"responses\"\n"
         );
-        db.save_provider(AppType::Codex.as_str(), &provider_a)?;
-        db.save_provider(AppType::Codex.as_str(), &provider_b)?;
+        db.save_provider(&AppType::Codex, &provider_a)?;
+        db.save_provider(&AppType::Codex, &provider_b)?;
         prepare_enabled_catalog_profile(
             db.as_ref(),
             &setup,
@@ -8078,8 +8068,8 @@ mod codex_route_manager {
         let old_shared = provider_with_route_catalog("provider-shared", "old-shared");
         let new_shared = provider_with_route_catalog("provider-shared", "new-shared");
         let other = provider_with_route_catalog("provider-other", "other-model");
-        db.save_provider(AppType::Codex.as_str(), &old_shared)?;
-        db.save_provider(AppType::Codex.as_str(), &other)?;
+        db.save_provider(&AppType::Codex, &old_shared)?;
+        db.save_provider(&AppType::Codex, &other)?;
         prepare_catalog_reference_profile(
             &db,
             &home_config,
@@ -8119,7 +8109,7 @@ mod codex_route_manager {
 
         manager
             .with_provider_catalog_update(&new_shared, || {
-                db.save_provider(AppType::Codex.as_str(), &new_shared)
+                db.save_provider(&AppType::Codex, &new_shared)
             })
             .await?;
 
@@ -8142,7 +8132,7 @@ mod codex_route_manager {
         let home_config = Arc::new(CodexHomeConfigService::system());
         let old_shared = provider_with_route_catalog("provider-shared", "old-shared");
         let new_shared = provider_with_route_catalog("provider-shared", "new-shared");
-        db.save_provider(AppType::Codex.as_str(), &old_shared)?;
+        db.save_provider(&AppType::Codex, &old_shared)?;
         prepare_catalog_reference_profile(
             &db,
             &home_config,
@@ -8176,7 +8166,7 @@ mod codex_route_manager {
 
         let error = manager
             .with_provider_catalog_update(&new_shared, || {
-                db.save_provider(AppType::Codex.as_str(), &new_shared)?;
+                db.save_provider(&AppType::Codex, &new_shared)?;
                 Err::<(), AppError>(AppError::Message("模拟供应商提交失败".to_string()))
             })
             .await
@@ -8184,7 +8174,7 @@ mod codex_route_manager {
 
         assert!(error.to_string().contains("模拟供应商提交失败"));
         assert_eq!(
-            db.get_provider_by_id("provider-shared", AppType::Codex.as_str())?
+            db.get_provider_by_id("provider-shared", &AppType::Codex)?
                 .expect("供应商已恢复")
                 .settings_config,
             old_shared.settings_config
@@ -8216,7 +8206,7 @@ mod codex_route_manager {
             "model_provider = \"custom\"\nmodel = \"new-default-model\"\nmodel_providers = { custom = { name = \"New Provider\", base_url = \"https://new.example.com/v1\", wire_api = \"responses\" } }\n"
         );
         new_provider.settings_config["auth"] = json!({});
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             home_config.as_ref(),
@@ -8236,7 +8226,7 @@ mod codex_route_manager {
         document["desktop"]["followUpQueueMode"] = toml_edit::value("queue");
         fs::write(&config_path, document.to_string()).expect("写入用户非路由修改");
         save_codex_mcp_server(db.as_ref())?;
-        db.save_provider(AppType::Codex.as_str(), &new_provider)?;
+        db.save_provider(&AppType::Codex, &new_provider)?;
         let manager = CodexRouteManager::new(
             db.clone(),
             home_config,
@@ -8292,7 +8282,7 @@ mod codex_route_manager {
             None,
         );
         official.category = Some("official".to_string());
-        db.save_provider(AppType::Codex.as_str(), &official)?;
+        db.save_provider(&AppType::Codex, &official)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-startup-catalog-cleanup".to_string(),
             name: "Profile Startup Catalog Cleanup".to_string(),
@@ -8391,7 +8381,7 @@ mod codex_route_manager {
             .as_mut()
             .expect("测试供应商包含元数据")
             .common_config_enabled = Some(true);
-        db.save_provider(AppType::Codex.as_str(), &old_provider)?;
+        db.save_provider(&AppType::Codex, &old_provider)?;
         prepare_disabled_profile(
             db.as_ref(),
             &setup_home_config,
@@ -8425,11 +8415,11 @@ mod codex_route_manager {
         )
         .expect("写入健康 Home 会话");
         db.set_config_snippet(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             Some("[features]\nweb_search = true\n".to_string()),
         )?;
         save_codex_mcp_server(db.as_ref())?;
-        db.save_provider(AppType::Codex.as_str(), &new_provider)?;
+        db.save_provider(&AppType::Codex, &new_provider)?;
         let failing_config_path =
             crate::codex_config::codex_config_path_for_home(failing_home.path());
         let manager = CodexRouteManager::new(
@@ -8531,7 +8521,7 @@ mod codex_route_manager {
             .expect("故障转移供应商包含元数据")
             .common_config_enabled = Some(true);
         for provider in [&old_primary, &old_failover] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         prepare_enabled_catalog_profile(
             db.as_ref(),
@@ -8568,12 +8558,12 @@ codex_unknown = true
             std::slice::from_ref(&old_failover.id),
         )?;
         db.set_config_snippet(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             Some("[features]\nweb_search = true\n".to_string()),
         )?;
         save_codex_mcp_server(db.as_ref())?;
         for provider in [&new_primary, &new_failover] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         let factory = Arc::new(SnapshotTrackingFactory {
             runtimes: Mutex::new(HashMap::new()),
@@ -8656,8 +8646,8 @@ codex_unknown = true
         let shared = provider_with_route_catalog("provider-shared", "new-shared");
         let stale_shared = provider_with_route_catalog("provider-shared", "stale-shared");
         let failing = provider_with_route_catalog("provider-failing", "failing-model");
-        db.save_provider(AppType::Codex.as_str(), &shared)?;
-        db.save_provider(AppType::Codex.as_str(), &failing)?;
+        db.save_provider(&AppType::Codex, &shared)?;
+        db.save_provider(&AppType::Codex, &failing)?;
 
         for (profile_id, home, provider_id, last_error, port) in [
             (
@@ -8761,9 +8751,9 @@ codex_unknown = true
             None,
         );
         provider.category = Some("official".to_string());
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-failover".to_string(),
                 "Provider Failover".to_string(),
@@ -8845,7 +8835,7 @@ codex_unknown = true
             None,
         );
         provider.category = Some("official".to_string());
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -8908,7 +8898,7 @@ codex_unknown = true
         );
         official.category = Some("official".to_string());
         for provider in [&third_party, &official] {
-            db.save_provider(AppType::Codex.as_str(), provider)?;
+            db.save_provider(&AppType::Codex, provider)?;
         }
         db.insert_codex_profile(&CodexProfile {
             id: "profile-catalog-round-trip".to_string(),
@@ -9028,7 +9018,7 @@ codex_unknown = true
             }),
             None,
         );
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -9137,7 +9127,7 @@ codex_unknown = true
         );
         fs::write(&config_path, &original).expect("写入原配置");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-new".to_string(),
                 "Provider New".to_string(),
@@ -9207,7 +9197,7 @@ codex_unknown = true
         let external = b"model = \"external\"\nprofile_extension = \"external-change\"\n".to_vec();
         fs::write(&config_path, original).expect("写入原配置");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-new".to_string(),
                 "Provider New".to_string(),
@@ -9277,7 +9267,7 @@ codex_unknown = true
     async fn switching_enabled_profile_rejects_official_provider() -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-old".to_string(),
                 "Provider Old".to_string(),
@@ -9292,7 +9282,7 @@ codex_unknown = true
             None,
         );
         official.category = Some("official".to_string());
-        db.save_provider(AppType::Codex.as_str(), &official)?;
+        db.save_provider(&AppType::Codex, &official)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-a".to_string(),
             name: "Profile A".to_string(),
@@ -9406,7 +9396,7 @@ experimental_bearer_token = "PROXY_MANAGED"
 "#;
         fs::write(codex_config_path_for_home(home.path()), original_config).expect("写入原始配置");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -9415,7 +9405,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             ),
         )?;
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-failover".to_string(),
                 "Provider Failover".to_string(),
@@ -9583,7 +9573,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             "test-local-token",
         )?;
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-new".to_string(),
                 "Provider New".to_string(),
@@ -9642,7 +9632,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             ("provider-new", "model = \"provider-model\"\n"),
         ] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     id.to_string(),
                     id.to_string(),
@@ -9709,7 +9699,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             ("provider-new", "model = \"provider-model\"\n"),
         ] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     id.to_string(),
                     id.to_string(),
@@ -9786,7 +9776,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let new_listener_token = "issue19-current-new-listener-token";
         for provider_id in [old_provider_id, new_provider_id] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -9845,7 +9835,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             reads: Mutex::new(HashMap::new()),
         });
         let runtime = snapshot_tracking_runtime(
-            db.get_provider_by_id(old_provider_id, AppType::Codex.as_str())?
+            db.get_provider_by_id(old_provider_id, &AppType::Codex)?
                 .expect("旧供应商存在"),
             vec![],
         );
@@ -9994,7 +9984,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let new_listener_token = "issue20-current-new-listener-token";
         for provider_id in [old_provider_id, new_provider_id] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -10049,7 +10039,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             reads: Mutex::new(HashMap::new()),
         });
         let runtime = snapshot_tracking_runtime(
-            db.get_provider_by_id(old_provider_id, AppType::Codex.as_str())?
+            db.get_provider_by_id(old_provider_id, &AppType::Codex)?
                 .expect("旧供应商存在"),
             vec![],
         );
@@ -10514,14 +10504,14 @@ experimental_bearer_token = "PROXY_MANAGED"
         let fixture = prepare_external_switch_tail_fixture("issue23-plan-build", 16_129)?;
         let mut selected_provider = fixture
             .db
-            .get_provider_by_id(&fixture.new_provider_id, AppType::Codex.as_str())?
+            .get_provider_by_id(&fixture.new_provider_id, &AppType::Codex)?
             .expect("目标供应商存在");
         selected_provider.settings_config["modelCatalog"] = json!({
             "models": [{ "model": "issue23-model" }]
         });
         fixture
             .db
-            .save_provider(AppType::Codex.as_str(), &selected_provider)?;
+            .save_provider(&AppType::Codex, &selected_provider)?;
         let catalog_path = fixture
             ._home
             .path()
@@ -11046,7 +11036,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -11110,7 +11100,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("创建顶层 fallback Home");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -11294,7 +11284,7 @@ experimental_bearer_token = "PROXY_MANAGED"
             ("provider-b", "model = \"database-model\"\n"),
         ] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -11365,7 +11355,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -11423,7 +11413,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         let home = tempfile::tempdir().expect("临时 Home 目录");
         for provider_id in ["provider-a", "provider-failover"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -12597,7 +12587,7 @@ keep = true
             json!({}),
             None,
         );
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: "profile-writer-failure".to_string(),
             name: "profile-writer-failure".to_string(),
@@ -12740,7 +12730,7 @@ keep = true
             "model_provider = \"{provider_id}\"\nmodel = \"baseline-v1-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         );
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 provider_id.to_string(),
                 provider_id.to_string(),
@@ -12855,7 +12845,7 @@ keep = true
             "model_provider = \"{provider_id}\"\nmodel = \"baseline-v1-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         );
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 provider_id.to_string(),
                 provider_id.to_string(),
@@ -12969,7 +12959,7 @@ keep = true
             "model_provider = \"{provider_id}\"\nmodel = \"baseline-v2-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v2\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         );
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 provider_id.to_string(),
                 provider_id.to_string(),
@@ -13091,7 +13081,7 @@ keep = true
             "model_provider = \"{provider_id}\"\nmodel = \"baseline-v2-model\"\n\n[model_providers.{provider_id}]\nname = \"Managed\"\nbase_url = \"https://before.example/v2\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         );
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 provider_id.to_string(),
                 provider_id.to_string(),
@@ -13225,7 +13215,7 @@ keep = true
                 "model_provider = \"{provider_id}\"\nmodel = \"user-model\"\n\n[model_providers.{provider_id}]\nbase_url = \"http://127.0.0.1:{listen_port}/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{old_listener_token}\"\n"
             );
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -13389,7 +13379,7 @@ keep = true
         let provider_id = format!("provider-{profile_id}");
         let old_listener_token = "old-pathless-listener-token";
         let provider = Provider::with_id(provider_id.clone(), provider_id.clone(), json!({}), None);
-        db.save_provider(AppType::Codex.as_str(), &provider)?;
+        db.save_provider(&AppType::Codex, &provider)?;
         db.insert_codex_profile(&CodexProfile {
             id: profile_id.to_string(),
             name: profile_id.to_string(),
@@ -13957,7 +13947,7 @@ keep = true
             json!({}),
             None,
         );
-        db.save_provider(AppType::Codex.as_str(), &failover)?;
+        db.save_provider(&AppType::Codex, &failover)?;
         db.replace_codex_profile_failovers("profile-bad-home", &[failover.id.clone()])?;
         let mut bad_profile = db.get_codex_profile("profile-bad-home")?;
         bad_profile.name = "Broken Profile".to_string();
@@ -14334,7 +14324,7 @@ keep = true
             "old-listener-token",
         )?;
         let provider = db
-            .get_provider_by_id("provider-profile-crash", AppType::Codex.as_str())?
+            .get_provider_by_id("provider-profile-crash", &AppType::Codex)?
             .expect("供应商存在");
         let desired_plan = home_config.build_profile_route_plan(
             home.path(),
@@ -14551,8 +14541,7 @@ keep = true
                 .replace_codex_profile_failovers(profile_id, provider_ids)
         }
         fn get_provider(&self, provider_id: &str) -> Result<Option<Provider>, AppError> {
-            self.db
-                .get_provider_by_id(provider_id, AppType::Codex.as_str())
+            self.db.get_provider_by_id(provider_id, &AppType::Codex)
         }
         fn delete_profile(&self, profile_id: &str) -> Result<(), AppError> {
             self.db.delete_codex_profile(profile_id)
@@ -14767,7 +14756,7 @@ keep = true
         )?;
         for id in ["provider-a-next", "provider-b"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
             )?;
         }
@@ -14864,7 +14853,7 @@ keep = true
         fs::write(&config_path, latest_before_switch).expect("写入切换前最新 Home");
         for id in ["provider-new", "provider-failover"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
             )?;
         }
@@ -14885,7 +14874,7 @@ keep = true
             Arc::new(FakeFactory),
         );
         let runtime = snapshot_tracking_runtime(
-            db.get_provider_by_id("provider-profile-a", AppType::Codex.as_str())?
+            db.get_provider_by_id("provider-profile-a", &AppType::Codex)?
                 .expect("切换前供应商存在"),
             vec![],
         );
@@ -14936,7 +14925,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         for id in ["provider-old", "provider-new"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(id.to_string(), id.to_string(), json!({}), None),
             )?;
         }
@@ -15006,7 +14995,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -15132,7 +15121,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -15523,7 +15512,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         for provider_id in ["provider-old", "provider-new"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -15610,7 +15599,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         for provider_id in ["provider-old", "provider-new", "provider-requested"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -15709,7 +15698,7 @@ keep = true
         fs::write(&config_path, "model = \"current\"\n").expect("写入当前配置");
         for provider_id in ["provider-old", "provider-new"] {
             db.save_provider(
-                AppType::Codex.as_str(),
+                &AppType::Codex,
                 &Provider::with_id(
                     provider_id.to_string(),
                     provider_id.to_string(),
@@ -15789,7 +15778,7 @@ keep = true
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-old".to_string(),
                 "provider-old".to_string(),
@@ -15849,7 +15838,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -15912,7 +15901,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None),
         )?;
         db.insert_codex_profile(&CodexProfile {
@@ -15970,7 +15959,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None),
         )?;
         db.insert_codex_profile(&CodexProfile {
@@ -16220,7 +16209,7 @@ keep = true
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id("provider-a".to_string(), "A".to_string(), json!({}), None),
         )?;
         db.insert_codex_profile(&CodexProfile {
@@ -16287,7 +16276,7 @@ keep = true
         let db = Arc::new(Database::memory()?);
         let home = tempfile::tempdir().expect("临时 Home 目录");
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -16345,7 +16334,7 @@ keep = true
     ) -> Result<(), AppError> {
         let db = Arc::new(Database::memory()?);
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
@@ -16838,7 +16827,7 @@ keep = true
     {
         let db = Arc::new(Database::memory()?);
         db.save_provider(
-            AppType::Codex.as_str(),
+            &AppType::Codex,
             &Provider::with_id(
                 "provider-a".to_string(),
                 "Provider A".to_string(),
