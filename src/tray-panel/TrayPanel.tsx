@@ -44,6 +44,8 @@ import {
 import { aimingAt, type Point } from "./menuAim";
 import { usePanelTheme } from "./usePanelTheme";
 import { UsageTab } from "./UsageTab";
+import wisGptFastOff from "./wisgpt-fast-off.svg";
+import wisGptFastOn from "./wisgpt-fast-on.svg";
 
 type Tab = "config" | "usage";
 const TAB_KEY = "cc-switch-tray-tab";
@@ -85,7 +87,7 @@ function WisGptQuotaBar({ quota }: { quota: WisGptQuota }) {
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={percent}
-      className="flex items-center gap-2 px-2.5 pb-1.5 pt-1 text-[11px] tabular-nums text-muted-foreground"
+      className="flex min-w-0 flex-1 items-center gap-2 pl-2.5 text-[11px] tabular-nums text-muted-foreground"
     >
       <span className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-black/10 dark:bg-white/10">
         <span
@@ -101,6 +103,93 @@ function WisGptQuotaBar({ quota }: { quota: WisGptQuota }) {
         M
       </span>
     </div>
+  );
+}
+
+/** 每次弹出重读本机开关，写入成功后才更新闪电图标。 */
+function WisGptFastModeToggle({
+  label,
+  refreshKey,
+}: {
+  label: string;
+  refreshKey: number;
+}) {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const savingRef = useRef(false);
+
+  useEffect(() => {
+    if (savingRef.current) return;
+    let current = true;
+    setError("");
+    setEnabled(null);
+    void trayPanelApi.wisGptFastMode().then(
+      (value) => {
+        if (current) setEnabled(value);
+      },
+      (cause) => {
+        if (current) setError(String(cause));
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [refreshKey]);
+
+  /** 保存期间屏蔽重复点击，失败时保留原来的已确认状态。 */
+  async function toggle() {
+    if (enabled === null || savingRef.current) return;
+    const next = !enabled;
+    savingRef.current = true;
+    setSaving(true);
+    setError("");
+    try {
+      await trayPanelApi.setWisGptFastMode(next);
+      setEnabled(next);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        role="switch"
+        aria-label={label}
+        aria-checked={enabled === true}
+        title={error ? `${label} · ${error}` : label}
+        disabled={enabled === null || saving}
+        onClick={() => void toggle()}
+        className={cn(
+          "flex h-6 w-6 shrink-0 items-center justify-center rounded-md disabled:opacity-60",
+          FOCUS_RING,
+          ROW_HOVER,
+        )}
+      >
+        {error ? (
+          <AlertTriangle
+            aria-hidden="true"
+            className="h-4 w-4 text-amber-600"
+          />
+        ) : (
+          <img
+            src={enabled ? wisGptFastOn : wisGptFastOff}
+            alt=""
+            className="h-5 w-5"
+          />
+        )}
+      </button>
+      {error && (
+        <span className="sr-only" role="status">
+          {error}
+        </span>
+      )}
+    </>
   );
 }
 
@@ -1171,7 +1260,14 @@ export function TrayPanel() {
           data-other-item
           className="shrink-0 border-t border-black/[0.08] px-1.5 py-1.5 dark:border-white/[0.08]"
         >
-          {wisGptQuota && <WisGptQuotaBar quota={wisGptQuota} />}
+          {/* 即使额度查询失败，仍可管理本机 7072 的快速模式。 */}
+          <div className="flex items-center justify-end gap-1.5 pr-2">
+            {wisGptQuota && <WisGptQuotaBar quota={wisGptQuota} />}
+            <WisGptFastModeToggle
+              label={texts.wisGptFastMode}
+              refreshKey={shownCount}
+            />
+          </div>
           {/* 开关要显示当前是否开着，数据到了再出 */}
           {state && (
             <button

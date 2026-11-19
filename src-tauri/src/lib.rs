@@ -1974,6 +1974,8 @@ pub fn run() {
             tray::take_tray_navigation,
             tray_panel::tray_panel_state,
             tray_panel::tray_panel_wisgpt_quota,
+            tray_panel::tray_panel_wisgpt_fast_mode,
+            tray_panel::tray_panel_set_wisgpt_fast_mode,
             tray_panel::tray_panel_placement,
             tray_panel::tray_panel_layout,
             tray_panel::tray_panel_hide,

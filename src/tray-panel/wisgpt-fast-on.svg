@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" role="img">
+  <title>WisGPT 快速模式开启</title>
+  <defs>
+    <linearGradient id="wisgpt-bolt" x1="15" y1="3" x2="9" y2="21" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFC928"/>
+      <stop offset=".52" stop-color="#F7AC08"/>
+      <stop offset="1" stop-color="#D98600"/>
+    </linearGradient>
+  </defs>
+  <!-- 实心闪电沿用关闭态的尺寸和位置，亮面随轮廓收束。 -->
+  <path d="M 14.75 3.25 L 6.65 13.15 L 11.05 13.15 L 8.75 20.75 L 17.35 10.8 L 12.85 10.8 Z"
+    fill="url(#wisgpt-bolt)" stroke="url(#wisgpt-bolt)" stroke-width="1.65" stroke-linejoin="round"/>
+  <path d="M 6.65 13.15 L 17.35 10.8 L 8.75 20.75 L 11.05 13.15 Z" fill="#FFF3A4" opacity="0.38"/>
+  <!-- 两道短电弧各自留出间隙，在托盘小尺寸下仍与主闪电分离。 -->
+  <path d="M 5.8 5.3 L 6.85 6.8 L 4.6 7.65 L 5 9.05 L 3.35 10.15 M 20.6 13.85 L 19.35 15 L 20 16.45 L 17.8 17.1 L 17.15 18.65"
+    fill="none" stroke="#DD9700" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

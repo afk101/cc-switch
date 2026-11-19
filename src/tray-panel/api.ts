@@ -12,6 +12,7 @@ export interface PanelTexts {
   quit: string;
   settings: string;
   lightweightMode: string;
+  wisGptFastMode: string;
   openPanel: string;
   configTab: string;
   usageTab: string;
@@ -137,6 +138,10 @@ export const CHANGED_EVENT = "tray-panel-changed";
 export const trayPanelApi = {
   state: () => invoke<TrayPanelState>("tray_panel_state"),
   wisGptQuota: () => invoke<WisGptQuota | null>("tray_panel_wisgpt_quota"),
+  /** 本机 7072 服务共享的快速模式状态。 */
+  wisGptFastMode: () => invoke<boolean>("tray_panel_wisgpt_fast_mode"),
+  setWisGptFastMode: (enabled: boolean) =>
+    invoke<void>("tray_panel_set_wisgpt_fast_mode", { enabled }),
   placement: () => invoke<PanelPlacement | null>("tray_panel_placement"),
   layout: (layout: PanelLayout) =>
     invoke<void>("tray_panel_layout", { layout }),

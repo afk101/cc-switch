@@ -25,6 +25,8 @@ vi.mock("@/tray-panel/api", async (importOriginal) => ({
   trayPanelApi: {
     state: vi.fn(),
     wisGptQuota: vi.fn().mockResolvedValue(null),
+    wisGptFastMode: vi.fn().mockResolvedValue(false),
+    setWisGptFastMode: vi.fn().mockResolvedValue(undefined),
     placement: vi.fn(),
     layout: vi.fn().mockResolvedValue(undefined),
     action: vi.fn().mockResolvedValue(undefined),
@@ -42,6 +44,7 @@ const texts: PanelTexts = {
   quit: "Quit",
   settings: "Settings",
   lightweightMode: "Lightweight mode",
+  wisGptFastMode: "WisGPT fast mode · 7072",
   openPanel: "Open panel",
   configTab: "Configuration",
   usageTab: "Usage",
@@ -144,6 +147,8 @@ describe("TrayPanel window layout", () => {
     window.localStorage.removeItem("cc-switch-tray-tab");
     vi.mocked(trayPanelApi.state).mockResolvedValue(state);
     vi.mocked(trayPanelApi.wisGptQuota).mockResolvedValue(null);
+    vi.mocked(trayPanelApi.wisGptFastMode).mockResolvedValue(false);
+    vi.mocked(trayPanelApi.setWisGptFastMode).mockResolvedValue(undefined);
     vi.mocked(trayPanelApi.layout).mockResolvedValue(undefined);
     // jsdom 不排版；分别提供主卡片和较高子卡片的实测高度。
     vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
@@ -217,6 +222,32 @@ describe("TrayPanel window layout", () => {
     await act(async () => emitTauriEvent(CHANGED_EVENT, {}));
     expect(screen.getByText("28M")).toBeInTheDocument();
     expect(trayPanelApi.wisGptQuota).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads the 7072 setting on open and changes the icon only after saving", async () => {
+    let finishSave = () => {};
+    vi.mocked(trayPanelApi.setWisGptFastMode).mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        finishSave = resolve;
+      }),
+    );
+    await openPanel(windows);
+    const toggle = await screen.findByRole("switch", {
+      name: "WisGPT fast mode · 7072",
+    });
+    await waitFor(() => expect(toggle).toBeEnabled());
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    expect(trayPanelApi.setWisGptFastMode).toHaveBeenCalledWith(true);
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    await act(async () => finishSave());
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+
+    await act(async () => emitTauriEvent(SHOW_EVENT, { ...windows, seq: 2 }));
+    await waitFor(() =>
+      expect(toggle).toHaveAttribute("aria-checked", "false"),
+    );
   });
 
   it("clears the old balance when the next opening has no usable WisCode quota", async () => {
@@ -321,7 +352,9 @@ describe("TrayPanel window layout", () => {
       screen.getByRole("button", { name: "Open main window" }),
     ).toBeVisible();
     expect(screen.queryByRole("button", { name: /Claude Code/ })).toBeNull();
-    expect(screen.queryByRole("switch")).toBeNull();
+    expect(
+      screen.queryByRole("switch", { name: "Lightweight mode" }),
+    ).toBeNull();
     expect(trayPanelApi.layout).toHaveBeenCalledTimes(1);
     expect(trayPanelApi.layout).toHaveBeenLastCalledWith(
       expect.objectContaining({
@@ -336,7 +369,9 @@ describe("TrayPanel window layout", () => {
 
     await act(async () => resolveState(state));
     await screen.findByRole("button", { name: "Claude Code default · Direct" });
-    expect(screen.getByRole("switch")).toBeVisible();
+    expect(
+      screen.getByRole("switch", { name: "Lightweight mode" }),
+    ).toBeVisible();
     // 数据那次回报走 rAF：先画到固定画布，再扩原生可见区域
     expect(trayPanelApi.layout).toHaveBeenCalledTimes(1);
     await paint();
@@ -407,7 +442,9 @@ describe("TrayPanel window layout", () => {
     expect(
       screen.getByRole("button", { name: "Claude Code default · Direct" }),
     ).toBeVisible();
-    expect(screen.getByRole("switch")).toBeVisible();
+    expect(
+      screen.getByRole("switch", { name: "Lightweight mode" }),
+    ).toBeVisible();
     expect(trayPanelApi.layout).toHaveBeenCalledTimes(calls + 1);
     expect(trayPanelApi.layout).toHaveBeenLastCalledWith(
       expect.objectContaining({

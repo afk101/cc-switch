@@ -84,6 +84,8 @@ pub struct PanelTexts {
     pub quit: &'static str,
     pub settings: &'static str,
     pub lightweight_mode: &'static str,
+    /// 7072 上的 WisGPT 请求共用此开关，名称中注明作用范围。
+    pub wis_gpt_fast_mode: &'static str,
     pub open_panel: &'static str,
     pub config_tab: &'static str,
     pub usage_tab: &'static str,
@@ -110,6 +112,7 @@ impl PanelTexts {
                 quit: "Quit",
                 settings: "Settings",
                 lightweight_mode: "Lightweight mode",
+                wis_gpt_fast_mode: "WisGPT fast mode · 7072",
                 open_panel: "Open quick panel",
                 config_tab: "Configuration",
                 usage_tab: "Usage",
@@ -129,6 +132,7 @@ impl PanelTexts {
                 quit: "Çık",
                 settings: "Ayarlar",
                 lightweight_mode: "Hafif mod",
+                wis_gpt_fast_mode: "WisGPT hızlı mod · 7072",
                 open_panel: "Hızlı paneli aç",
                 config_tab: "Yapılandırma",
                 usage_tab: "Kullanım",
@@ -148,6 +152,7 @@ impl PanelTexts {
                 quit: "Выйти",
                 settings: "Настройки",
                 lightweight_mode: "Облегчённый режим",
+                wis_gpt_fast_mode: "Быстрый режим WisGPT · 7072",
                 open_panel: "Открыть быструю панель",
                 config_tab: "Конфигурация",
                 usage_tab: "Использование",
@@ -167,6 +172,7 @@ impl PanelTexts {
                 quit: "종료",
                 settings: "설정",
                 lightweight_mode: "경량 모드",
+                wis_gpt_fast_mode: "WisGPT 빠른 모드 · 7072",
                 open_panel: "빠른 패널 열기",
                 config_tab: "설정",
                 usage_tab: "사용량",
@@ -186,6 +192,7 @@ impl PanelTexts {
                 quit: "終了",
                 settings: "設定",
                 lightweight_mode: "軽量モード",
+                wis_gpt_fast_mode: "WisGPT 高速モード · 7072",
                 open_panel: "クイックパネルを開く",
                 config_tab: "構成",
                 usage_tab: "使用量",
@@ -205,6 +212,7 @@ impl PanelTexts {
                 quit: "結束",
                 settings: "設定",
                 lightweight_mode: "輕量模式",
+                wis_gpt_fast_mode: "WisGPT 快速模式 · 7072",
                 open_panel: "開啟快捷面板",
                 config_tab: "配置",
                 usage_tab: "用量",
@@ -224,6 +232,7 @@ impl PanelTexts {
                 quit: "退出",
                 settings: "设置",
                 lightweight_mode: "轻量模式",
+                wis_gpt_fast_mode: "WisGPT 快速模式 · 7072",
                 open_panel: "打开快捷面板",
                 config_tab: "配置",
                 usage_tab: "用量",
@@ -1143,6 +1152,19 @@ mod platform {
 pub async fn tray_panel_wisgpt_quota() -> Option<crate::services::wisgpt_quota::WisGptQuota> {
     let client = crate::proxy::http_client::no_redirect().ok()?;
     crate::services::wisgpt_quota::fetch_daily_quota(&crate::config::get_home_dir(), &client).await
+}
+
+/// 读取本机 7072 的快速模式，与 WisGPT 额度查询相互独立。
+#[tauri::command]
+pub fn tray_panel_wisgpt_fast_mode() -> bool {
+    crate::services::wisgpt_fast_mode::read_enabled(&crate::config::get_home_dir())
+}
+
+/// 保存到本机服务配置，只有写入完成才向托盘返回成功。
+#[tauri::command]
+pub fn tray_panel_set_wisgpt_fast_mode(enabled: bool) -> Result<(), String> {
+    crate::services::wisgpt_fast_mode::write_enabled(&crate::config::get_home_dir(), enabled)
+        .map_err(|err| err.to_string())
 }
 
 /// 收集要读库和设备文件，一次几十毫秒。同步命令跑在主线程上，弹出后那一串额度刷新

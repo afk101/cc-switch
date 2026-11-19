@@ -46,6 +46,7 @@ pub mod usage_stats;
 pub mod webdav;
 pub mod webdav_auto_sync;
 pub mod webdav_sync;
+pub mod wisgpt_fast_mode;
 pub mod wisgpt_quota;
 
 pub use config::ConfigService;
